@@ -10,11 +10,13 @@ class RedisClientError extends Error {
 }
 
 class RedisClient {
+  #connectPromise = null
+
   constructor (options = {}) {
     const retryConfig = {
-      maxRetryAttempts: options.maxRetryAttempts || Infinity,
-      baseRetryDelay: options.baseRetryDelay || 1000,
-      maxRetryDelay: options.maxRetryDelay || 30000
+      maxRetryAttempts: options.maxRetryAttempts ?? Infinity,
+      baseRetryDelay: options.baseRetryDelay ?? 1000,
+      maxRetryDelay: options.maxRetryDelay ?? 30000
     }
 
     this.logger = options.logger || Logger
@@ -28,99 +30,77 @@ class RedisClient {
     this.config = this.redisConfig.getOptions()
     this.client = null
     this.keyPrefix = this.config.keyPrefix ?? ''
-    this.isConnecting = false
-    this.reconnectInterval = options.reconnectInterval || 5000
-    this.maxReconnectAttempts = retryConfig.maxRetryAttempts
-    this.reconnectAttempts = 0
     this.isConnected = false
     this.lastHealthCheckTime = 0
-    this.healthCheckInterval = options.healthCheckInterval || 5000
-    this.healthCheckTimeout = options.healthCheckTimeout || 1000
+    this.healthCheckInterval = options.healthCheckInterval ?? 5000
+    this.healthCheckTimeout = options.healthCheckTimeout ?? 1000
     this.healthCheckPromise = null
-    this.initialConnectionAttempted = false
   }
 
+  // Reconnection is owned entirely by the ioredis driver (retryStrategy /
+  // reconnectOnError in RedisConfig): a single client instance survives the
+  // whole connect()..disconnect() cycle and the listeners below only track
+  // state. The library never creates a second client for the same cycle.
   async connect () {
     if (this.client) {
-      this.logger.info('Redis client already exists. Reusing existing connection.')
+      this.logger.debug?.('Redis client already exists. Reusing existing connection.')
       return
     }
 
-    if (this.isConnecting) {
-      this.logger.info('Redis connection attempt already in progress.')
-      return
+    if (!this.#connectPromise) {
+      this.#connectPromise = this.#establishConnection().finally(() => {
+        this.#connectPromise = null
+      })
     }
 
-    this.isConnecting = true
-    await this.attemptConnection()
+    return this.#connectPromise
   }
 
-  async attemptConnection () {
-    try {
-      this.client = this.redisConfig.createRedisClient()
+  async #establishConnection () {
+    const client = this.redisConfig.createRedisClient()
+    this.client = client
 
-      this.client.on('connect', () => {
-        this.logger.info('Redis is connected')
-        this.isConnecting = false
-        this.reconnectAttempts = 0
-        this.isConnected = true
-      })
-
-      this.client.on('error', (err) => {
-        this.logger.error(`Redis client error: ${err.message || err}`)
-        this.isConnected = false
-
-        if (!this.isConnecting) {
-          this.isConnecting = true
-          this.scheduleReconnect()
-        }
-      })
-
-      this.client.on('close', () => {
-        this.logger.warn('Redis connection closed')
-        this.isConnected = false
-
-        if (!this.isConnecting) {
-          this.isConnecting = true
-          this.scheduleReconnect()
-        }
-      })
-
-      this.client.on('reconnecting', () => {
-        this.logger.info('Redis client is reconnecting...')
-      })
-
-      if (!this.initialConnectionAttempted) {
-        await this.client.ping()
-        this.initialConnectionAttempted = true
-      }
-
-      this.isConnecting = false
-      this.reconnectAttempts = 0
+    client.on('ready', () => {
       this.isConnected = true
-    } catch (err) {
-      this.logger.error(`Failed to connect to Redis: ${err.message}`)
-      this.isConnecting = false
+      this.logger.info('Redis connection is ready')
+    })
+
+    client.on('error', (err) => {
+      this.logger.error(`Redis client error: ${err.message || err}`)
+    })
+
+    client.on('close', () => {
       this.isConnected = false
+      this.logger.warn('Redis connection closed')
+    })
 
-      if (!this.initialConnectionAttempted) {
-        this.initialConnectionAttempted = true
-        this.scheduleReconnect()
+    client.on('reconnecting', (delay) => {
+      this.logger.info(`Redis client is reconnecting${typeof delay === 'number' ? ` in ${delay}ms` : ''}...`)
+    })
+
+    client.on('end', () => {
+      // Final state: emitted after quit() or when retryStrategy gives up.
+      // Release the instance so a later connect() starts a fresh cycle.
+      this.isConnected = false
+      client.removeAllListeners()
+
+      if (this.client === client) {
+        this.client = null
       }
+    })
+
+    try {
+      await client.connect()
+    } catch (err) {
+      if (client.status === 'end') {
+        this.logger.error(`Failed to connect to Redis: ${err.message}`)
+        return
+      }
+
+      // The driver keeps retrying in the background per retryStrategy;
+      // commands stay gated by the health check until it succeeds.
+      this.logger.error(`Failed to connect to Redis: ${err.message}. Reconnection attempts continue in the background.`)
     }
-  }
-
-  scheduleReconnect () {
-    if (this.maxReconnectAttempts > 0 && this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.error('Max reconnection attempts reached. Stopping reconnection attempts.')
-      this.isConnecting = false
-
-      return
-    }
-
-    this.reconnectAttempts++
-    this.logger.info(`Scheduling Redis reconnection attempt ${this.reconnectAttempts} in ${this.reconnectInterval}ms`)
-    setTimeout(() => this.attemptConnection(), this.reconnectInterval)
   }
 
   async checkHealth () {
@@ -560,20 +540,33 @@ class RedisClient {
     })
   }
 
+  // Final and idempotent: quit() makes the driver emit 'end', which releases
+  // the client (see #establishConnection) without ever scheduling a
+  // reconnection. A later connect() starts a brand-new cycle.
   async disconnect () {
-    if (this.client) {
-      try {
-        await this.client.quit()
+    const client = this.client
 
-        this.client = null
-        this.isConnected = false
+    if (!client) {
+      return
+    }
 
-        this.logger.info('Redis client disconnected successfully')
-      } catch (err) {
-        this.logger.error(`Error disconnecting Redis client: ${err.message}`)
-
-        throw err
+    try {
+      if (client.status !== 'end') {
+        await client.quit()
       }
+
+      this.logger.info('Redis client disconnected successfully')
+    } catch (err) {
+      this.logger.warn(`Error during Redis quit: ${err.message}. Forcing the connection closed.`)
+      client.disconnect()
+    } finally {
+      client.removeAllListeners()
+
+      if (this.client === client) {
+        this.client = null
+      }
+
+      this.isConnected = false
     }
   }
 

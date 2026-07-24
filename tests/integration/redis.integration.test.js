@@ -88,7 +88,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // The sacred test (playbook §4): drop the connection FOR REAL, from the
   // server side, and prove the client fully recovers.
   test('recovers after all connections are killed server-side (CLIENT KILL)', { timeout: 60000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, reconnectInterval: 500, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:sacred:before', 'ok'), 'OK')
@@ -119,7 +119,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // also reconnects the old one — every recovery must end with the SAME
   // number of connections it started with.
   test('does not leak extra connections while recovering', { timeout: 60000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, reconnectInterval: 500, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:leak:probe', '1'), 'OK')
@@ -154,13 +154,13 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // Regression probe for AUDIT C4: quit() emits 'close', and the close
   // handler used to schedule a reconnection — disconnect() must be final.
   test('disconnect() stays disconnected (no self-resurrection)', { timeout: 30000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, reconnectInterval: 500, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:cycle:probe', '1'), 'OK')
     await client.disconnect()
 
-    // Longer than reconnectInterval: any scheduled resurrection has fired.
+    // Long enough for any wrongly-scheduled reconnection to have fired.
     await sleep(2000)
 
     assert.equal(client.client, null, 'internal client must remain null after disconnect()')

@@ -10,13 +10,14 @@ class RedisConfig {
       password: options.password,
       db: options.db,
       keyPrefix: options.keyPrefix,
+      connectionName: options.connectionName,
       retryStrategy: this.retryStrategy.bind(this),
       reconnectOnError: this.reconnectOnError.bind(this),
-      maxRetriesPerRequest: options.maxRetriesPerRequest || null,
-      enableReadyCheck: options.enableReadyCheck !== undefined ? options.enableReadyCheck : true,
-      autoResubscribe: options.autoResubscribe !== undefined ? options.autoResubscribe : true,
-      autoResendUnfulfilledCommands: options.autoResendUnfulfilledCommands !== undefined ? options.autoResendUnfulfilledCommands : true,
-      lazyConnect: options.lazyConnect !== undefined ? options.lazyConnect : true
+      maxRetriesPerRequest: options.maxRetriesPerRequest ?? null,
+      enableReadyCheck: options.enableReadyCheck ?? true,
+      autoResubscribe: options.autoResubscribe ?? true,
+      autoResendUnfulfilledCommands: options.autoResendUnfulfilledCommands ?? true,
+      lazyConnect: options.lazyConnect ?? true
     }
 
     this.maxRetryAttempts = options.maxRetryAttempts
