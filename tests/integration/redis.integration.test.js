@@ -117,6 +117,31 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Regression (AUDIT C7): scanStream does not apply keyPrefix to MATCH, so
+  // getAllStream used to scan the whole database (missing every prefixed key
+  // and leaking foreign ones) and rejected everything on the first
+  // non-string key.
+  test('getAllStream scans only the prefixed keyspace and skips non-strings', { timeout: 30000 }, async () => {
+    await admin.flushdb()
+
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'app:', logger: quietLogger })
+    await client.connect()
+
+    await client.set('user:1', 'alice')
+    await client.set('user:2', 'bob')
+    await client.set('config:x', 'y')
+    await client.hset('user:hash', 'field', 'value') // non-string: skipped
+    await admin.set('foreign:user:1', 'intruder') // outside the prefix
+
+    const users = Object.assign({}, ...await client.getAllStream('user:*'))
+    assert.deepEqual(users, { 'user:1': 'alice', 'user:2': 'bob' })
+
+    const everything = Object.assign({}, ...await client.getAllStream())
+    assert.deepEqual(everything, { 'user:1': 'alice', 'user:2': 'bob', 'config:x': 'y' })
+
+    await client.disconnect()
+  })
+
   // The sacred test (playbook §4): drop the connection FOR REAL, from the
   // server side, and prove the client fully recovers.
   test('recovers after all connections are killed server-side (CLIENT KILL)', { timeout: 60000 }, async () => {

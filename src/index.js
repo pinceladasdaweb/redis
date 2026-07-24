@@ -495,57 +495,66 @@ class RedisClient {
   }
 
   async _getAllStream (pattern = '*') {
+    const client = this.client
+
     return new Promise((resolve, reject) => {
       const data = []
-      const pending = []
-      let totalKeys = 0
-      let nullValues = 0
+      const seen = new Set()
 
-      const stream = this.client.scanStream({
-        match: pattern
+      // ioredis does NOT apply keyPrefix to SCAN MATCH patterns: prefix it
+      // ourselves, so the scan is confined to this client's keyspace instead
+      // of sweeping the whole database (and other applications' keys).
+      const stream = client.scanStream({
+        match: `${this.keyPrefix}${pattern}`,
+        count: 100
       })
 
       stream.on('data', (keys) => {
-        totalKeys += keys.length
+        if (keys.length === 0) {
+          return
+        }
 
-        const promises = keys.map(async (key) => {
-          const property = this.omitPrefix(key)
-          const value = await this.client.get(property)
+        // One pipelined round-trip per SCAN batch (bounded concurrency), and
+        // per-key errors — e.g. WRONGTYPE for non-string keys — skip that key
+        // instead of rejecting the whole scan.
+        stream.pause()
 
-          if (value === null) {
-            nullValues++
+        const properties = keys.map((key) => this.omitPrefix(key))
 
-            this.logger.warn(`Null value found for key: ${property}`)
+        client.pipeline(properties.map((property) => ['get', property])).exec()
+          .then((results) => {
+            results.forEach(([err, value], index) => {
+              const property = properties[index]
 
-            const ttl = await this.client.ttl(property)
-            const type = await this.client.type(property)
+              if (err) {
+                this.logger.debug?.(`getAllStream skipped key '${property}': ${err.message}`)
+                return
+              }
 
-            this.logger.info(`Key ${property} - Type: ${type}, TTL: ${ttl}`)
-          } else {
-            data.push({ [property]: value })
-          }
-        })
+              // SCAN may return a key more than once; null means the key
+              // expired or was deleted between SCAN and GET.
+              if (value !== null && !seen.has(property)) {
+                seen.add(property)
+                data.push({ [property]: value })
+              }
+            })
 
-        pending.push(...promises)
+            stream.resume()
+          })
+          .catch((err) => {
+            this.logger.error(`Error in getAllStream: ${err.message}`)
+            stream.destroy()
+            reject(err)
+          })
       })
 
-      stream.on('end', async () => {
-        try {
-          await Promise.all(pending)
-
-          this.logger.info(`Redis getAllStream is complete. Total keys: ${totalKeys}, null values: ${nullValues}, valid entries: ${data.length}`)
-
-          resolve(data)
-        } catch (err) {
-          this.logger.error(`Error in getAllStream: ${err.message}`)
-
-          reject(err)
-        }
+      stream.on('end', () => {
+        this.logger.debug?.(`Redis getAllStream is complete. Entries: ${data.length}`)
+        resolve(data)
       })
 
       stream.on('error', (error) => {
         this.logger.error(`Error in getAllStream: ${error.message}`)
-
         reject(error)
       })
     })
