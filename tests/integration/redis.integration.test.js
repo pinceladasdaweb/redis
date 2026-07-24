@@ -174,6 +174,75 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // The facade is an EventEmitter: connection lifecycle is observable.
+  test('emits connection lifecycle events across a server-side kill', { timeout: 30000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    const events = []
+
+    for (const name of ['ready', 'close', 'reconnecting', 'end']) {
+      client.on(name, () => events.push(name))
+    }
+
+    await client.connect()
+    assert.ok(events.includes('ready'), 'ready must fire on connect')
+
+    await client.set('it:events', '1')
+    await waitFor(async () => (await listOtherClientIds()).length >= 1, {
+      message: 'library connection to appear in CLIENT LIST'
+    })
+    await killAllOtherClients()
+
+    await waitFor(async () => events.filter((e) => e === 'ready').length >= 2, {
+      message: 'a second ready after the server-side kill'
+    })
+    assert.ok(events.includes('close'), 'close must fire when the connection drops')
+    assert.ok(events.includes('reconnecting'), 'reconnecting must fire during recovery')
+
+    await client.disconnect()
+    assert.ok(events.includes('end'), 'end must fire after disconnect()')
+
+    await client.del?.('it:events').catch(() => {})
+  })
+
+  // withDedicatedConnection isolates WATCH/MULTI/EXEC: the watch must abort
+  // the transaction when the watched key changes — something the shared
+  // connection could never guarantee under concurrency.
+  test('withDedicatedConnection provides working optimistic locking', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'tx:', logger: quietLogger })
+    await client.connect()
+
+    await client.set('balance', '10')
+
+    // Happy path: watch + multi + exec commits.
+    const committed = await client.withDedicatedConnection(async (conn) => {
+      await conn.watch('balance')
+      const current = Number(await conn.get('balance'))
+
+      return conn.multi().set('balance', String(current + 5)).exec()
+    })
+    assert.ok(committed, 'transaction must commit when the key is untouched')
+    assert.equal(await client.get('balance'), '15')
+
+    // Conflict path: the shared connection mutates the watched key mid-flight
+    // and EXEC must abort (null) — proof the WATCH actually protects.
+    const aborted = await client.withDedicatedConnection(async (conn) => {
+      await conn.watch('balance')
+      await client.set('balance', '99')
+
+      return conn.multi().set('balance', '0').exec()
+    })
+    assert.equal(aborted, null, 'transaction must abort when the watched key changes')
+    assert.equal(await client.get('balance'), '99')
+
+    // The dedicated connections are released afterwards.
+    await waitFor(async () => (await listOtherClientIds()).length === 1, {
+      message: 'dedicated connections to be released'
+    })
+
+    await client.del('balance')
+    await client.disconnect()
+  })
+
   // The sacred test (playbook §4): drop the connection FOR REAL, from the
   // server side, and prove the client fully recovers.
   test('recovers after all connections are killed server-side (CLIENT KILL)', { timeout: 60000 }, async () => {

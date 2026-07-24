@@ -1,19 +1,18 @@
 import Logger from './logger.js'
 import RedisConfig from './config.js'
+import HealthChecker from './health.js'
+import scanKeyspace from './scanner.js'
+import RedisClientError from './errors.js'
+import { EventEmitter } from 'node:events'
+import ConnectionManager from './connection.js'
 
-class RedisClientError extends Error {
-  constructor (message, operation, code = 'REDIS_CLIENT_ERROR') {
-    super(message)
-    this.name = 'RedisClientError'
-    this.operation = operation
-    this.code = code
-  }
-}
-
-class RedisClient {
-  #connectPromise = null
-
+// Thin facade: wires the collaborators together through a small context
+// (logger, config, emit) and exposes the command surface. Mutable state is
+// always reached through getters — never captured references.
+class RedisClient extends EventEmitter {
   constructor (options = {}) {
+    super()
+
     const retryConfig = {
       maxRetryAttempts: options.maxRetryAttempts ?? Infinity,
       baseRetryDelay: options.baseRetryDelay ?? 1000,
@@ -29,186 +28,76 @@ class RedisClient {
     })
 
     this.config = this.redisConfig.getOptions()
-    this.client = null
     this.keyPrefix = this.config.keyPrefix ?? ''
-    this.isConnected = false
-    this.lastHealthCheckTime = 0
-    this.healthCheckInterval = options.healthCheckInterval ?? 5000
-    this.healthCheckTimeout = options.healthCheckTimeout ?? 1000
-    this.healthCheckPromise = null
+
+    this.connection = new ConnectionManager({
+      redisConfig: this.redisConfig,
+      logger: this.logger,
+      emit: (event, ...args) => this.emit(event, ...args)
+    })
+
+    this.health = new HealthChecker({
+      getClient: () => this.connection.client,
+      logger: this.logger,
+      interval: options.healthCheckInterval ?? 5000,
+      timeout: options.healthCheckTimeout ?? 1000
+    })
   }
 
-  // Reconnection is owned entirely by the ioredis driver (retryStrategy /
-  // reconnectOnError in RedisConfig): a single client instance survives the
-  // whole connect()..disconnect() cycle and the listeners below only track
-  // state. The library never creates a second client for the same cycle.
+  get client () {
+    return this.connection.client
+  }
+
+  get isConnected () {
+    return this.connection.isConnected
+  }
+
   async connect () {
-    if (this.client) {
-      this.logger.debug?.('Redis client already exists. Reusing existing connection.')
-      return
-    }
-
-    if (!this.#connectPromise) {
-      this.#connectPromise = this.#establishConnection().finally(() => {
-        this.#connectPromise = null
-      })
-    }
-
-    return this.#connectPromise
+    return this.connection.connect()
   }
 
-  async #establishConnection () {
-    const client = this.redisConfig.createRedisClient()
-    this.client = client
-
-    client.on('ready', () => {
-      this.isConnected = true
-      this.logger.info('Redis connection is ready')
-    })
-
-    client.on('error', (err) => {
-      this.logger.error(`Redis client error: ${err.message || err}`)
-    })
-
-    client.on('close', () => {
-      this.isConnected = false
-      this.logger.warn('Redis connection closed')
-    })
-
-    client.on('reconnecting', (delay) => {
-      this.logger.info(`Redis client is reconnecting${typeof delay === 'number' ? ` in ${delay}ms` : ''}...`)
-    })
-
-    client.on('end', () => {
-      // Final state: emitted after quit() or when retryStrategy gives up.
-      // Release the instance so a later connect() starts a fresh cycle.
-      this.isConnected = false
-      client.removeAllListeners()
-
-      if (this.client === client) {
-        this.client = null
-      }
-    })
-
-    try {
-      await client.connect()
-    } catch (err) {
-      if (client.status === 'end') {
-        this.logger.error(`Failed to connect to Redis: ${err.message}`)
-        return
-      }
-
-      // The driver keeps retrying in the background per retryStrategy;
-      // commands stay gated by the health check until it succeeds.
-      this.logger.error(`Failed to connect to Redis: ${err.message}. Reconnection attempts continue in the background.`)
-    }
+  async disconnect () {
+    return this.connection.disconnect()
   }
 
   async checkHealth () {
-    const now = Date.now()
-
-    if (now - this.lastHealthCheckTime < this.healthCheckInterval && this.healthCheckPromise) {
-      return this.healthCheckPromise
-    }
-
-    this.lastHealthCheckTime = now
-    this.healthCheckPromise = this.performHealthCheck()
-    return this.healthCheckPromise
+    return this.health.check()
   }
 
-  // Explicit health probe (real PING with a timeout) for operational checks
-  // like readiness endpoints. Connection state itself is owned by the driver
-  // events — this method observes, it does not mutate.
-  async performHealthCheck () {
-    if (!this.client || this.client.status !== 'ready') {
-      return false
-    }
+  // Escape hatch for anything that must not share the main connection:
+  // WATCH/MULTI/EXEC transactions, blocking reads, SUBSCRIBE experiments.
+  // The dedicated client inherits the full configuration (prefix, retries)
+  // and is always released, whatever fn does.
+  async withDedicatedConnection (fn) {
+    const client = this.connection.assertReady('withDedicatedConnection')
+    const dedicated = client.duplicate()
+
+    dedicated.on('error', (err) => {
+      this.logger.debug?.(`Dedicated connection error: ${err.message}`)
+    })
 
     try {
-      const pong = await this.timeoutOperation(
-        (callback) => {
-          this.client.ping((err, result) => {
-            if (err) {
-              callback(err)
-            } else {
-              callback(null, result)
-            }
-          })
-        },
-        this.healthCheckTimeout
-      )
-
-      return pong === 'PONG'
-    } catch (error) {
-      this.logger.error(`Redis health check failed: ${error.message}`)
-
-      return false
+      return await fn(dedicated)
+    } finally {
+      dedicated.disconnect()
     }
-  }
-
-  timeoutOperation (operation, ms) {
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        reject(new Error('Operation timed out'))
-      }, ms)
-
-      operation((err, result) => {
-        clearTimeout(timeoutId)
-
-        if (err) {
-          reject(err)
-        } else {
-          resolve(result)
-        }
-      })
-    })
-  }
-
-  // Fail-fast gate: a cheap local probe of the driver's own status, never a
-  // network round-trip. Commands issued while disconnected throw a structured
-  // REDIS_UNAVAILABLE error instead of silently resolving to null — writes
-  // must never look successful when nothing happened. Reconnection is not
-  // this gate's job: the driver already owns it.
-  #assertReady (operation) {
-    const client = this.client
-
-    if (!client || client.status !== 'ready') {
-      this.logger.debug?.(`Redis is not connected. Rejecting '${operation}'.`)
-
-      throw new RedisClientError(
-        `Redis is not connected. Cannot execute '${operation}'.`,
-        operation,
-        'REDIS_UNAVAILABLE'
-      )
-    }
-
-    return client
   }
 
   // Blocking commands (XREAD/XREADGROUP with BLOCK) run on a short-lived
   // dedicated connection: on the shared one they would stall every other
   // command of the application until the block resolves.
   async executeBlockingCommand (command, args) {
-    const client = this.#assertReady(command)
-    const blockingClient = client.duplicate()
-
-    blockingClient.on('error', (err) => {
-      this.logger.debug?.(`Blocking '${command}' connection error: ${err.message}`)
-    })
-
     try {
-      return await blockingClient[command](...args)
+      return await this.withDedicatedConnection((client) => client[command](...args))
     } catch (err) {
       this.logError(err, command)
 
       throw err
-    } finally {
-      blockingClient.disconnect()
     }
   }
 
   async executeCommand (command, ...args) {
-    const client = this.#assertReady(command)
+    const client = this.connection.assertReady(command)
 
     try {
       if (command === 'getAllStream') {
@@ -407,16 +296,16 @@ class RedisClient {
   }
 
   async multi () {
-    return this.#assertReady('multi').multi()
+    return this.connection.assertReady('multi').multi()
   }
 
   // WATCH state is per-connection: on the shared connection, concurrent
   // flows watching keys poison each other (any EXEC/UNWATCH clears ALL
-  // watches). Refusing loudly beats silently-wrong optimistic locking; a
-  // transaction API with a dedicated connection is planned.
+  // watches). Refusing loudly beats silently-wrong optimistic locking —
+  // use withDedicatedConnection() for isolated WATCH/MULTI/EXEC.
   async watch () {
     throw new RedisClientError(
-      'watch() is not supported on the shared connection. Use multi() for atomic batches.',
+      'watch() is not supported on the shared connection. Use withDedicatedConnection() for isolated WATCH/MULTI/EXEC.',
       'watch',
       'UNSUPPORTED_OPERATION'
     )
@@ -424,7 +313,7 @@ class RedisClient {
 
   async unwatch () {
     throw new RedisClientError(
-      'unwatch() is not supported on the shared connection. Use multi() for atomic batches.',
+      'unwatch() is not supported on the shared connection. Use withDedicatedConnection() for isolated WATCH/MULTI/EXEC.',
       'unwatch',
       'UNSUPPORTED_OPERATION'
     )
@@ -563,99 +452,12 @@ class RedisClient {
   }
 
   async _getAllStream (pattern = '*') {
-    const client = this.client
-
-    return new Promise((resolve, reject) => {
-      const data = []
-      const seen = new Set()
-
-      // ioredis does NOT apply keyPrefix to SCAN MATCH patterns: prefix it
-      // ourselves, so the scan is confined to this client's keyspace instead
-      // of sweeping the whole database (and other applications' keys).
-      const stream = client.scanStream({
-        match: `${this.keyPrefix}${pattern}`,
-        count: 100
-      })
-
-      stream.on('data', (keys) => {
-        if (keys.length === 0) {
-          return
-        }
-
-        // One pipelined round-trip per SCAN batch (bounded concurrency), and
-        // per-key errors — e.g. WRONGTYPE for non-string keys — skip that key
-        // instead of rejecting the whole scan.
-        stream.pause()
-
-        const properties = keys.map((key) => this.omitPrefix(key))
-
-        client.pipeline(properties.map((property) => ['get', property])).exec()
-          .then((results) => {
-            results.forEach(([err, value], index) => {
-              const property = properties[index]
-
-              if (err) {
-                this.logger.debug?.(`getAllStream skipped key '${property}': ${err.message}`)
-                return
-              }
-
-              // SCAN may return a key more than once; null means the key
-              // expired or was deleted between SCAN and GET.
-              if (value !== null && !seen.has(property)) {
-                seen.add(property)
-                data.push({ [property]: value })
-              }
-            })
-
-            stream.resume()
-          })
-          .catch((err) => {
-            this.logger.error(`Error in getAllStream: ${err.message}`)
-            stream.destroy()
-            reject(err)
-          })
-      })
-
-      stream.on('end', () => {
-        this.logger.debug?.(`Redis getAllStream is complete. Entries: ${data.length}`)
-        resolve(data)
-      })
-
-      stream.on('error', (error) => {
-        this.logger.error(`Error in getAllStream: ${error.message}`)
-        reject(error)
-      })
+    return scanKeyspace({
+      client: this.connection.client,
+      keyPrefix: this.keyPrefix,
+      logger: this.logger,
+      pattern
     })
-  }
-
-  // Final and idempotent: quit() makes the driver emit 'end', which releases
-  // the client (see #establishConnection) without ever scheduling a
-  // reconnection. A later connect() starts a brand-new cycle.
-  async disconnect () {
-    const client = this.client
-
-    if (!client) {
-      return
-    }
-
-    try {
-      if (client.status !== 'end') {
-        await client.quit()
-      }
-
-      this.logger.info('Redis client disconnected successfully')
-    } catch (err) {
-      this.logger.warn(`Error during Redis quit: ${err.message}. Forcing the connection closed.`)
-      client.disconnect()
-    } finally {
-      client.removeAllListeners()
-
-      if (this.client === client) {
-        this.client = null
-      }
-
-      this.isConnected = false
-    }
   }
 
   omitPrefix (key) {
