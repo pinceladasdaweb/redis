@@ -3,19 +3,34 @@ on:
   push:
     branches:
       - main
+permissions:
+  contents: write
+  # Required for OIDC trusted publishing: npm exchanges the workflow's
+  # identity token for a short-lived credential — no NPM_TOKEN secret.
+  id-token: write
+# Serialize releases: concurrent pushes to main must not race each other
+# through version bump / publish / tag push.
+concurrency:
+  group: publish
+  cancel-in-progress: false
 jobs:
-  publish-gpr:
-    name: Publish package on GitHub Packages
+  publish-npm:
+    name: Publish package on npm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
-          registry-url: 'https://npm.pkg.github.com'
-          scope: '@oisamitech'
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing (OIDC) requires npm >= 11.5.1; the runner's
+      # bundled npm may lag behind, so upgrade explicitly.
+      - name: Update npm for trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
       - name: Configure git
         run: |
           git config --global user.name "Github Actions"
@@ -23,18 +38,28 @@ jobs:
       - name: Install dependencies
         run: |
           npm install
+      - name: Lint and unit tests
+        run: |
+          npx standard src/ tests/
+          npm test
       - name: Bump version based on commit message
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%B)
           echo "Last commit message: $COMMIT_MSG"
 
-          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          # The npm registry is the source of truth for what is already
+          # published: basing the bump on package.json/tags desyncs whenever
+          # a previous run publishes but fails a later step.
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PUBLISHED_VERSION=$(npm view "$PKG_NAME" version 2>/dev/null || true)
 
-          if [[ -z $(git describe --tags --abbrev=0 2>/dev/null) ]]; then
-            echo "No tags found. This might be the first release."
-            echo "Using current version from package.json: $CURRENT_VERSION"
-            NEW_VERSION=$CURRENT_VERSION
+          if [[ -z "$PUBLISHED_VERSION" ]]; then
+            NEW_VERSION=$(node -p "require('./package.json').version")
+            echo "Package not on the registry yet. Using package.json version: $NEW_VERSION"
           else
+            echo "Latest published version: $PUBLISHED_VERSION"
+            npm version "$PUBLISHED_VERSION" --no-git-tag-version --allow-same-version
+
             if [[ $COMMIT_MSG == *"BREAKING CHANGE"* || $COMMIT_MSG == *"major"* ]]; then
               echo "Major version bump"
               NEW_VERSION=$(npm version major --no-git-tag-version)
@@ -91,19 +116,12 @@ jobs:
           fi
 
           echo -e "${changelog_content}${existing_changelog}" > CHANGELOG.md
-      - name: Update package.json for GitHub Packages
+      # Authentication happens via OIDC trusted publishing (id-token: write
+      # + the trusted publisher configured on npmjs.com) — no token secret.
+      # Provenance attestation is generated automatically.
+      - name: Publish package to npm
         run: |
-          repo_name="${GITHUB_REPOSITORY#*/}"
-          jq '.name = "@oisamitech/'"$repo_name"'"' package.json > tmp.json && mv tmp.json package.json
-          jq '.repository.url = "git+https://github.com/'"$GITHUB_REPOSITORY"'.git"' package.json > tmp.json && mv tmp.json package.json
-          jq '.bugs.url = "https://github.com/'"$GITHUB_REPOSITORY"'/issues"' package.json > tmp.json && mv tmp.json package.json
-          jq '.homepage = "https://github.com/'"$GITHUB_REPOSITORY"'#readme"' package.json > tmp.json && mv tmp.json package.json
-      - name: Publish package to GitHub Packages
-        run: |
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
-          npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          npm publish --access public
       - name: Create and push tag
         run: |
           NEW_VERSION=$(node -p "require('./package.json').version")
@@ -118,4 +136,3 @@ jobs:
           )
 
           git push origin HEAD
-
