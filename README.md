@@ -200,6 +200,12 @@ const report = await redis.getOrSetJson('report:daily', 3600, buildExpensiveRepo
 // lock accepts LockOptions too: { lock: { ttl: 30000, retries: 200 } }
 ```
 
+Guarantees worth knowing:
+
+- The cache lock auto-extends by default, so a producer slower than the lock ttl does not reopen the stampede.
+- A cache call never surfaces lock errors: a waiter that exhausts its retry budget re-reads the cache (the winner has usually filled it by then) and, as a last resort, runs the producer without protection.
+- The producer's value must be cacheable — `getOrSet` accepts strings and numbers, `getOrSetJson` anything JSON-serializable. Anything else (including `undefined`) rejects with `INVALID_ARGUMENT` **without writing to the cache**.
+
 To invalidate, delete by pattern — `SCAN` + `UNLINK` in batches (non-blocking, never `KEYS`), confined to your `keyPrefix`:
 
 ```javascript

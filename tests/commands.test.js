@@ -134,6 +134,19 @@ describe('command argument building', () => {
     await assert.rejects(client.getOrSetJson('k', 60, 'not-a-function'), { code: 'INVALID_ARGUMENT' })
   })
 
+  // Review finding: JSON.stringify(undefined) is undefined — caching it
+  // stored an empty string that poisoned the key until the ttl expired.
+  test('getOrSet rejects non-cacheable producer values without writing anything', async () => {
+    const { client, calls } = capture()
+
+    await assert.rejects(client.getOrSetJson('k', 60, () => undefined), { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(client.getOrSetJson('k', 60, () => () => {}), { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(client.getOrSet('k', 60, () => ({ object: true })), { code: 'INVALID_ARGUMENT' })
+
+    const writes = calls.filter(([command]) => command === 'setex')
+    assert.equal(writes.length, 0, 'nothing may be cached when the producer value is invalid')
+  })
+
   test('deleteByPattern requires an explicit non-empty pattern', async () => {
     const { client } = capture()
 

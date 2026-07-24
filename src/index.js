@@ -211,14 +211,39 @@ class RedisClient extends EventEmitter {
   // library's own lock and re-read (dogpile/stampede protection).
   async getOrSet (key, ttlSeconds, producer, options = {}) {
     return this.#getOrSet(key, ttlSeconds, producer, options, {
-      encode: (value) => String(value),
+      encode: (value) => {
+        if (typeof value !== 'string' && typeof value !== 'number') {
+          throw new RedisClientError(
+            'getOrSet caches strings and numbers only — use getOrSetJson for anything else.',
+            'getOrSet',
+            'INVALID_ARGUMENT'
+          )
+        }
+
+        return String(value)
+      },
       decode: (raw) => raw
     })
   }
 
   async getOrSetJson (key, ttlSeconds, producer, options = {}) {
     return this.#getOrSet(key, ttlSeconds, producer, options, {
-      encode: (value) => JSON.stringify(value),
+      encode: (value) => {
+        const encoded = JSON.stringify(value)
+
+        // JSON.stringify returns undefined for undefined/functions/symbols;
+        // caching that would poison the key (an empty string that every
+        // later read fails to parse until the ttl expires).
+        if (typeof encoded !== 'string') {
+          throw new RedisClientError(
+            'getOrSetJson requires the producer to return a JSON-serializable value (got undefined, a function or a symbol).',
+            'getOrSetJson',
+            'INVALID_ARGUMENT'
+          )
+        }
+
+        return encoded
+      },
       decode: (raw) => JSON.parse(raw)
     })
   }
@@ -265,19 +290,41 @@ class RedisClient extends EventEmitter {
       retries: 100,
       retryDelay: 50,
       retryJitter: 50,
+      // Producers slower than the lock ttl must not reopen the stampede.
+      autoExtend: true,
       ...(typeof lock === 'object' ? lock : {})
     }
 
-    return this.locks.withLock(`cache:${key}`, lockOptions, async () => {
-      // Double-check: the winner may have filled the cache while we waited.
-      const refreshed = await this.get(key)
+    try {
+      return await this.locks.withLock(`cache:${key}`, lockOptions, async () => {
+        // Double-check: the winner may have filled the cache while we waited.
+        const refreshed = await this.get(key)
 
-      if (refreshed !== null) {
-        return decode(refreshed)
+        if (refreshed !== null) {
+          return decode(refreshed)
+        }
+
+        return produceAndStore()
+      })
+    } catch (err) {
+      if (err?.code !== 'LOCK_NOT_ACQUIRED') {
+        throw err
+      }
+
+      // A cache call must not surface lock errors. Waiters land here after
+      // waiting out their whole retry budget, so the winner has probably
+      // filled the cache by now — re-read, and only produce unprotected as
+      // the last resort (availability beats perfect stampede protection).
+      this.logger.debug?.(`Cache lock for '${key}' not acquired within the retry budget — falling back.`)
+
+      const fallback = await this.get(key)
+
+      if (fallback !== null) {
+        return decode(fallback)
       }
 
       return produceAndStore()
-    })
+    }
   }
 
   // Non-blocking bulk deletion (SCAN + UNLINK batches) confined to the

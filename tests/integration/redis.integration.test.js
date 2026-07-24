@@ -432,6 +432,53 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Review regression: an undefined-returning producer used to store an
+  // empty string with a ttl, poisoning every later read with SyntaxError.
+  test('getOrSetJson never caches an invalid producer value', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    await assert.rejects(client.getOrSetJson('it:cache:poison', 60, () => undefined), { code: 'INVALID_ARGUMENT' })
+    assert.equal(await client.get('it:cache:poison'), null, 'the key must not be written')
+
+    // The key stays healthy for a well-behaved producer afterwards.
+    assert.deepEqual(await client.getOrSetJson('it:cache:poison', 60, () => ({ ok: true })), { ok: true })
+
+    await client.del('it:cache:poison')
+    await client.disconnect()
+  })
+
+  // Review regression: waiters that exhausted the lock retry budget used to
+  // reject with LOCK_NOT_ACQUIRED — a lock error leaking from a cache call.
+  test('getOrSetJson degrades gracefully when the lock budget is exceeded', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    let calls = 0
+    const slowProducer = async () => {
+      calls++
+      await sleep(600)
+      return { ok: true }
+    }
+
+    // Tiny budget (~2 retries of 50ms) against a 600ms producer: the loser
+    // exhausts its retries while the winner still holds the lock.
+    const results = await Promise.allSettled([
+      client.getOrSetJson('it:cache:budget', 60, slowProducer, { lock: { retries: 2, retryDelay: 50, retryJitter: 0 } }),
+      client.getOrSetJson('it:cache:budget', 60, slowProducer, { lock: { retries: 2, retryDelay: 50, retryJitter: 0 } })
+    ])
+
+    for (const result of results) {
+      assert.equal(result.status, 'fulfilled', `cache calls must not reject with lock errors (${result.reason?.code})`)
+      assert.deepEqual(result.value, { ok: true })
+    }
+
+    assert.ok(calls <= 2, `fallback may produce at most once per loser (producer ran ${calls} times)`)
+
+    await client.del('it:cache:budget')
+    await client.disconnect()
+  })
+
   test('deleteByPattern unlinks only matching keys inside the prefix', { timeout: 15000 }, async () => {
     const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'dbp:', logger: quietLogger })
     await client.connect()

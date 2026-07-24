@@ -120,8 +120,10 @@ export interface LockOptions {
 
 export interface CacheAsideOptions {
   /**
-   * Stampede protection: true (defaults: ttl 10s, 100 retries of 50ms+jitter)
-   * or LockOptions to tune. Concurrent misses collapse into one producer call.
+   * Stampede protection: true (defaults: ttl 10s auto-extended, 100 retries
+   * of 50ms+jitter) or LockOptions to tune. Concurrent misses collapse into
+   * one producer call. Lock errors never surface from cache calls: an
+   * exhausted retry budget falls back to re-read, then unprotected produce.
    */
   lock?: boolean | LockOptions
 }
