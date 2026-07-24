@@ -10,6 +10,8 @@ Every reliability claim in this README is enforced by the integration suite agai
 - **Fail-fast structured errors**: commands issued while disconnected reject immediately with `code: 'REDIS_UNAVAILABLE'` — a write never looks successful when nothing happened. No network round-trip is added to the hot path.
 - **Observable lifecycle**: `RedisClient` is an `EventEmitter` — `ready`, `close`, `reconnecting`, `end` and `connectionError` tell you exactly what the connection is doing.
 - **Dedicated connections when they matter**: blocking stream reads (`BLOCK`) never stall the shared connection, and `withDedicatedConnection()` gives you isolated `WATCH`/`MULTI`/`EXEC` optimistic locking that actually works under concurrency.
+- **Pub/Sub that survives outages**: subscriptions live on a dedicated connection and are automatically restored after reconnections — enforced by a server-side `CLIENT KILL` test.
+- **Distributed locking (single instance)**: `withLock()`/`acquireLock()` with `SET NX PX` acquisition and token-checked Lua release — a holder can never release or extend someone else's lock.
 - **Bring your own logger**: inject any pino/winston/bunyan instance; the built-in fallback is a dependency-free leveled console logger.
 - **JSON helpers**: `setJson`/`getJson`/`setexJson` with explicit serialization — never magic.
 - **Prefixed keyspace scan**: `getAllStream(pattern)` dumps your keys (and only yours — `keyPrefix` is honored, unlike raw `SCAN`), skipping non-string types gracefully.
@@ -106,6 +108,8 @@ Reconnection is handled entirely by the ioredis driver — there is exactly one 
 | `reconnecting` | `delay?: number` | The driver scheduled a reconnection attempt |
 | `end` | — | The client is done: after `disconnect()`, or when `maxRetryAttempts` is exhausted |
 | `connectionError` | `Error` | The driver reported a connection-level error (never emitted as `'error'`, so an unsubscribed process is never crashed) |
+| `message` | `channel, message` | A subscribed channel received a message |
+| `pmessage` | `pattern, channel, message` | A pattern subscription received a message |
 
 ```javascript
 redis.once('ready', () => console.log('connected'))
@@ -120,6 +124,7 @@ All library errors are `RedisClientError` instances carrying `operation` and a s
 | --- | --- |
 | `REDIS_UNAVAILABLE` | The command was rejected because the connection is not ready. Nothing was sent |
 | `UNSUPPORTED_OPERATION` | The method cannot work safely on the shared connection (`watch`/`unwatch`) |
+| `LOCK_NOT_ACQUIRED` | `acquireLock`/`withLock` could not obtain the lock within the configured retries |
 | `REDIS_CLIENT_ERROR` | Generic library error |
 
 ```javascript
@@ -178,6 +183,50 @@ const committed = await redis.withDedicatedConnection(async (conn) => {
 })
 ```
 
+## Pub/Sub
+
+A Redis connection in subscriber mode cannot run regular commands, so subscriptions live on a **dedicated connection** managed by the library (created on the first `subscribe`, released on `disconnect()`). Subscriptions survive reconnections automatically — the integration suite kills the subscriber server-side and proves delivery resumes.
+
+```javascript
+await redis.subscribe('news', (message, channel) => {
+  console.log(`${channel}: ${message}`)
+})
+
+await redis.psubscribe('logs.*', (message, channel, pattern) => {
+  console.log(`${pattern} matched ${channel}`)
+})
+
+await redis.publish('news', 'hello')
+await redis.publishJson('logs.app', { level: 'info' })
+
+await redis.unsubscribe('news')
+await redis.punsubscribe('logs.*')
+```
+
+Messages also arrive as facade events (`message`, `pmessage`) if you prefer a single listener. Handler rejections are caught and logged — they never crash the process. Note: channels are not keys, so `keyPrefix` does not apply to them.
+
+## Distributed locking
+
+Single-instance locking: acquisition via `SET NX PX`, release and extension via Lua scripts that check the holder token — you can never release or extend a lock you no longer hold. This is a best-effort mutex against one Redis instance, **not** Redlock: no multi-node quorum claims.
+
+```javascript
+// Managed: acquire, run, always release
+await redis.withLock('reports:daily', { ttl: 60000, retries: 5, retryDelay: 200 }, async () => {
+  await generateDailyReport()
+})
+
+// Manual control
+const lock = await redis.acquireLock('reports:daily', { ttl: 60000 })
+try {
+  await generateDailyReport()
+  await lock.extend(60000) // still holding? reset the ttl
+} finally {
+  await lock.release() // false if the lock had already expired
+}
+```
+
+Failing to acquire rejects with `code: 'LOCK_NOT_ACQUIRED'`. Locks are stored as `lock:<name>` (your `keyPrefix` applies). Scripts are cached and transparently reloaded after a server restart (`NOSCRIPT`). Keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
+
 ## Streams
 
 All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xlen`, `xinfo`, `xrange`, `xrevrange`, `xdel`, `xtrim`, `xpending`, `xclaim`). Two behaviors worth knowing:
@@ -211,6 +260,8 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Sets**: `sadd`, `smembers`, `sismember`, `scard`, `spop` (single member without `count`, array with it), `srem`
 **Keys**: `del`, `exists`, `type`, `rename`, `renamenx`, `persist`, `expire`, `ttl`, `sort`
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
+**Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`
+**Locking**: `acquireLock`, `withLock`
 **Streams**: see [Streams](#streams)
 **Scan**: `getAllStream(pattern)`
 

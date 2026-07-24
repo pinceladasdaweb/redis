@@ -51,7 +51,7 @@ export interface RedisClientOptions {
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
@@ -92,7 +92,28 @@ export interface StreamPendingOptions {
 export type StreamEntry = [id: string, fields: string[]]
 export type StreamReadResult = Array<[key: string, entries: StreamEntry[]]> | null
 
-export type RedisClientEvent = 'ready' | 'close' | 'reconnecting' | 'end' | 'connectionError'
+export type RedisClientEvent = 'ready' | 'close' | 'reconnecting' | 'end' | 'connectionError' | 'message' | 'pmessage'
+
+/** Handler for subscribe()/psubscribe(). `pattern` is set for pattern subscriptions only. */
+export type PubSubHandler = (message: string, channel: string, pattern?: string) => void | Promise<void>
+
+export interface LockOptions {
+  /** Lock lifetime in ms. The critical section must finish within it. Default: 30000. */
+  ttl?: number
+  /** Extra acquisition attempts when the lock is taken. Default: 0. */
+  retries?: number
+  /** Delay between acquisition attempts (ms). Default: 100. */
+  retryDelay?: number
+}
+
+export interface Lock {
+  name: string
+  token: string
+  /** Deletes the lock only if still held by this token. False means it was already gone. */
+  release (): Promise<boolean>
+  /** Resets the ttl only if still held by this token. */
+  extend (ttlMs?: number): Promise<boolean>
+}
 
 export declare class RedisClient extends EventEmitter {
   constructor (options?: RedisClientOptions)
@@ -106,11 +127,15 @@ export declare class RedisClient extends EventEmitter {
   on (event: 'ready' | 'close' | 'end', listener: () => void): this
   on (event: 'reconnecting', listener: (delay?: number) => void): this
   on (event: 'connectionError', listener: (err: Error) => void): this
+  on (event: 'message', listener: (channel: string, message: string) => void): this
+  on (event: 'pmessage', listener: (pattern: string, channel: string, message: string) => void): this
   on (event: string | symbol, listener: (...args: unknown[]) => void): this
 
   once (event: 'ready' | 'close' | 'end', listener: () => void): this
   once (event: 'reconnecting', listener: (delay?: number) => void): this
   once (event: 'connectionError', listener: (err: Error) => void): this
+  once (event: 'message', listener: (channel: string, message: string) => void): this
+  once (event: 'pmessage', listener: (pattern: string, channel: string, message: string) => void): this
   once (event: string | symbol, listener: (...args: unknown[]) => void): this
 
   connect (): Promise<void>
@@ -186,6 +211,20 @@ export declare class RedisClient extends EventEmitter {
   watch (...keys: string[]): Promise<never>
   /** Always rejects with UNSUPPORTED_OPERATION — use withDedicatedConnection(). */
   unwatch (): Promise<never>
+
+  /** Channels are not keys: keyPrefix does not apply to pub/sub. */
+  publish (channel: string, message: string | number | Buffer): Promise<number>
+  publishJson (channel: string, value: unknown): Promise<number>
+  /** Subscriptions live on a dedicated connection and survive reconnections. */
+  subscribe (channel: string, handler?: PubSubHandler): Promise<unknown>
+  unsubscribe (channel: string): Promise<unknown>
+  psubscribe (pattern: string, handler?: PubSubHandler): Promise<unknown>
+  punsubscribe (pattern: string): Promise<unknown>
+
+  /** Single-instance lock (SET NX PX + token-checked Lua release). Not Redlock. */
+  acquireLock (name: string, options?: LockOptions): Promise<Lock>
+  withLock<T> (name: string, fn: (lock: Lock) => T | Promise<T>): Promise<T>
+  withLock<T> (name: string, options: LockOptions, fn: (lock: Lock) => T | Promise<T>): Promise<T>
 
   xadd (key: string, id: string, ...args: Array<string | number>): Promise<string>
   xread (options: StreamReadOptions, streams: string[]): Promise<StreamReadResult>

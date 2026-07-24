@@ -1,3 +1,4 @@
+import LockManager from './lock.js'
 import RedisConfig from './config.js'
 import HealthChecker from './health.js'
 import scanKeyspace from './scanner.js'
@@ -5,6 +6,7 @@ import RedisClientError from './errors.js'
 import { EventEmitter } from 'node:events'
 import ConnectionManager from './connection.js'
 import Logger, { createLogger } from './logger.js'
+import SubscriptionManager from './pubsub.js'
 
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
@@ -42,6 +44,17 @@ class RedisClient extends EventEmitter {
       interval: options.healthCheckInterval ?? 5000,
       timeout: options.healthCheckTimeout ?? 1000
     })
+
+    this.subscriptions = new SubscriptionManager({
+      connection: this.connection,
+      logger: this.logger,
+      emit: (event, ...args) => this.emit(event, ...args)
+    })
+
+    this.locks = new LockManager({
+      connection: this.connection,
+      logger: this.logger
+    })
   }
 
   get client () {
@@ -57,6 +70,8 @@ class RedisClient extends EventEmitter {
   }
 
   async disconnect () {
+    await this.subscriptions.close()
+
     return this.connection.disconnect()
   }
 
@@ -317,6 +332,40 @@ class RedisClient extends EventEmitter {
       'unwatch',
       'UNSUPPORTED_OPERATION'
     )
+  }
+
+  // Channels are not keys: keyPrefix does not apply to pub/sub.
+  async publish (channel, message) {
+    return this.executeCommand('publish', channel, message)
+  }
+
+  async publishJson (channel, value) {
+    return this.executeCommand('publish', channel, JSON.stringify(value))
+  }
+
+  async subscribe (channel, handler) {
+    return this.subscriptions.subscribe(channel, handler)
+  }
+
+  async unsubscribe (channel) {
+    return this.subscriptions.unsubscribe(channel)
+  }
+
+  async psubscribe (pattern, handler) {
+    return this.subscriptions.psubscribe(pattern, handler)
+  }
+
+  async punsubscribe (pattern) {
+    return this.subscriptions.punsubscribe(pattern)
+  }
+
+  // Single-instance distributed lock (SET NX PX + token-checked Lua release).
+  async acquireLock (name, options) {
+    return this.locks.acquire(name, options)
+  }
+
+  async withLock (name, options, fn) {
+    return this.locks.withLock(name, options, fn)
   }
 
   async xadd (key, id, ...args) {
