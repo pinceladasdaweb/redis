@@ -1,4 +1,4 @@
-# @pinceladasdaweb/redis
+# Redis
 
 A resilient Redis client for Node.js built on [ioredis](https://github.com/redis/ioredis), with driver-owned automatic reconnection, fail-fast structured errors, observable connection lifecycle events and JSON helpers.
 
