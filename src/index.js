@@ -1,12 +1,12 @@
 import LockManager from './lock.js'
 import RedisConfig from './config.js'
 import HealthChecker from './health.js'
-import scanKeyspace from './scanner.js'
 import RedisClientError from './errors.js'
 import { EventEmitter } from 'node:events'
+import SubscriptionManager from './pubsub.js'
 import ConnectionManager from './connection.js'
 import Logger, { createLogger } from './logger.js'
-import SubscriptionManager from './pubsub.js'
+import scanKeyspace, { deletePattern } from './scanner.js'
 
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
@@ -203,6 +203,104 @@ class RedisClient extends EventEmitter {
 
   async setexJson (key, seconds, value) {
     return this.executeCommand('setex', key, seconds, JSON.stringify(value))
+  }
+
+  // Cache-aside: return the cached value, or produce it, store it (SETEX)
+  // and return it. With `lock`, concurrent misses collapse into a single
+  // producer call — the winner fills the cache while the others wait on the
+  // library's own lock and re-read (dogpile/stampede protection).
+  async getOrSet (key, ttlSeconds, producer, options = {}) {
+    return this.#getOrSet(key, ttlSeconds, producer, options, {
+      encode: (value) => String(value),
+      decode: (raw) => raw
+    })
+  }
+
+  async getOrSetJson (key, ttlSeconds, producer, options = {}) {
+    return this.#getOrSet(key, ttlSeconds, producer, options, {
+      encode: (value) => JSON.stringify(value),
+      decode: (raw) => JSON.parse(raw)
+    })
+  }
+
+  async #getOrSet (key, ttlSeconds, producer, { lock } = {}, { encode, decode }) {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+      throw new RedisClientError(
+        `getOrSet requires a positive integer ttl in seconds (got ${ttlSeconds}).`,
+        'getOrSet',
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    if (typeof producer !== 'function') {
+      throw new RedisClientError(
+        'getOrSet requires a producer function.',
+        'getOrSet',
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    const cached = await this.get(key)
+
+    if (cached !== null) {
+      return decode(cached)
+    }
+
+    // Every caller gets the value in its cached form (a decode of what was
+    // stored), so winner and waiters always see consistent types.
+    const produceAndStore = async () => {
+      const value = await producer()
+      const encoded = encode(value)
+      await this.setex(key, ttlSeconds, encoded)
+
+      return decode(encoded)
+    }
+
+    if (!lock) {
+      return produceAndStore()
+    }
+
+    const lockOptions = {
+      ttl: 10000,
+      retries: 100,
+      retryDelay: 50,
+      retryJitter: 50,
+      ...(typeof lock === 'object' ? lock : {})
+    }
+
+    return this.locks.withLock(`cache:${key}`, lockOptions, async () => {
+      // Double-check: the winner may have filled the cache while we waited.
+      const refreshed = await this.get(key)
+
+      if (refreshed !== null) {
+        return decode(refreshed)
+      }
+
+      return produceAndStore()
+    })
+  }
+
+  // Non-blocking bulk deletion (SCAN + UNLINK batches) confined to the
+  // prefixed keyspace, same semantics as getAllStream. Returns the number
+  // of keys removed. The pattern is required — '*' wipes the whole
+  // (prefixed) keyspace and must be an explicit choice.
+  async deleteByPattern (pattern) {
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new RedisClientError(
+        "deleteByPattern requires a non-empty pattern (use '*' explicitly to wipe the prefixed keyspace).",
+        'deleteByPattern',
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    const client = this.connection.assertReady('deleteByPattern')
+
+    return deletePattern({
+      client,
+      keyPrefix: this.keyPrefix,
+      logger: this.logger,
+      pattern
+    })
   }
 
   // HMSET is deprecated since Redis 4.0: delegate to variadic HSET.

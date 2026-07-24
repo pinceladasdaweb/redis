@@ -15,6 +15,16 @@ class RedisConfig {
       retryStrategy: this.retryStrategy.bind(this),
       reconnectOnError: this.reconnectOnError.bind(this),
       maxRetriesPerRequest: options.maxRetriesPerRequest ?? null,
+      // Sentinel mode (high availability): only forwarded when configured,
+      // so standalone options stay exactly as ioredis expects them.
+      ...(options.sentinels
+        ? {
+            sentinels: options.sentinels,
+            name: options.name,
+            sentinelPassword: options.sentinelPassword,
+            role: options.role
+          }
+        : {}),
       enableReadyCheck: options.enableReadyCheck ?? true,
       autoResubscribe: options.autoResubscribe ?? true,
       autoResendUnfulfilledCommands: options.autoResendUnfulfilledCommands ?? true,

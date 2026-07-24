@@ -43,6 +43,14 @@ export interface RedisClientOptions {
   autoResendUnfulfilledCommands?: boolean
   /** ioredis passthrough. Default: true. */
   lazyConnect?: boolean
+  /** Sentinel mode: list of sentinel nodes. Enables high availability via ioredis. */
+  sentinels?: Array<{ host: string, port: number }>
+  /** Sentinel mode: the master group name to resolve. */
+  name?: string
+  /** Sentinel mode: password for the sentinel nodes themselves. */
+  sentinelPassword?: string
+  /** Sentinel mode: connect to the 'master' (default) or a 'slave'. */
+  role?: 'master' | 'slave'
   /** Minimum interval in ms between real PINGs issued by checkHealth(). Default: 5000. */
   healthCheckInterval?: number
   /** Timeout in ms for the checkHealth() PING. Default: 1000. */
@@ -98,12 +106,24 @@ export type RedisClientEvent = 'ready' | 'close' | 'reconnecting' | 'end' | 'con
 export type PubSubHandler = (message: string, channel: string, pattern?: string) => void | Promise<void>
 
 export interface LockOptions {
-  /** Lock lifetime in ms. The critical section must finish within it. Default: 30000. */
+  /** Lock lifetime in ms. The critical section must finish within it (or use autoExtend). Default: 30000. */
   ttl?: number
   /** Extra acquisition attempts when the lock is taken. Default: 0. */
   retries?: number
   /** Delay between acquisition attempts (ms). Default: 100. */
   retryDelay?: number
+  /** Random extra delay (0..n ms) added per attempt to avoid retry lockstep under contention. Default: 0. */
+  retryJitter?: number
+  /** withLock() only: keep extending the lock at half-ttl intervals while fn runs. Default: false. */
+  autoExtend?: boolean
+}
+
+export interface CacheAsideOptions {
+  /**
+   * Stampede protection: true (defaults: ttl 10s, 100 retries of 50ms+jitter)
+   * or LockOptions to tune. Concurrent misses collapse into one producer call.
+   */
+  lock?: boolean | LockOptions
 }
 
 export interface Lock {
@@ -170,6 +190,13 @@ export declare class RedisClient extends EventEmitter {
   setJson (key: string, value: unknown): Promise<'OK'>
   getJson<T = unknown> (key: string): Promise<T | null>
   setexJson (key: string, seconds: number, value: unknown): Promise<'OK'>
+
+  /** Cache-aside: cached value, or produce + SETEX + return. String values only — see getOrSetJson. */
+  getOrSet (key: string, ttlSeconds: number, producer: () => string | number | Promise<string | number>, options?: CacheAsideOptions): Promise<string>
+  /** Cache-aside with JSON serialization. */
+  getOrSetJson<T = unknown> (key: string, ttlSeconds: number, producer: () => T | Promise<T>, options?: CacheAsideOptions): Promise<T>
+  /** SCAN + UNLINK batches inside the prefixed keyspace. Returns the number of keys removed. */
+  deleteByPattern (pattern: string): Promise<number>
 
   hset (key: string, field: string, value: string | number): Promise<number>
   hset (key: string, obj: Record<string, string | number>): Promise<number>

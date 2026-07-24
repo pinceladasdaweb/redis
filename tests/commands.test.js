@@ -126,6 +126,21 @@ describe('command argument building', () => {
     assert.deepEqual(calls[0], ['xtrim', 's', 'MAXLEN', '~', 1000])
   })
 
+  test('getOrSet validates ttl and producer before touching the connection', async () => {
+    const { client } = capture()
+
+    await assert.rejects(client.getOrSet('k', 0, () => 'x'), { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(client.getOrSet('k', 1.5, () => 'x'), { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(client.getOrSetJson('k', 60, 'not-a-function'), { code: 'INVALID_ARGUMENT' })
+  })
+
+  test('deleteByPattern requires an explicit non-empty pattern', async () => {
+    const { client } = capture()
+
+    await assert.rejects(client.deleteByPattern(), { code: 'INVALID_ARGUMENT' })
+    await assert.rejects(client.deleteByPattern(''), { code: 'INVALID_ARGUMENT' })
+  })
+
   // Regression: maxRetryAttempts: 0 was clobbered to Infinity by `||`.
   test('retryStrategy honors maxRetryAttempts: 0', () => {
     const client = new RedisClient({ maxRetryAttempts: 0, logger: quietLogger })

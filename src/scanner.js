@@ -66,5 +66,50 @@ const scanKeyspace = ({ client, keyPrefix = '', logger, pattern = '*' }) => {
   })
 }
 
-export { scanKeyspace }
+// SCAN + UNLINK in batches: non-blocking deletion of every key matching the
+// (prefixed) pattern. Same prefix semantics as scanKeyspace.
+const deletePattern = ({ client, keyPrefix = '', logger, pattern }) => {
+  const omitPrefix = (key) =>
+    keyPrefix && key.startsWith(keyPrefix) ? key.slice(keyPrefix.length) : key
+
+  return new Promise((resolve, reject) => {
+    let deleted = 0
+
+    const stream = client.scanStream({
+      match: `${keyPrefix}${pattern}`,
+      count: 100
+    })
+
+    stream.on('data', (keys) => {
+      if (keys.length === 0) {
+        return
+      }
+
+      stream.pause()
+
+      client.unlink(...keys.map(omitPrefix))
+        .then((count) => {
+          deleted += count
+          stream.resume()
+        })
+        .catch((err) => {
+          logger.error(`Error in deleteByPattern: ${err.message}`)
+          stream.destroy()
+          reject(err)
+        })
+    })
+
+    stream.on('end', () => {
+      logger.debug?.(`deleteByPattern complete. Keys removed: ${deleted}`)
+      resolve(deleted)
+    })
+
+    stream.on('error', (error) => {
+      logger.error(`Error in deleteByPattern: ${error.message}`)
+      reject(error)
+    })
+  })
+}
+
+export { scanKeyspace, deletePattern }
 export default scanKeyspace

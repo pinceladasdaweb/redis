@@ -382,6 +382,94 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  test('getOrSetJson produces on miss, serves from cache on hit and sets the ttl', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    let calls = 0
+    const producer = async () => {
+      calls++
+      return { expensive: true }
+    }
+
+    assert.deepEqual(await client.getOrSetJson('it:cache:miss', 60, producer), { expensive: true })
+    assert.equal(calls, 1)
+
+    // Hit: the producer must not run again.
+    assert.deepEqual(await client.getOrSetJson('it:cache:miss', 60, producer), { expensive: true })
+    assert.equal(calls, 1)
+
+    const ttl = await client.ttl('it:cache:miss')
+    assert.ok(ttl > 0 && ttl <= 60, `ttl must be set (got ${ttl})`)
+
+    await client.del('it:cache:miss')
+    await client.disconnect()
+  })
+
+  // The stampede case: N concurrent misses with lock enabled must collapse
+  // into exactly ONE producer call.
+  test('getOrSetJson with lock collapses concurrent misses into one producer call', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    let calls = 0
+    const slowProducer = async () => {
+      calls++
+      await sleep(300)
+      return { produced: calls }
+    }
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => client.getOrSetJson('it:cache:stampede', 60, slowProducer, { lock: true }))
+    )
+
+    assert.equal(calls, 1, `producer ran ${calls} times — the stampede was not contained`)
+    for (const result of results) {
+      assert.deepEqual(result, { produced: 1 })
+    }
+
+    await client.del('it:cache:stampede')
+    await client.disconnect()
+  })
+
+  test('deleteByPattern unlinks only matching keys inside the prefix', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'dbp:', logger: quietLogger })
+    await client.connect()
+
+    await client.mset({ 'cache:a': '1', 'cache:b': '2', 'cache:c': '3', 'keep:me': '4' })
+    await admin.set('cache:foreign', 'outside-the-prefix')
+
+    const deleted = await client.deleteByPattern('cache:*')
+    assert.equal(deleted, 3)
+
+    assert.equal(await client.get('keep:me'), '4', 'non-matching keys must survive')
+    assert.equal(await admin.get('cache:foreign'), 'outside-the-prefix', 'keys outside the prefix must survive')
+
+    await client.deleteByPattern('*')
+    assert.equal(await client.get('keep:me'), null)
+
+    await admin.del('cache:foreign')
+    await client.disconnect()
+  })
+
+  test('withLock autoExtend keeps a lock held beyond its ttl', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    await client.withLock('longjob', { ttl: 400, autoExtend: true }, async () => {
+      // Well past the original ttl: the watchdog must have extended it.
+      await sleep(1200)
+
+      await assert.rejects(client.acquireLock('longjob'), { code: 'LOCK_NOT_ACQUIRED' })
+    })
+
+    // Released after fn: acquirable again.
+    const lock = await client.acquireLock('longjob')
+    assert.equal(await lock.release(), true)
+
+    await client.disconnect()
+  })
+
   test('locks are mutually exclusive and only the holder can release', { timeout: 15000 }, async () => {
     const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
     await client.connect()

@@ -14,6 +14,9 @@ Every reliability claim in this README is enforced by the integration suite agai
 - **Distributed locking (single instance)**: `withLock()`/`acquireLock()` with `SET NX PX` acquisition and token-checked Lua release — a holder can never release or extend someone else's lock.
 - **Bring your own logger**: inject any pino/winston/bunyan instance; the built-in fallback is a dependency-free leveled console logger.
 - **JSON helpers**: `setJson`/`getJson`/`setexJson` with explicit serialization — never magic.
+- **Cache-aside with stampede protection**: `getOrSet`/`getOrSetJson` return the cached value or produce-and-store it — and with `{ lock: true }`, concurrent misses collapse into a single producer call.
+- **Bulk deletion done right**: `deleteByPattern` uses `SCAN` + `UNLINK` in batches (non-blocking, prefix-aware) instead of `KEYS`.
+- **Sentinel support**: pass `sentinels` + `name` and the client rides ioredis' native high-availability failover.
 - **Prefixed keyspace scan**: `getAllStream(pattern)` dumps your keys (and only yours — `keyPrefix` is honored, unlike raw `SCAN`), skipping non-string types gracefully.
 - **TypeScript declarations**: hand-maintained `index.d.ts`, checked with `tsc --strict` in CI.
 - **One runtime dependency**: ioredis. Nothing else.
@@ -67,6 +70,24 @@ await redis.disconnect()
 | `db` | `number` | `0` | Database number |
 | `keyPrefix` | `string` | `''` | Prefix applied to every key, including `getAllStream` scans |
 | `connectionName` | `string` | — | `CLIENT SETNAME` value; makes the client identifiable in `CLIENT LIST` |
+
+### High availability (Sentinel)
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `sentinels` | `Array<{host, port}>` | — | Sentinel nodes; providing this enables sentinel mode |
+| `name` | `string` | — | Master group name to resolve (e.g. `'mymaster'`) |
+| `sentinelPassword` | `string` | — | Password for the sentinel nodes themselves |
+| `role` | `'master' \| 'slave'` | `'master'` | Which role to connect to |
+
+```javascript
+const redis = new RedisClient({
+  sentinels: [{ host: 'sentinel-1', port: 26379 }, { host: 'sentinel-2', port: 26379 }],
+  name: 'mymaster'
+})
+```
+
+Failover is handled by ioredis: on `READONLY` replies the client reconnects to the new master and resends the failed command.
 
 ### Reconnection
 
@@ -164,6 +185,28 @@ const logger = createLogger('debug')
 
 Hot paths log at `debug` level only.
 
+## Caching (cache-aside)
+
+`getOrSet`/`getOrSetJson` implement the read-through pattern: return the cached value, or run the producer, store its result with the ttl and return it.
+
+```javascript
+const user = await redis.getOrSetJson(`user:${id}`, 300, () => db.loadUser(id))
+```
+
+Under load, an expired hot key means N concurrent misses running N producers (the dogpile/stampede effect). Enable the built-in protection and they collapse into **one** producer call — the winner fills the cache while the others wait on a lock and re-read:
+
+```javascript
+const report = await redis.getOrSetJson('report:daily', 3600, buildExpensiveReport, { lock: true })
+// lock accepts LockOptions too: { lock: { ttl: 30000, retries: 200 } }
+```
+
+To invalidate, delete by pattern — `SCAN` + `UNLINK` in batches (non-blocking, never `KEYS`), confined to your `keyPrefix`:
+
+```javascript
+const removed = await redis.deleteByPattern('user:*')
+// The pattern is required: deleteByPattern('*') wipes the whole prefixed keyspace, so say it explicitly.
+```
+
 ## Transactions and dedicated connections
 
 `multi()` returns an ioredis pipeline for atomic batches on the shared connection:
@@ -228,7 +271,20 @@ try {
 }
 ```
 
-Failing to acquire rejects with `code: 'LOCK_NOT_ACQUIRED'`. Locks are stored as `lock:<name>` (your `keyPrefix` applies). Scripts are cached and transparently reloaded after a server restart (`NOSCRIPT`). Keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
+Failing to acquire rejects with `code: 'LOCK_NOT_ACQUIRED'`. Locks are stored as `lock:<name>` (your `keyPrefix` applies). Scripts are cached and transparently reloaded after a server restart (`NOSCRIPT`).
+
+Two options worth knowing:
+
+- **`retryJitter`** adds a random extra delay (0..n ms) per acquisition attempt — under contention, fixed delays make every waiter retry in lockstep.
+- **`autoExtend: true`** (in `withLock` only) starts a watchdog that keeps extending the lock at half-ttl intervals while your callback runs — for critical sections that may outlive the ttl. If the lock is definitively lost, the watchdog stops and logs a warning.
+
+```javascript
+await redis.withLock('report:build', { ttl: 30000, autoExtend: true, retries: 10, retryJitter: 100 }, async () => {
+  await possiblyVerySlowJob()
+})
+```
+
+Without `autoExtend`, keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
 
 ## Streams
 
@@ -258,6 +314,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Connection**: `connect()`, `disconnect()`, `checkHealth()`, `withDedicatedConnection(fn)`
 **Strings**: `get`, `set`, `setex`, `incr`, `decr`, `mset`, `mget`
 **JSON**: `setJson`, `getJson`, `setexJson`
+**Cache**: `getOrSet`, `getOrSetJson`, `deleteByPattern`
 **Hashes**: `hset` (pairs or object), `hget`, `hgetall`, `hmset` (delegates to `HSET`; returns the number of new fields), `hmget`, `hincrby`, `hexists`, `hdel`
 **Lists**: `lpush`, `rpop`, `lrange`, `llen`, `lrem`, `lpushx`, `rpushx`
 **Sets**: `sadd`, `smembers`, `sismember`, `scard`, `spop` (single member without `count`, array with it), `srem`
