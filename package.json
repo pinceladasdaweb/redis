@@ -8,21 +8,27 @@
   "files": [
     "dist",
     "index.d.ts",
+    "index.d.cts",
     "LICENSE",
     "README.md",
     "CHANGELOG.md"
   ],
   "exports": {
     ".": {
-      "types": "./index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
   "scripts": {
-    "build": "rollup -c rollup.config.mjs",
-    "prepare": "git config core.hooksPath .hooks",
-    "prepublishOnly": "npm run build",
+    "build": "rollup -c rollup.config.mjs && cp index.d.ts index.d.cts",
+    "hooks": "git config core.hooksPath .hooks",
+    "prepack": "npm run build",
     "standard:fix": "standard --fix",
     "test": "node --test 'tests/**/*.test.js'",
     "test:coverage": "node --test --experimental-test-coverage 'tests/**/*.test.js'",

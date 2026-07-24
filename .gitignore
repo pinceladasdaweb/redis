@@ -1,5 +1,6 @@
 node_modules/
 dist/
+index.d.cts
 .vscode/
 .DS_Store
 .env

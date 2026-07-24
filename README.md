@@ -342,11 +342,14 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 ## Development
 
 ```bash
+npm run hooks              # once per clone: enable the repo's git hooks (lint, commitlint)
 docker compose up -d       # pinned redis:7.4-alpine
 npm test                   # unit tests (no server required)
 npm run test:integration   # full suite against the real Redis, including CLIENT KILL recovery
 npm run check:types        # tsc --strict on index.d.ts
 ```
+
+The published package declares **zero lifecycle scripts**, so it installs without any `allow-scripts` approval friction.
 
 The integration suite is destructive (it kills connections server-side) — never point it at a shared Redis.
 
