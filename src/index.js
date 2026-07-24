@@ -1,5 +1,5 @@
-import Logger from './logger'
-import RedisConfig from './config'
+import Logger from './logger.js'
+import RedisConfig from './config.js'
 
 class RedisClientError extends Error {
   constructor (message, operation) {

@@ -1,6 +1,3 @@
-import json from '@rollup/plugin-json'
-import commonjs from '@rollup/plugin-commonjs'
-import resolve from '@rollup/plugin-node-resolve'
 export default {
   input: 'src/index.js',
   output: [
@@ -15,10 +12,7 @@ export default {
       exports: 'named'
     }
   ],
-  plugins: [
-    resolve(),
-    commonjs(),
-    json()
-  ],
-  external: ['ioredis', 'pino', 'pino-pretty']
+  // A library build must never inline dependencies: everything that is not
+  // the library's own source (deps, node builtins) stays external.
+  external: (id) => !id.startsWith('.') && !id.startsWith('/')
 }
