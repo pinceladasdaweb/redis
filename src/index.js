@@ -1,10 +1,10 @@
-import Logger from './logger.js'
 import RedisConfig from './config.js'
 import HealthChecker from './health.js'
 import scanKeyspace from './scanner.js'
 import RedisClientError from './errors.js'
 import { EventEmitter } from 'node:events'
 import ConnectionManager from './connection.js'
+import Logger, { createLogger } from './logger.js'
 
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
@@ -475,5 +475,5 @@ class RedisClient extends EventEmitter {
   }
 }
 
-export { RedisClient, RedisClientError }
+export { RedisClient, RedisClientError, createLogger }
 export default RedisClient

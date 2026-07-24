@@ -41,7 +41,8 @@ jobs:
       - name: Lint
         run: npx standard src/ tests/
 
-      # TODO: enable once index.d.ts lands (npm run check:types)
+      - name: Type declarations check
+        run: npm run check:types
 
       - name: Unit tests (with coverage)
         run: npm run test:coverage

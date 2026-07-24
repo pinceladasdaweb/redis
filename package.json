@@ -4,14 +4,17 @@
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
+  "types": "./index.d.ts",
   "files": [
     "dist",
+    "index.d.ts",
     "LICENSE",
     "README.md",
     "CHANGELOG.md"
   ],
   "exports": {
     ".": {
+      "types": "./index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.cjs"
     }
@@ -23,7 +26,8 @@
     "standard:fix": "standard --fix",
     "test": "node --test 'tests/**/*.test.js'",
     "test:coverage": "node --test --experimental-test-coverage 'tests/**/*.test.js'",
-    "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'"
+    "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'",
+    "check:types": "tsc --noEmit --strict index.d.ts"
   },
   "engines": {
     "node": ">=22"
@@ -51,6 +55,7 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0",
+    "@types/node": "^26.1.1",
     "lint-staged": "^17.2.0",
     "rollup": "^4.62.2",
     "standard": "^17.1.2",
