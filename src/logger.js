@@ -1,26 +1,28 @@
-import pino from 'pino'
+// Dependency-free default logger. The library logs through whatever the
+// application injects via the `logger` option; this console-based fallback
+// only exists so the out-of-the-box experience still has visible, leveled
+// logs. See the README ("Logging Options") for injecting pino/winston/etc.
 
-const isDevelopment = process.env.NODE_ENV === 'development'
+const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 }
 
-const config = {
-  level: process.env.LOG_LEVEL || 'debug',
-  formatters: {
-    level: (level) => ({ level }),
-    ...(!isDevelopment ? { bindings: (bindings) => ({ hostname: bindings.hostname }) } : {})
-  },
-  timestamp: () => `,"time":"${new Date(Date.now()).toISOString()}"`,
-  ...(isDevelopment && {
-    transport: {
-      target: 'pino-pretty',
-      options: {
-        colorize: true,
-        levelFirst: true,
-        ignore: 'time,pid,hostname'
-      }
-    }
-  })
+const createLogger = (level = process.env.LOG_LEVEL || 'info') => {
+  const threshold = LEVELS[level] ?? LEVELS.info
+
+  const write = (method, levelName) => (message, ...args) => {
+    if (LEVELS[levelName] > threshold) return
+
+    console[method](`${new Date().toISOString()} [${levelName}] ${message}`, ...args)
+  }
+
+  return {
+    error: write('error', 'error'),
+    warn: write('warn', 'warn'),
+    info: write('log', 'info'),
+    debug: write('log', 'debug')
+  }
 }
 
-const Logger = pino(config)
+const logger = createLogger()
 
-export default Logger
+export { createLogger }
+export default logger
