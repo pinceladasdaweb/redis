@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test, describe } from 'node:test'
-import defaultLogger, { createLogger } from '../src/logger.js'
+import defaultLogger, { createLogger } from '../src/utils/logger.js'
 
 describe('logger', () => {
   test('default export exposes all four level methods', () => {

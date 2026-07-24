@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import RedisConfig from '../src/config.js'
+import RedisConfig from '../src/connection/config.js'
 
 const quietLogger = { info () {}, warn () {}, error () {}, debug () {} }
 

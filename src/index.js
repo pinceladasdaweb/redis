@@ -1,12 +1,12 @@
-import LockManager from './lock.js'
-import RedisConfig from './config.js'
-import HealthChecker from './health.js'
-import RedisClientError from './errors.js'
 import { EventEmitter } from 'node:events'
-import SubscriptionManager from './pubsub.js'
-import ConnectionManager from './connection.js'
-import Logger, { createLogger } from './logger.js'
-import scanKeyspace, { deletePattern } from './scanner.js'
+import LockManager from './resilience/lock.js'
+import RedisConfig from './connection/config.js'
+import RedisClientError from './utils/errors.js'
+import HealthChecker from './connection/health.js'
+import SubscriptionManager from './messaging/pubsub.js'
+import ConnectionManager from './connection/manager.js'
+import Logger, { createLogger } from './utils/logger.js'
+import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
 
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is

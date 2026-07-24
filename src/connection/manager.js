@@ -1,4 +1,4 @@
-import RedisClientError from './errors.js'
+import RedisClientError from '../utils/errors.js'
 
 // Owns the client lifecycle. Reconnection itself belongs entirely to the
 // ioredis driver (retryStrategy / reconnectOnError in RedisConfig): a single

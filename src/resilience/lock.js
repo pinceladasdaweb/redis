@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import RedisClientError from './errors.js'
+import RedisClientError from '../utils/errors.js'
 
 // Single-instance distributed lock: SET NX PX to acquire, Lua compare-and-del
 // to release (a client can only ever release or extend a lock it still
