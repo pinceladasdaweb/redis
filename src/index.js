@@ -185,6 +185,28 @@ class RedisClient {
     return client
   }
 
+  // Blocking commands (XREAD/XREADGROUP with BLOCK) run on a short-lived
+  // dedicated connection: on the shared one they would stall every other
+  // command of the application until the block resolves.
+  async executeBlockingCommand (command, args) {
+    const client = this.#assertReady(command)
+    const blockingClient = client.duplicate()
+
+    blockingClient.on('error', (err) => {
+      this.logger.debug?.(`Blocking '${command}' connection error: ${err.message}`)
+    })
+
+    try {
+      return await blockingClient[command](...args)
+    } catch (err) {
+      this.logError(err, command)
+
+      throw err
+    } finally {
+      blockingClient.disconnect()
+    }
+  }
+
   async executeCommand (command, ...args) {
     const client = this.#assertReady(command)
 
@@ -229,8 +251,8 @@ class RedisClient {
     return this.executeCommand('decr', key)
   }
 
-  async hset (key, field, value) {
-    return this.executeCommand('hset', key, field, value)
+  async hset (key, ...args) {
+    return this.executeCommand('hset', key, ...args)
   }
 
   async hget (key, field) {
@@ -279,8 +301,10 @@ class RedisClient {
     return this.executeCommand('setex', key, seconds, JSON.stringify(value))
   }
 
+  // HMSET is deprecated since Redis 4.0: delegate to variadic HSET.
+  // Note: returns the number of newly created fields, not 'OK'.
   async hmset (key, obj) {
-    return this.executeCommand('hmset', key, obj)
+    return this.executeCommand('hset', key, obj)
   }
 
   async hmget (key, ...fields) {
@@ -327,8 +351,12 @@ class RedisClient {
     return this.executeCommand('scard', key)
   }
 
-  async spop (key, count = 1) {
-    return this.executeCommand('spop', key, count)
+  // Without a count Redis returns a single member; with one it returns an
+  // array — never force a count, or the return type silently changes.
+  async spop (key, count) {
+    return count === undefined
+      ? this.executeCommand('spop', key)
+      : this.executeCommand('spop', key, count)
   }
 
   async srem (key, ...members) {
@@ -347,14 +375,11 @@ class RedisClient {
     return this.executeCommand('sort', ...args)
   }
 
+  // Values are sent as-is (ioredis accepts the object form directly). No
+  // magic JSON serialization: mget/get would hand back raw strings anyway —
+  // use the *Json helpers for objects.
   async mset (obj) {
-    const args = []
-
-    for (const [key, value] of Object.entries(obj)) {
-      args.push(key, typeof value === 'object' ? JSON.stringify(value) : value)
-    }
-
-    return this.executeCommand('mset', ...args)
+    return this.executeCommand('mset', obj)
   }
 
   async mget (...keys) {
@@ -385,46 +410,89 @@ class RedisClient {
     return this.#assertReady('multi').multi()
   }
 
-  async watch (...keys) {
-    return this.executeCommand('watch', ...keys)
+  // WATCH state is per-connection: on the shared connection, concurrent
+  // flows watching keys poison each other (any EXEC/UNWATCH clears ALL
+  // watches). Refusing loudly beats silently-wrong optimistic locking; a
+  // transaction API with a dedicated connection is planned.
+  async watch () {
+    throw new RedisClientError(
+      'watch() is not supported on the shared connection. Use multi() for atomic batches.',
+      'watch',
+      'UNSUPPORTED_OPERATION'
+    )
   }
 
   async unwatch () {
-    return this.executeCommand('unwatch')
+    throw new RedisClientError(
+      'unwatch() is not supported on the shared connection. Use multi() for atomic batches.',
+      'unwatch',
+      'UNSUPPORTED_OPERATION'
+    )
   }
 
   async xadd (key, id, ...args) {
     return this.executeCommand('xadd', key, id, ...args)
   }
 
+  // block: 0 is a legitimate value (block forever) — test against null,
+  // never truthiness. Blocking reads run on a dedicated connection.
   async xread (options = {}, streams) {
     const args = []
 
-    if (options.count) args.push('COUNT', options.count)
-    if (options.block) args.push('BLOCK', options.block)
+    if (options.count != null) args.push('COUNT', options.count)
+    if (options.block != null) args.push('BLOCK', options.block)
 
     args.push('STREAMS', ...streams)
 
-    return this.executeCommand('xread', ...args)
+    return options.block != null
+      ? this.executeBlockingCommand('xread', args)
+      : this.executeCommand('xread', ...args)
   }
 
   async xreadgroup (groupName, consumerName, options = {}, streams) {
     const args = ['GROUP', groupName, consumerName]
 
-    if (options.count) args.push('COUNT', options.count)
-    if (options.block) args.push('BLOCK', options.block)
+    if (options.count != null) args.push('COUNT', options.count)
+    if (options.block != null) args.push('BLOCK', options.block)
     if (options.noack) args.push('NOACK')
 
     args.push('STREAMS', ...streams)
 
-    return this.executeCommand('xreadgroup', ...args)
+    return options.block != null
+      ? this.executeBlockingCommand('xreadgroup', args)
+      : this.executeCommand('xreadgroup', ...args)
   }
 
-  async xgroup (command, key, groupName, id = '$') {
-    const args = [command, key, groupName, id]
+  // Each XGROUP subcommand has its own arity — a blanket trailing id turned
+  // documented calls like xgroup('DESTROY', key, group) into protocol errors.
+  async xgroup (command, key, groupName, ...rest) {
+    const subcommand = String(command).toUpperCase()
+    const args = [subcommand, key, groupName]
 
-    if (command.toUpperCase() === 'CREATE' && arguments.length > 4 && arguments[4]) {
-      args.push('MKSTREAM')
+    switch (subcommand) {
+      case 'CREATE': {
+        const [id = '$', mkstream] = rest
+        args.push(id)
+
+        if (mkstream) {
+          args.push('MKSTREAM')
+        }
+
+        break
+      }
+      case 'SETID': {
+        const [id = '$'] = rest
+        args.push(id)
+
+        break
+      }
+      case 'CREATECONSUMER':
+      case 'DELCONSUMER': {
+        args.push(rest[0])
+
+        break
+      }
+      // DESTROY takes no extra arguments.
     }
 
     return this.executeCommand('xgroup', ...args)
@@ -441,7 +509,7 @@ class RedisClient {
   async xrange (key, start, end, options = {}) {
     const args = [key, start, end]
 
-    if (options.count) {
+    if (options.count != null) {
       args.push('COUNT', options.count)
     }
 
@@ -451,7 +519,7 @@ class RedisClient {
   async xrevrange (key, end, start, options = {}) {
     const args = [key, end, start]
 
-    if (options.count) {
+    if (options.count != null) {
       args.push('COUNT', options.count)
     }
 
@@ -477,7 +545,7 @@ class RedisClient {
   async xpending (key, group, options = {}) {
     const args = [key, group]
 
-    if (options.start && options.end && options.count) {
+    if (options.start != null && options.end != null && options.count != null) {
       args.push(options.start, options.end, options.count)
 
       if (options.consumer) {

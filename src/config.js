@@ -51,23 +51,17 @@ class RedisConfig {
     return delay
   }
 
+  // Called by ioredis for COMMAND errors only (server error replies) —
+  // socket errors like ECONNREFUSED/ENOTFOUND never reach here; those belong
+  // to retryStrategy (the previous branches for them were dead code). Redis
+  // error replies start with the error-code token, so startsWith is the
+  // structured check (never match substrings mid-message).
   reconnectOnError (err) {
-    if (err.message.includes('READONLY')) {
-      this.logger.warn('READONLY error detected. Reconnecting to potential new master.')
+    if (err.message.startsWith('READONLY')) {
+      this.logger.warn('READONLY error detected. Reconnecting to the new master and resending the command.')
 
-      return true
-    }
-
-    if (err.message.includes('ECONNREFUSED')) {
-      this.logger.warn('Connection refused. Attempting to reconnect.')
-
-      return true
-    }
-
-    if (err.message.includes('ENOTFOUND')) {
-      this.logger.warn('Host not found. The Redis service might not be ready yet. Attempting to reconnect.')
-
-      return true
+      // 2 = reconnect AND resend the failed command once reconnected.
+      return 2
     }
 
     return false

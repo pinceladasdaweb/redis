@@ -142,6 +142,38 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Regression (AUDIT B2): xgroup DESTROY used to send a stray '$'.
+  test('xgroup CREATE and DESTROY roundtrip against the server', async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    assert.equal(await client.xgroup('CREATE', 'it:stream', 'it-group', '$', true), 'OK')
+    assert.equal(await client.xgroup('DESTROY', 'it:stream', 'it-group'), 1)
+
+    await client.del('it:stream')
+    await client.disconnect()
+  })
+
+  // Regression (AUDIT B7): a blocking read on the shared connection stalled
+  // every other command until the block resolved.
+  test('blocking xread does not stall concurrent commands', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const blocked = client.xread({ block: 2000 }, ['it:blockstream', '$'])
+
+    const started = Date.now()
+    await client.set('it:concurrent', 'concurrent')
+    const elapsed = Date.now() - started
+
+    assert.ok(elapsed < 500, `concurrent set took ${elapsed}ms while xread was blocking`)
+
+    assert.equal(await blocked, null)
+
+    await client.del('it:concurrent')
+    await client.disconnect()
+  })
+
   // The sacred test (playbook §4): drop the connection FOR REAL, from the
   // server side, and prove the client fully recovers.
   test('recovers after all connections are killed server-side (CLIENT KILL)', { timeout: 60000 }, async () => {
