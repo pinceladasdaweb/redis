@@ -51,17 +51,43 @@ class SubscriptionManager {
       this.#dispatch(this.#patternHandlers.get(pattern), message, channel, pattern)
     })
 
+    subscriber.on('end', () => {
+      // The subscriber's own retryStrategy gave up: release the dead client
+      // so a later subscribe() starts a fresh connection, and never lose the
+      // subscriptions silently. (A normal close() detaches this handler
+      // before quitting, so it only fires for real give-ups.)
+      if (this.#subscriber === subscriber) {
+        this.#subscriber = null
+
+        if (this.#channelHandlers.size > 0 || this.#patternHandlers.size > 0) {
+          this.logger.warn('Redis subscriber connection ended permanently: active subscriptions were lost. Subscribe again to restore them.')
+        }
+      }
+
+      subscriber.removeAllListeners()
+    })
+
     return subscriber
   }
 
+  // One handler per channel/pattern — a re-subscribe replaces it (last one
+  // wins); the facade 'message'/'pmessage' events allow fan-out when needed.
+  // On a failed subscribe the previous handler is restored.
   async subscribe (channel, handler) {
     const subscriber = this.#ensureSubscriber()
+    const previous = this.#channelHandlers.get(channel)
 
     if (handler) {
       this.#channelHandlers.set(channel, handler)
     }
 
-    return subscriber.subscribe(channel)
+    try {
+      return await subscriber.subscribe(channel)
+    } catch (err) {
+      this.#restore(this.#channelHandlers, channel, previous, handler)
+
+      throw err
+    }
   }
 
   async unsubscribe (channel) {
@@ -76,12 +102,31 @@ class SubscriptionManager {
 
   async psubscribe (pattern, handler) {
     const subscriber = this.#ensureSubscriber()
+    const previous = this.#patternHandlers.get(pattern)
 
     if (handler) {
       this.#patternHandlers.set(pattern, handler)
     }
 
-    return subscriber.psubscribe(pattern)
+    try {
+      return await subscriber.psubscribe(pattern)
+    } catch (err) {
+      this.#restore(this.#patternHandlers, pattern, previous, handler)
+
+      throw err
+    }
+  }
+
+  #restore (handlers, key, previous, attempted) {
+    if (!attempted) {
+      return
+    }
+
+    if (previous) {
+      handlers.set(key, previous)
+    } else {
+      handlers.delete(key)
+    }
   }
 
   async punsubscribe (pattern) {

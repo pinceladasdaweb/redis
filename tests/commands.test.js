@@ -114,6 +114,18 @@ describe('command argument building', () => {
     await assert.rejects(client.unwatch(), { name: 'RedisClientError', code: 'UNSUPPORTED_OPERATION' })
   })
 
+  // Review finding: xtrim without a count used to reach the server and fail
+  // with a confusing 'value is not an integer' reply.
+  test('xtrim without a count rejects with INVALID_ARGUMENT', async () => {
+    const { client, calls } = capture()
+
+    await assert.rejects(client.xtrim('s', 'MAXLEN'), { name: 'RedisClientError', code: 'INVALID_ARGUMENT' })
+    assert.equal(calls.length, 0, 'nothing must be sent to the server')
+
+    await client.xtrim('s', 'MAXLEN', true, 1000)
+    assert.deepEqual(calls[0], ['xtrim', 's', 'MAXLEN', '~', 1000])
+  })
+
   // Regression: maxRetryAttempts: 0 was clobbered to Infinity by `||`.
   test('retryStrategy honors maxRetryAttempts: 0', () => {
     const client = new RedisClient({ maxRetryAttempts: 0, logger: quietLogger })

@@ -125,6 +125,7 @@ All library errors are `RedisClientError` instances carrying `operation` and a s
 | `REDIS_UNAVAILABLE` | The command was rejected because the connection is not ready. Nothing was sent |
 | `UNSUPPORTED_OPERATION` | The method cannot work safely on the shared connection (`watch`/`unwatch`) |
 | `LOCK_NOT_ACQUIRED` | `acquireLock`/`withLock` could not obtain the lock within the configured retries |
+| `INVALID_ARGUMENT` | A required argument is missing or malformed (e.g. `xtrim` without a count) |
 | `REDIS_CLIENT_ERROR` | Generic library error |
 
 ```javascript
@@ -204,6 +205,8 @@ await redis.punsubscribe('logs.*')
 ```
 
 Messages also arrive as facade events (`message`, `pmessage`) if you prefer a single listener. Handler rejections are caught and logged — they never crash the process. Note: channels are not keys, so `keyPrefix` does not apply to them.
+
+Each channel/pattern holds **one handler** — subscribing again replaces it (last one wins). Use the `message`/`pmessage` events when you need fan-out to multiple listeners. If the subscriber connection permanently gives up (finite `maxRetryAttempts` exhausted), a warning is logged and the next `subscribe()` starts a fresh connection — resubscribe to restore delivery.
 
 ## Distributed locking
 

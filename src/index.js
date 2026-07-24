@@ -469,6 +469,14 @@ class RedisClient extends EventEmitter {
   }
 
   async xtrim (key, strategy, approx = false, count) {
+    if (count == null) {
+      throw new RedisClientError(
+        'xtrim requires a count/threshold value (e.g. xtrim(key, \'MAXLEN\', false, 1000)).',
+        'xtrim',
+        'INVALID_ARGUMENT'
+      )
+    }
+
     const args = [key, strategy]
 
     if (approx) {

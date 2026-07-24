@@ -243,6 +243,222 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  test('pub/sub delivers to channel handlers, pattern handlers and facade events', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const received = { handler: [], event: [], pattern: [] }
+
+    client.on('message', (channel, message) => received.event.push([channel, message]))
+
+    await client.subscribe('news', (message, channel) => received.handler.push([channel, message]))
+    await client.psubscribe('logs.*', (message, channel, pattern) => received.pattern.push([pattern, channel, message]))
+
+    assert.equal(await client.publish('news', 'hello'), 1)
+    await client.publishJson('logs.app', { level: 'info' })
+
+    await waitFor(() => received.handler.length >= 1 && received.event.length >= 1 && received.pattern.length >= 1, {
+      message: 'all subscription paths to deliver'
+    })
+
+    assert.deepEqual(received.handler[0], ['news', 'hello'])
+    assert.deepEqual(received.event[0], ['news', 'hello'])
+    assert.deepEqual(received.pattern[0], ['logs.*', 'logs.app', '{"level":"info"}'])
+
+    // Unsubscribing stops delivery.
+    await client.unsubscribe('news')
+    await client.publish('news', 'after-unsubscribe')
+    await sleep(300)
+    assert.equal(received.handler.length, 1, 'no delivery after unsubscribe')
+
+    // disconnect() releases the subscriber connection too.
+    await client.disconnect()
+    const remaining = (await listOtherClientIds()).length
+    assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
+  })
+
+  // The sacred test, pub/sub edition: the subscriber connection is killed
+  // server-side and the subscription must survive (driver-owned reconnection
+  // + autoResubscribe on the SAME client object).
+  test('pub/sub survives a server-side CLIENT KILL', { timeout: 30000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    await client.connect()
+
+    const received = []
+    await client.subscribe('resilient', (message) => received.push(message))
+
+    await client.publish('resilient', 'before')
+    await waitFor(() => received.includes('before'), { message: 'first message to arrive' })
+
+    await killAllOtherClients()
+
+    // Publish until the resubscribed consumer hears us again.
+    await waitFor(async () => {
+      try {
+        await client.publish('resilient', 'after')
+      } catch {
+        return false
+      }
+
+      return received.includes('after')
+    }, { timeout: 20000, message: 'delivery to resume after the kill' })
+
+    await client.disconnect()
+  })
+
+  // Review gap: releases go through Lua/defineCommand — this proves ioredis
+  // applies keyPrefix to the script KEYS just like it does to SET.
+  test('locks work correctly under a keyPrefix', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'pfx:', logger: quietLogger })
+    await client.connect()
+
+    const lock = await client.acquireLock('prefixed', { ttl: 5000 })
+
+    assert.equal(await admin.exists('pfx:lock:prefixed'), 1, 'lock key must live under the prefix')
+    assert.equal(await lock.release(), true)
+    assert.equal(await admin.exists('pfx:lock:prefixed'), 0, 'release must delete the prefixed key')
+
+    await client.disconnect()
+  })
+
+  // Review gap: when the driver exhausts its retries the client must be
+  // released ('end') and a later connect() must start a fresh cycle.
+  test('exhausted retries release the client and connect() can start over', { timeout: 15000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: 1,
+      maxRetryAttempts: 1,
+      baseRetryDelay: 10,
+      logger: quietLogger
+    })
+
+    let ends = 0
+    client.on('end', () => { ends++ })
+
+    await client.connect()
+    await waitFor(() => ends >= 1 && client.client === null, { message: 'driver to give up and release the client' })
+
+    await assert.rejects(client.set('it:giveup', 'x'), { code: 'REDIS_UNAVAILABLE' })
+
+    // A fresh cycle starts (and gives up again — the point is that it CAN).
+    await client.connect()
+    await waitFor(() => ends >= 2, { message: 'a second full cycle after the first give-up' })
+    assert.equal(client.client, null)
+  })
+
+  // Review gap: a rejecting async handler must be logged, never crash.
+  test('pub/sub handler rejections are caught and logged', { timeout: 15000 }, async () => {
+    const errors = []
+    const spyLogger = { ...quietLogger, error: (message) => errors.push(String(message)) }
+
+    const client = new RedisClient({ host: HOST, port: PORT, logger: spyLogger })
+    await client.connect()
+
+    await client.subscribe('explosive', async () => {
+      throw new Error('handler boom')
+    })
+
+    await client.publish('explosive', 'trigger')
+
+    await waitFor(() => errors.some((m) => m.includes('handler') && m.includes('boom')), {
+      message: 'the handler rejection to be logged'
+    })
+
+    // The client is still fully functional afterwards.
+    assert.equal(await client.set('it:alive', '1'), 'OK')
+    await client.del('it:alive')
+    await client.disconnect()
+  })
+
+  // Review gap: the documented SyntaxError on non-JSON payloads.
+  test('getJson rejects with SyntaxError on malformed payloads', async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    await client.set('it:notjson', '{definitely-not-json')
+    await assert.rejects(client.getJson('it:notjson'), SyntaxError)
+
+    await client.del('it:notjson')
+    await client.disconnect()
+  })
+
+  test('locks are mutually exclusive and only the holder can release', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const lock = await client.acquireLock('job', { ttl: 5000 })
+
+    await assert.rejects(client.acquireLock('job'), {
+      name: 'RedisClientError',
+      code: 'LOCK_NOT_ACQUIRED'
+    })
+
+    assert.equal(await lock.release(), true)
+
+    // Released: acquirable again.
+    const second = await client.acquireLock('job', { ttl: 5000 })
+    assert.equal(await second.release(), true)
+
+    await client.disconnect()
+  })
+
+  test('an expired lock can be taken over and the old holder cannot release it', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const first = await client.acquireLock('expiring', { ttl: 150 })
+    await sleep(300)
+
+    const second = await client.acquireLock('expiring', { ttl: 5000 })
+
+    // The stale holder must not delete the new holder's lock.
+    assert.equal(await first.release(), false)
+    await assert.rejects(client.acquireLock('expiring'), { code: 'LOCK_NOT_ACQUIRED' })
+
+    assert.equal(await second.release(), true)
+    await client.disconnect()
+  })
+
+  test('extend() prolongs a held lock', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const lock = await client.acquireLock('extendable', { ttl: 500 })
+    assert.equal(await lock.extend(5000), true)
+
+    await sleep(800)
+
+    // Past the original ttl: still held thanks to the extension.
+    await assert.rejects(client.acquireLock('extendable'), { code: 'LOCK_NOT_ACQUIRED' })
+
+    assert.equal(await lock.release(), true)
+    await client.disconnect()
+  })
+
+  test('withLock runs the critical section, releases afterwards and honors retries', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const result = await client.withLock('section', async (lock) => {
+      assert.equal(typeof lock.token, 'string')
+      await assert.rejects(client.acquireLock('section'), { code: 'LOCK_NOT_ACQUIRED' })
+
+      return 'done'
+    })
+    assert.equal(result, 'done')
+
+    // Released after the callback: contention resolved by retries.
+    const holder = await client.acquireLock('section', { ttl: 5000 })
+    const contender = client.withLock('section', { retries: 20, retryDelay: 100 }, async () => 'finally')
+
+    await sleep(300)
+    await holder.release()
+
+    assert.equal(await contender, 'finally')
+
+    await client.disconnect()
+  })
+
   // The sacred test (playbook §4): drop the connection FOR REAL, from the
   // server side, and prove the client fully recovers.
   test('recovers after all connections are killed server-side (CLIENT KILL)', { timeout: 60000 }, async () => {

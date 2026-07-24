@@ -51,7 +51,7 @@ export interface RedisClientOptions {
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
@@ -215,7 +215,11 @@ export declare class RedisClient extends EventEmitter {
   /** Channels are not keys: keyPrefix does not apply to pub/sub. */
   publish (channel: string, message: string | number | Buffer): Promise<number>
   publishJson (channel: string, value: unknown): Promise<number>
-  /** Subscriptions live on a dedicated connection and survive reconnections. */
+  /**
+   * Subscriptions live on a dedicated connection and survive reconnections.
+   * One handler per channel — a re-subscribe replaces it (last one wins);
+   * use the 'message' event for fan-out.
+   */
   subscribe (channel: string, handler?: PubSubHandler): Promise<unknown>
   unsubscribe (channel: string): Promise<unknown>
   psubscribe (pattern: string, handler?: PubSubHandler): Promise<unknown>
@@ -235,7 +239,8 @@ export declare class RedisClient extends EventEmitter {
   xrange (key: string, start: string, end: string, options?: StreamRangeOptions): Promise<StreamEntry[]>
   xrevrange (key: string, end: string, start: string, options?: StreamRangeOptions): Promise<StreamEntry[]>
   xdel (key: string, ...ids: string[]): Promise<number>
-  xtrim (key: string, strategy: string, approx?: boolean, count?: number): Promise<number>
+  /** `count` is required at runtime — omitting it rejects with INVALID_ARGUMENT. */
+  xtrim (key: string, strategy: string, approx: boolean, count: number): Promise<number>
   xpending (key: string, group: string, options?: StreamPendingOptions): Promise<unknown>
   xclaim (key: string, group: string, consumer: string, minIdleTime: number, ...ids: string[]): Promise<StreamEntry[]>
 
