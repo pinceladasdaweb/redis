@@ -11,6 +11,7 @@ class RedisConfig {
       db: options.db,
       keyPrefix: options.keyPrefix,
       connectionName: options.connectionName,
+      commandTimeout: options.commandTimeout,
       retryStrategy: this.retryStrategy.bind(this),
       reconnectOnError: this.reconnectOnError.bind(this),
       maxRetriesPerRequest: options.maxRetriesPerRequest ?? null,

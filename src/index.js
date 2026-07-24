@@ -2,10 +2,11 @@ import Logger from './logger.js'
 import RedisConfig from './config.js'
 
 class RedisClientError extends Error {
-  constructor (message, operation) {
+  constructor (message, operation, code = 'REDIS_CLIENT_ERROR') {
     super(message)
     this.name = 'RedisClientError'
     this.operation = operation
+    this.code = code
   }
 }
 
@@ -115,10 +116,11 @@ class RedisClient {
     return this.healthCheckPromise
   }
 
+  // Explicit health probe (real PING with a timeout) for operational checks
+  // like readiness endpoints. Connection state itself is owned by the driver
+  // events — this method observes, it does not mutate.
   async performHealthCheck () {
-    if (!this.client) {
-      this.isConnected = false
-
+    if (!this.client || this.client.status !== 'ready') {
       return false
     }
 
@@ -136,12 +138,9 @@ class RedisClient {
         this.healthCheckTimeout
       )
 
-      this.isConnected = pong === 'PONG'
-
-      return this.isConnected
+      return pong === 'PONG'
     } catch (error) {
       this.logger.error(`Redis health check failed: ${error.message}`)
-      this.isConnected = false
 
       return false
     }
@@ -165,20 +164,36 @@ class RedisClient {
     })
   }
 
-  async executeCommand (command, ...args) {
-    const isHealthy = await this.checkHealth()
+  // Fail-fast gate: a cheap local probe of the driver's own status, never a
+  // network round-trip. Commands issued while disconnected throw a structured
+  // REDIS_UNAVAILABLE error instead of silently resolving to null — writes
+  // must never look successful when nothing happened. Reconnection is not
+  // this gate's job: the driver already owns it.
+  #assertReady (operation) {
+    const client = this.client
 
-    if (!isHealthy) {
-      this.logger.warn(`Redis is not healthy. Skipping ${command} operation.`)
-      return null
+    if (!client || client.status !== 'ready') {
+      this.logger.debug?.(`Redis is not connected. Rejecting '${operation}'.`)
+
+      throw new RedisClientError(
+        `Redis is not connected. Cannot execute '${operation}'.`,
+        operation,
+        'REDIS_UNAVAILABLE'
+      )
     }
+
+    return client
+  }
+
+  async executeCommand (command, ...args) {
+    const client = this.#assertReady(command)
 
     try {
       if (command === 'getAllStream') {
-        return this._getAllStream(...args)
+        return await this._getAllStream(...args)
       }
 
-      return await this.client[command](...args)
+      return await client[command](...args)
     } catch (err) {
       this.logError(err, command)
 
@@ -367,11 +382,7 @@ class RedisClient {
   }
 
   async multi () {
-    if (!this.client) {
-      throw new RedisClientError('Redis client is not initialized.', 'multi')
-    }
-
-    return this.client.multi()
+    return this.#assertReady('multi').multi()
   }
 
   async watch (...keys) {
@@ -585,5 +596,5 @@ class RedisClient {
   }
 }
 
-export { RedisClient }
+export { RedisClient, RedisClientError }
 export default RedisClient

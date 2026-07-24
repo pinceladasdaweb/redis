@@ -70,6 +70,38 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await admin.quit()
   })
 
+  // Regression (AUDIT C5): commands while disconnected used to resolve null —
+  // a silent no-op for writes. They must fail fast with a structured error.
+  test('rejects commands with REDIS_UNAVAILABLE before connect()', async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+
+    await assert.rejects(client.set('it:unavailable', 'x'), {
+      name: 'RedisClientError',
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'set'
+    })
+  })
+
+  test('rejects commands with REDIS_UNAVAILABLE while the server is unreachable', { timeout: 15000 }, async () => {
+    // Nothing listens on this port: connect() resolves and retries run in
+    // the background, but commands must fail fast instead of queueing.
+    const client = new RedisClient({
+      host: HOST,
+      port: 1,
+      baseRetryDelay: 50,
+      maxRetryAttempts: 1,
+      logger: quietLogger
+    })
+    await client.connect()
+
+    await assert.rejects(client.set('it:unreachable', 'x'), {
+      name: 'RedisClientError',
+      code: 'REDIS_UNAVAILABLE'
+    })
+
+    await client.disconnect()
+  })
+
   test('performs a basic write/read/delete roundtrip', async () => {
     const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
     await client.connect()
@@ -168,5 +200,10 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
 
     const remaining = (await listOtherClientIds()).length
     assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
+
+    await assert.rejects(client.set('it:cycle:probe', '2'), {
+      name: 'RedisClientError',
+      code: 'REDIS_UNAVAILABLE'
+    })
   })
 })
