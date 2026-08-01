@@ -154,6 +154,36 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Regression: ioredis does not prefix the key of XGROUP/XINFO, so a
+  // prefixed client used to create the consumer group on a different key than
+  // the one XADD wrote to — every consumer-group flow was broken under a
+  // keyPrefix.
+  test('consumer groups work under a keyPrefix end to end', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'grp:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.xadd('events', '*', 'type', 'signup')
+    await client.xgroup('CREATE', 'events', 'workers', '0', true)
+
+    // The group must live on the same (prefixed) key the entries went to.
+    assert.equal(await admin.exists('grp:events'), 1)
+    assert.equal(await admin.exists('events'), 0, 'nothing may be created outside the prefix')
+
+    const groups = await client.xinfo('GROUPS', 'events')
+    assert.equal(groups.length, 1, 'xinfo must look at the prefixed key')
+
+    const delivered = await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['events', '>'])
+    assert.equal(delivered[0][1].length, 1, 'the group must see the entries')
+
+    assert.equal(await client.xack('events', 'workers', delivered[0][1][0][0]), 1)
+    assert.equal((await client.xpending('events', 'workers'))[0], 0)
+
+    await client.xgroup('DESTROY', 'events', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
   // Regression (AUDIT B7): a blocking read on the shared connection stalled
   // every other command until the block resolved.
   test('blocking xread does not stall concurrent commands', { timeout: 15000 }, async () => {

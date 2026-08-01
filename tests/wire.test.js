@@ -111,6 +111,7 @@ const CONTRACTS = [
   ['xlen', ['st'], ['xlen', 'st']],
   ['xinfo', ['STREAM', 'st'], ['xinfo', 'STREAM', 'st']],
   ['xdel', ['st', '1-1', '1-2'], ['xdel', 'st', '1-1', '1-2']],
+  ['xack', ['st', 'g', '1-1', '1-2'], ['xack', 'st', 'g', '1-1', '1-2']],
   ['xclaim', ['st', 'g', 'c', 1000, '1-1'], ['xclaim', 'st', 'g', 'c', 1000, '1-1']],
   ['xrange', ['st', '-', '+'], ['xrange', 'st', '-', '+']],
   ['xrevrange', ['st', '+', '-'], ['xrevrange', 'st', '+', '-']],
@@ -413,6 +414,23 @@ describe('wire contract', () => {
     handlers[0](new Error('dedicated socket died'))
 
     assert.match(debugged.at(-1), /Dedicated connection error: dedicated socket died/)
+  })
+
+  // Regression: ioredis does not prefix the key of XGROUP/XINFO (it sits
+  // after the subcommand), so a prefixed client used to create consumer
+  // groups on a different key than the one XADD wrote to.
+  test('xgroup and xinfo carry the key prefix themselves', async () => {
+    const { redis, calls } = createClient({ keyPrefix: 'app:' })
+
+    await redis.xgroup('CREATE', 'events', 'workers', '$', true)
+    await redis.xgroup('DESTROY', 'events', 'workers')
+    await redis.xinfo('STREAM', 'events')
+    await redis.xinfo('CONSUMERS', 'events', 'workers')
+
+    assert.deepEqual(calls[0], ['xgroup', 'CREATE', 'app:events', 'workers', '$', 'MKSTREAM'])
+    assert.deepEqual(calls[1], ['xgroup', 'DESTROY', 'app:events', 'workers'])
+    assert.deepEqual(calls[2], ['xinfo', 'STREAM', 'app:events'])
+    assert.deepEqual(calls[3], ['xinfo', 'CONSUMERS', 'app:events', 'workers'])
   })
 
   test('getAllStream and deleteByPattern prefix the scan pattern', async () => {

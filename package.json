@@ -34,7 +34,8 @@
     "test:coverage": "node --test --experimental-test-coverage 'tests/**/*.test.js'",
     "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'",
     "check:types": "tsc --noEmit --strict index.d.ts",
-    "test:mutation": "stryker run"
+    "test:mutation": "stryker run",
+    "examples": "node examples/run-all.mjs"
   },
   "engines": {
     "node": ">=22"

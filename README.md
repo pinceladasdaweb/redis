@@ -57,6 +57,33 @@ console.log(await redis.getJson('user:1')) // { name: 'Ada' }
 await redis.disconnect()
 ```
 
+## Examples
+
+Every example below is a runnable script that asserts its own outcome — if the documented behavior ever breaks, the example fails instead of quietly printing something wrong. Start a server (`docker compose up -d`) and run them all with `npm run examples`, or one at a time:
+
+```bash
+node "examples/5 - cache-stampede/index.mjs"
+```
+
+| # | Example | What it shows |
+| --- | --- | --- |
+| 1 | [connection](examples/1%20-%20connection) | Connecting, lifecycle events (`ready`/`close`/`end`), health probe, clean shutdown |
+| 2 | [strings-and-expiration](examples/2%20-%20strings-and-expiration) | `set`/`get`, `setex`, `ttl`/`persist`, atomic counters, `mset`/`mget` |
+| 3 | [json-documents](examples/3%20-%20json-documents) | `setJson`/`getJson`/`setexJson` and why serialization stays explicit |
+| 4 | [cache-aside](examples/4%20-%20cache-aside) | `getOrSetJson`: miss produces, hit serves — with the producer call counted |
+| 5 | [cache-stampede](examples/5%20-%20cache-stampede) | 50 concurrent misses: 50 database hits without the lock, **1** with `{ lock: true }` |
+| 6 | [cache-invalidation](examples/6%20-%20cache-invalidation) | `deleteByPattern` (SCAN + UNLINK) and dumping the keyspace with `getAllStream` |
+| 7 | [hashes](examples/7%20-%20hashes) | Partial updates and atomic field increments |
+| 8 | [lists-and-sets](examples/8%20-%20lists-and-sets) | Queues with lists, membership with sets |
+| 9 | [distributed-lock](examples/9%20-%20distributed-lock) | Two workers, one critical section: `withLock`, contention, token-checked release |
+| 10 | [long-running-lock](examples/10%20-%20long-running-lock) | `autoExtend`: a 1500ms job safely holding a 500ms lock |
+| 11 | [pubsub](examples/11%20-%20pubsub) | Channel and pattern subscriptions, handlers vs events, unsubscribing |
+| 12 | [streams](examples/12%20-%20streams) | Consumer groups end to end: `xreadgroup`, `xack`, pending entries, `xclaim`, `xtrim` |
+| 13 | [transactions](examples/13%20-%20transactions) | `multi()` batches and real optimistic locking, including an aborted conflict |
+| 14 | [resilience](examples/14%20-%20resilience) | Fail-fast `REDIS_UNAVAILABLE`, error codes and graceful degradation |
+| 15 | [custom-logger](examples/15%20-%20custom-logger) | Injecting your own logger and proving the hot path stays silent |
+| 16 | [rate-limiting](examples/16%20-%20rate-limiting) | A fixed-window limiter built from `incr` + `expire`, correct under bursts |
+
 ## Constructor options
 
 ### Connection
@@ -298,6 +325,9 @@ All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xle
 
 - **Blocking reads run on a dedicated connection.** `xread`/`xreadgroup` with `block` (including `block: 0`, which blocks forever) never stall other commands.
 - **`xgroup` respects each subcommand's arity** — `CREATE` (with optional `MKSTREAM`), `DESTROY`, `SETID`, `CREATECONSUMER`, `DELCONSUMER`.
+- **`keyPrefix` is honored everywhere**, including `xgroup` and `xinfo` — whose key sits after a subcommand, a position the underlying driver does not prefix on its own.
+
+Consumer groups, acknowledgements and recovery of stalled entries are covered end to end in [example 12](examples/12%20-%20streams).
 
 ```javascript
 await redis.xadd('events', '*', 'type', 'signup')
@@ -336,6 +366,7 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 ## Notes on semantics
 
 - Values are sent as-is: no implicit JSON serialization anywhere (`mset` included). Use the `*Json` helpers.
+- `sort()`'s `by` and `get` patterns are sent verbatim: unlike keys, the driver never rewrites them, so include your `keyPrefix` yourself when using them.
 - `getJson` returns `null` for missing keys and throws `SyntaxError` on non-JSON payloads.
 - A command issued while disconnected rejects with `REDIS_UNAVAILABLE` — it is **not** queued (the tiny race window that slips into the driver's offline queue is resent on reconnection; bound it with `commandTimeout` if needed).
 

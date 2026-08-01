@@ -271,6 +271,8 @@ export declare class RedisClient extends EventEmitter {
   /** `count` is required at runtime — omitting it rejects with INVALID_ARGUMENT. */
   xtrim (key: string, strategy: string, approx: boolean, count: number): Promise<number>
   xpending (key: string, group: string, options?: StreamPendingOptions): Promise<unknown>
+  /** Acknowledges entries so they leave the consumer group's pending list. */
+  xack (key: string, group: string, ...ids: string[]): Promise<number>
   xclaim (key: string, group: string, consumer: string, minIdleTime: number, ...ids: string[]): Promise<StreamEntry[]>
 
   /** SCAN-based dump of the (prefixed) keyspace: [{ key: value }, ...]. Skips non-string keys. */

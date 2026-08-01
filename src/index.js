@@ -546,11 +546,19 @@ class RedisClient extends EventEmitter {
       : this.executeCommand('xreadgroup', ...args)
   }
 
+  // ioredis applies keyPrefix by argument position, and XGROUP/XINFO carry
+  // their key *after* a subcommand — a position it does not recognize. Left
+  // alone, a prefixed client would create consumer groups on unprefixed keys
+  // while XADD/XREADGROUP used the prefixed ones.
+  #prefixed (key) {
+    return `${this.keyPrefix}${key}`
+  }
+
   // Each XGROUP subcommand has its own arity — a blanket trailing id turned
   // documented calls like xgroup('DESTROY', key, group) into protocol errors.
   async xgroup (command, key, groupName, ...rest) {
     const subcommand = String(command).toUpperCase()
-    const args = [subcommand, key, groupName]
+    const args = [subcommand, this.#prefixed(key), groupName]
 
     switch (subcommand) {
       case 'CREATE': {
@@ -586,7 +594,7 @@ class RedisClient extends EventEmitter {
   }
 
   async xinfo (subcommand, key, ...args) {
-    return this.executeCommand('xinfo', subcommand, key, ...args)
+    return this.executeCommand('xinfo', subcommand, this.#prefixed(key), ...args)
   }
 
   async xrange (key, start, end, options = {}) {
@@ -645,6 +653,12 @@ class RedisClient extends EventEmitter {
     }
 
     return this.executeCommand('xpending', ...args)
+  }
+
+  // Settling a consumer-group entry: without it, every delivered entry stays
+  // in the group's pending list forever.
+  async xack (key, group, ...ids) {
+    return this.executeCommand('xack', key, group, ...ids)
   }
 
   async xclaim (key, group, consumer, minIdleTime, ...ids) {
