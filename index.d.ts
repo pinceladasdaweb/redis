@@ -68,6 +68,25 @@ export declare class RedisClientError extends Error {
   constructor (message: string, operation: string, code?: string)
 }
 
+/** A sorted-set member with its score already parsed (infinities included). */
+export interface ScoredMember {
+  member: string
+  score: number
+}
+
+export interface SortedSetRangeOptions {
+  /** Return { member, score } pairs instead of bare members. */
+  withScores?: boolean
+  /** Interpret start/stop as scores (ZRANGE only). */
+  byScore?: boolean
+  /** Interpret start/stop as lexicographic ranges (ZRANGE only). */
+  byLex?: boolean
+  /** Reverse the ordering (ZRANGE only). */
+  rev?: boolean
+  /** Requires byScore or byLex on ZRANGE; always available on ZRANGEBYSCORE. */
+  limit?: { offset: number, count: number }
+}
+
 export interface SortOptions {
   by?: string
   limit?: { offset: number, count: number }
@@ -228,6 +247,33 @@ export declare class RedisClient extends EventEmitter {
   spop (key: string): Promise<string | null>
   spop (key: string, count: number): Promise<string[]>
   srem (key: string, ...members: string[]): Promise<number>
+
+  /** Adds members as { member: score }, or passes ioredis arguments through (score first, plus flags). */
+  zadd (key: string, members: Record<string, number | string>): Promise<number>
+  zadd (key: string, ...args: Array<string | number>): Promise<number | string>
+  /** The member's score as a number, or null when it is not in the set. */
+  zscore (key: string, member: string): Promise<number | null>
+  /** The new score after the increment. */
+  zincrby (key: string, increment: number, member: string): Promise<number>
+  zcard (key: string): Promise<number>
+  zcount (key: string, min: number | string, max: number | string): Promise<number>
+  /** Zero-based position, or null when the member is absent. */
+  zrank (key: string, member: string): Promise<number | null>
+  zrevrank (key: string, member: string): Promise<number | null>
+  zrem (key: string, ...members: string[]): Promise<number>
+  zrange (key: string, start: number | string, stop: number | string, options: SortedSetRangeOptions & { withScores: true }): Promise<ScoredMember[]>
+  zrange (key: string, start: number | string, stop: number | string, options?: SortedSetRangeOptions): Promise<string[]>
+  zrevrange (key: string, start: number, stop: number, options: SortedSetRangeOptions & { withScores: true }): Promise<ScoredMember[]>
+  zrevrange (key: string, start: number, stop: number, options?: SortedSetRangeOptions): Promise<string[]>
+  zrangebyscore (key: string, min: number | string, max: number | string, options: SortedSetRangeOptions & { withScores: true }): Promise<ScoredMember[]>
+  zrangebyscore (key: string, min: number | string, max: number | string, options?: SortedSetRangeOptions): Promise<string[]>
+  zremrangebyrank (key: string, start: number, stop: number): Promise<number>
+  zremrangebyscore (key: string, min: number | string, max: number | string): Promise<number>
+  /** Without a count: the single lowest-scored member, or null on an empty set. */
+  zpopmin (key: string): Promise<ScoredMember | null>
+  zpopmin (key: string, count: number): Promise<ScoredMember[]>
+  zpopmax (key: string): Promise<ScoredMember | null>
+  zpopmax (key: string, count: number): Promise<ScoredMember[]>
 
   sort (key: string, options?: SortOptions): Promise<string[]>
 

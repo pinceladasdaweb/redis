@@ -18,6 +18,7 @@ Every reliability claim in this README is enforced by the integration suite agai
 - **Bulk deletion done right**: `deleteByPattern` uses `SCAN` + `UNLINK` in batches (non-blocking, prefix-aware) instead of `KEYS`.
 - **Sentinel support**: pass `sentinels` + `name` and the client rides ioredis' native high-availability failover.
 - **Prefixed keyspace scan**: `getAllStream(pattern)` dumps your keys (and only yours — `keyPrefix` is honored, unlike raw `SCAN`), skipping non-string types gracefully.
+- **Rankings without the footguns**: sorted-set scores return as real numbers (infinities included) and `withScores` gives you `{ member, score }` pairs instead of a flat array.
 - **TypeScript declarations**: hand-maintained `index.d.ts`, checked with `tsc --strict` in CI.
 - **One runtime dependency**: ioredis. Nothing else.
 
@@ -83,6 +84,7 @@ node "examples/5 - cache-stampede/index.mjs"
 | 14 | [resilience](examples/14%20-%20resilience) | Fail-fast `REDIS_UNAVAILABLE`, error codes and graceful degradation |
 | 15 | [custom-logger](examples/15%20-%20custom-logger) | Injecting your own logger and proving the hot path stays silent |
 | 16 | [rate-limiting](examples/16%20-%20rate-limiting) | A fixed-window limiter built from `incr` + `expire`, correct under bursts |
+| 17 | [leaderboard](examples/17%20-%20leaderboard) | Sorted sets: rankings, pagination by score, infinite scores, priority queue, trimming |
 
 ## Constructor options
 
@@ -319,6 +321,35 @@ await redis.withLock('report:build', { ttl: 30000, autoExtend: true, retries: 10
 
 Without `autoExtend`, keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
 
+## Sorted sets and rankings
+
+Sorted sets keep members ordered by score — the backbone of leaderboards, priority queues and score-based windows. Two conveniences over the raw protocol:
+
+- **Scores come back as numbers.** Redis sends them as strings, infinities included, and `Number('inf')` is `NaN`. `zscore`, `zincrby` and every `withScores` result parse them for you (`Infinity` and `-Infinity` survive the round-trip). A member that is not in the set reads as `null`, never `NaN`.
+- **`withScores` returns pairs**, not the flat `[member, score, member, score]` array that is so easy to mis-index.
+
+```javascript
+await redis.zadd('leaderboard', { ada: 120, alan: 95, grace: 180 })
+await redis.zincrby('leaderboard', 45, 'ada')   // → 165
+
+await redis.zrevrange('leaderboard', 0, 2, { withScores: true })
+// → [{ member: 'grace', score: 180 }, { member: 'ada', score: 165 }, { member: 'alan', score: 95 }]
+
+await redis.zrevrank('leaderboard', 'ada')      // → 1 (zero-based)
+await redis.zrangebyscore('leaderboard', 100, '+inf')
+await redis.zremrangebyrank('leaderboard', 0, -101)   // keep the top 100
+```
+
+`zadd` also accepts raw arguments, so flags stay available: `zadd(key, 'NX', 'CH', 50, 'member')`. Pagination by score uses `zrange` with `byScore`:
+
+```javascript
+await redis.zrange('leaderboard', '+inf', '-inf', {
+  byScore: true, rev: true, limit: { offset: 20, count: 10 }, withScores: true
+})
+```
+
+Popping follows the `spop` convention — without a count you get a single `{ member, score }` (or `null`), with one you get an array. That makes `zpopmin` a natural priority queue: [example 17](examples/17%20-%20leaderboard).
+
 ## Streams
 
 All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xlen`, `xinfo`, `xrange`, `xrevrange`, `xdel`, `xtrim`, `xpending`, `xclaim`). Two behaviors worth knowing:
@@ -354,6 +385,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Hashes**: `hset` (pairs or object), `hget`, `hgetall`, `hmset` (delegates to `HSET`; returns the number of new fields), `hmget`, `hincrby`, `hexists`, `hdel`
 **Lists**: `lpush`, `rpop`, `lrange`, `llen`, `lrem`, `lpushx`, `rpushx`
 **Sets**: `sadd`, `smembers`, `sismember`, `scard`, `spop` (single member without `count`, array with it), `srem`
+**Sorted sets**: `zadd`, `zscore`, `zincrby`, `zcard`, `zcount`, `zrank`, `zrevrank`, `zrem`, `zrange`, `zrevrange`, `zrangebyscore`, `zremrangebyrank`, `zremrangebyscore`, `zpopmin`, `zpopmax` — see [Sorted sets](#sorted-sets-and-rankings)
 **Keys**: `del`, `exists`, `type`, `rename`, `renamenx`, `persist`, `expire`, `ttl`, `sort`
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
 **Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`

@@ -107,6 +107,13 @@ const CONTRACTS = [
   ['sismember', ['s', 'm'], ['sismember', 's', 'm']],
   ['scard', ['s'], ['scard', 's']],
   ['srem', ['s', 'a', 'b'], ['srem', 's', 'a', 'b']],
+  ['zcard', ['z'], ['zcard', 'z']],
+  ['zcount', ['z', 0, 100], ['zcount', 'z', 0, 100]],
+  ['zrank', ['z', 'm'], ['zrank', 'z', 'm']],
+  ['zrevrank', ['z', 'm'], ['zrevrank', 'z', 'm']],
+  ['zrem', ['z', 'a', 'b'], ['zrem', 'z', 'a', 'b']],
+  ['zremrangebyrank', ['z', 0, 9], ['zremrangebyrank', 'z', 0, 9]],
+  ['zremrangebyscore', ['z', '-inf', 10], ['zremrangebyscore', 'z', '-inf', 10]],
   ['xadd', ['st', '*', 'f', 'v'], ['xadd', 'st', '*', 'f', 'v']],
   ['xlen', ['st'], ['xlen', 'st']],
   ['xinfo', ['STREAM', 'st'], ['xinfo', 'STREAM', 'st']],
@@ -139,6 +146,7 @@ describe('wire contract', () => {
       // asserted in dedicated tests below
       'getJson', 'setJson', 'setexJson', 'getOrSet', 'getOrSetJson', 'deleteByPattern',
       'getAllStream', 'hset', 'hmset', 'mset', 'spop', 'sort', 'multi', 'watch', 'unwatch',
+      'zadd', 'zscore', 'zincrby', 'zrange', 'zrevrange', 'zrangebyscore', 'zpopmin', 'zpopmax',
       'xread', 'xreadgroup', 'xgroup', 'xtrim', 'publishJson',
       'subscribe', 'unsubscribe', 'psubscribe', 'punsubscribe', 'acquireLock', 'withLock'
     ])
@@ -196,6 +204,71 @@ describe('wire contract', () => {
     })
 
     assert.deepEqual(calls[0], ['sort', 'l', 'BY', 'w_*', 'LIMIT', 0, 10, 'GET', 'o_*', 'DESC', 'ALPHA'])
+  })
+
+  test('zadd accepts an object of members and raw arguments alike', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.zadd('z', { ada: 100, alan: 90 })
+    await redis.zadd('z', 100, 'ada')
+    await redis.zadd('z', 'NX', 'CH', 50, 'grace')
+
+    assert.deepEqual(calls[0], ['zadd', 'z', 100, 'ada', 90, 'alan'], 'score comes before member on the wire')
+    assert.deepEqual(calls[1], ['zadd', 'z', 100, 'ada'])
+    assert.deepEqual(calls[2], ['zadd', 'z', 'NX', 'CH', 50, 'grace'], 'flags must stay available')
+  })
+
+  test('sorted-set ranges build their clauses in protocol order', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.zrange('z', 0, -1)
+    await redis.zrange('z', 0, -1, { withScores: true })
+    await redis.zrange('z', 10, 20, { byScore: true, rev: true, limit: { offset: 0, count: 5 }, withScores: true })
+    await redis.zrevrange('z', 0, 9, { withScores: true })
+    await redis.zrangebyscore('z', '-inf', '+inf', { withScores: true, limit: { offset: 5, count: 10 } })
+
+    assert.deepEqual(calls[0], ['zrange', 'z', 0, -1])
+    assert.deepEqual(calls[1], ['zrange', 'z', 0, -1, 'WITHSCORES'])
+    assert.deepEqual(calls[2], ['zrange', 'z', 10, 20, 'BYSCORE', 'REV', 'LIMIT', 0, 5, 'WITHSCORES'])
+    assert.deepEqual(calls[3], ['zrevrange', 'z', 0, 9, 'WITHSCORES'])
+    assert.deepEqual(calls[4], ['zrangebyscore', 'z', '-inf', '+inf', 'WITHSCORES', 'LIMIT', 5, 10])
+  })
+
+  test('scores are returned as numbers, and WITHSCORES as member/score pairs', async () => {
+    const { redis, fake } = createClient()
+
+    fake.zscore = async () => '42.5'
+    fake.zincrby = async () => 'inf'
+    fake.zrange = async () => ['ada', '100', 'alan', '90']
+    fake.zpopmin = async () => ['alan', '90']
+
+    assert.equal(await redis.zscore('z', 'ada'), 42.5)
+    assert.equal(await redis.zincrby('z', 1, 'ada'), Number.POSITIVE_INFINITY)
+    assert.deepEqual(await redis.zrange('z', 0, -1, { withScores: true }), [
+      { member: 'ada', score: 100 },
+      { member: 'alan', score: 90 }
+    ])
+    assert.deepEqual(await redis.zpopmin('z'), { member: 'alan', score: 90 })
+
+    fake.zscore = async () => null
+    assert.equal(await redis.zscore('z', 'ghost'), null, 'a missing member is null, never NaN')
+  })
+
+  test('zpopmin and zpopmax switch shape on the count argument', async () => {
+    const { redis, calls, fake } = createClient()
+
+    // Overrides must keep recording, or the wire assertions below see nothing.
+    fake.zpopmin = async (...args) => { calls.push(['zpopmin', ...args]); return [] }
+    fake.zpopmax = async (...args) => { calls.push(['zpopmax', ...args]); return ['ada', '100', 'alan', '90'] }
+
+    assert.equal(await redis.zpopmin('z'), null, 'an empty set pops nothing')
+    assert.deepEqual(await redis.zpopmax('z', 2), [
+      { member: 'ada', score: 100 },
+      { member: 'alan', score: 90 }
+    ])
+
+    assert.deepEqual(calls[0], ['zpopmin', 'z'], 'no count means no count on the wire')
+    assert.deepEqual(calls[1], ['zpopmax', 'z', 2])
   })
 
   test('sort without options sends no clauses at all', async () => {
