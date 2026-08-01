@@ -4,7 +4,8 @@
 // `interval` so concurrent callers reuse one in-flight PING.
 class HealthChecker {
   #lastCheckTime = 0
-  #checkPromise = null
+  #lastResult = null
+  #inFlight = null
 
   constructor ({ getClient, logger, interval = 5000, timeout = 1000 }) {
     this.getClient = getClient
@@ -14,16 +15,32 @@ class HealthChecker {
   }
 
   async check () {
+    // Concurrent callers always share the probe that is already running.
+    if (this.#inFlight) {
+      return this.#inFlight
+    }
+
     const now = Date.now()
 
-    if (now - this.#lastCheckTime < this.interval && this.#checkPromise) {
-      return this.#checkPromise
+    // Only a healthy result is cached. Caching a failure would keep reporting
+    // "down" for a whole interval after the connection recovered — readiness
+    // endpoints would hold traffic back long after Redis came back.
+    if (this.#lastResult === true && now - this.#lastCheckTime < this.interval) {
+      return true
     }
 
     this.#lastCheckTime = now
-    this.#checkPromise = this.#performCheck()
+    this.#inFlight = this.#performCheck()
+      .then((healthy) => {
+        this.#lastResult = healthy
 
-    return this.#checkPromise
+        return healthy
+      })
+      .finally(() => {
+        this.#inFlight = null
+      })
+
+    return this.#inFlight
   }
 
   async #performCheck () {

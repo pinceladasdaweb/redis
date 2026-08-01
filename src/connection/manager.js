@@ -24,16 +24,21 @@ class ConnectionManager {
   }
 
   async connect () {
+    // An attempt in flight must be joined, never skipped: #establishConnection
+    // assigns the client synchronously, so a concurrent caller that checked
+    // for the client first would resolve before the connection was ready.
+    if (this.#connectPromise) {
+      return this.#connectPromise
+    }
+
     if (this.#client) {
       this.logger.debug?.('Redis client already exists. Reusing existing connection.')
       return
     }
 
-    if (!this.#connectPromise) {
-      this.#connectPromise = this.#establishConnection().finally(() => {
-        this.#connectPromise = null
-      })
-    }
+    this.#connectPromise = this.#establishConnection().finally(() => {
+      this.#connectPromise = null
+    })
 
     return this.#connectPromise
   }
