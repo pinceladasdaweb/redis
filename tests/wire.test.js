@@ -218,6 +218,19 @@ describe('wire contract', () => {
     assert.deepEqual(calls[2], ['zadd', 'z', 'NX', 'CH', 50, 'grace'], 'flags must stay available')
   })
 
+  // Regression: an empty member map used to reach the server as a bare ZADD
+  // ("wrong number of arguments"), and an array was mistaken for a member map.
+  test('zadd rejects an empty batch and leaves arrays to the driver', async () => {
+    const { redis, calls } = createClient()
+
+    await assert.rejects(redis.zadd('z', {}), { code: 'INVALID_ARGUMENT', operation: 'zadd' })
+    await assert.rejects(redis.zadd('z'), { code: 'INVALID_ARGUMENT', operation: 'zadd' })
+    assert.equal(calls.length, 0, 'nothing may be sent for an empty batch')
+
+    await redis.zadd('z', [100, 'ada'])
+    assert.deepEqual(calls[0], ['zadd', 'z', [100, 'ada']], 'arrays go through untouched')
+  })
+
   test('sorted-set ranges build their clauses in protocol order', async () => {
     const { redis, calls } = createClient()
 

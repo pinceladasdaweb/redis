@@ -118,21 +118,32 @@ describe('connection manager', () => {
     assert.equal(manager.client, created[0], 'the driver keeps retrying on this client')
   })
 
-  test('a connect that ends the client releases it', async () => {
-    const { manager } = createManager({ connectFails: true })
-    const client = manager.redisConfig.createRedisClient
-    assert.equal(typeof client, 'function')
+  // A driver that rejects with the client already dead must not leave the
+  // reference behind: connect() would short-circuit on it forever.
+  test('a client that dies during connect is released, and connect can retry', async () => {
+    const { manager } = createManager()
+    const dead = createDriverClient()
 
-    const failing = createDriverClient({ connectFails: true })
-    failing.connect = async () => {
-      failing.status = 'end'
-      throw new Error('gave up')
+    dead.connect = async () => {
+      dead.status = 'end'
+      throw new Error('gave up without emitting end')
     }
-    manager.redisConfig = { createRedisClient: () => failing }
+
+    const healthy = createDriverClient()
+    let next = dead
+    manager.redisConfig = { createRedisClient: () => next }
 
     await manager.connect()
 
+    assert.equal(manager.client, null, 'the dead client must not stay assigned')
     assert.equal(manager.isConnected, false)
+
+    // A later connect() starts a fresh cycle instead of reusing the corpse.
+    next = healthy
+    await manager.connect()
+
+    assert.equal(manager.client, healthy)
+    assert.equal(manager.isConnected, true)
   })
 
   test('driver lifecycle events reach the facade', async () => {

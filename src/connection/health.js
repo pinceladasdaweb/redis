@@ -22,10 +22,12 @@ class HealthChecker {
 
     const now = Date.now()
 
-    // Only a healthy result is cached. Caching a failure would keep reporting
-    // "down" for a whole interval after the connection recovered — readiness
-    // endpoints would hold traffic back long after Redis came back.
-    if (this.#lastResult === true && now - this.#lastCheckTime < this.interval) {
+    // Only a healthy result is cached, and only while the connection is still
+    // up. Caching a failure would keep reporting "down" after the connection
+    // recovered; serving a stale "up" is worse — a readiness endpoint would
+    // keep traffic flowing to a connection that already dropped. Checking the
+    // driver's own status is a free local read.
+    if (this.#lastResult === true && now - this.#lastCheckTime < this.interval && this.#readyClient()) {
       return true
     }
 
@@ -43,10 +45,16 @@ class HealthChecker {
     return this.#inFlight
   }
 
-  async #performCheck () {
+  #readyClient () {
     const client = this.getClient()
 
-    if (!client || client.status !== 'ready') {
+    return client && client.status === 'ready' ? client : null
+  }
+
+  async #performCheck () {
+    const client = this.#readyClient()
+
+    if (!client) {
       return false
     }
 

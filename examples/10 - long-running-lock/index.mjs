@@ -18,11 +18,11 @@ await redis.deleteByPattern('*')
 // while the callback runs.
 let intruderGotIn = false
 
-await redis.withLock('import', { ttl: 500, autoExtend: true }, async () => {
-  console.log('  job started         → ttl is 500ms, work takes 1500ms')
+await redis.withLock('import', { ttl: 2000, autoExtend: true }, async () => {
+  console.log('  job started         → ttl is 2000ms, work takes 3000ms')
 
-  for (let elapsed = 0; elapsed < 1500; elapsed += 300) {
-    await new Promise((resolve) => setTimeout(resolve, 300))
+  for (let elapsed = 0; elapsed < 3000; elapsed += 750) {
+    await new Promise((resolve) => setTimeout(resolve, 750))
 
     // Someone else tries to grab the lock while we are still working.
     try {
@@ -48,4 +48,4 @@ assert.equal(intruderGotIn, false, 'the lock must survive the whole job')
 
 await redis.deleteByPattern('*')
 await redis.disconnect()
-done('A 1500ms job held a 500ms lock from start to finish')
+done('A 3000ms job held a 2000ms lock from start to finish')

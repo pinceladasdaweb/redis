@@ -89,6 +89,16 @@ class ConnectionManager {
     } catch (err) {
       if (client.status === 'end') {
         this.logger.error(`Failed to connect to Redis: ${err.message}`)
+
+        // The driver is done with this client. Release it here too: if it
+        // never emits 'end', a stale reference would make every later
+        // connect() short-circuit and leave the caller unable to reconnect.
+        this.#isConnected = false
+
+        if (this.#client === client) {
+          this.#client = null
+        }
+
         return
       }
 

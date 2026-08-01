@@ -104,6 +104,20 @@ describe('health checker', () => {
     assert.equal(client.pings, 2, 'a failed probe must be retried, not remembered')
   })
 
+  // Regression: a cached "healthy" used to be served without looking at the
+  // connection, so a readiness endpoint kept sending traffic to a client that
+  // had already dropped.
+  test('never serves a cached healthy result for a dropped connection', async () => {
+    const client = pingingClient('PONG')
+    const checker = createChecker({ client, interval: 60000 })
+
+    assert.equal(await checker.check(), true)
+
+    client.status = 'end'
+    assert.equal(await checker.check(), false, 'the cache must not outlive the connection')
+    assert.equal(client.pings, 1, 'and noticing costs no extra round-trip')
+  })
+
   test('caches a healthy result for the configured interval', async () => {
     const client = pingingClient('PONG')
     const checker = createChecker({ client, interval: 60000 })

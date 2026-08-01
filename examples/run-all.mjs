@@ -10,8 +10,14 @@ import { spawn } from 'node:child_process'
 const here = dirname(fileURLToPath(import.meta.url))
 
 const run = (name) => new Promise((resolve) => {
-  const child = spawn(process.execPath, [join(here, name, 'index.mjs')], { encoding: 'utf8' })
+  const child = spawn(process.execPath, [join(here, name, 'index.mjs')])
   let output = ''
+
+  // Decode per stream, not per chunk: concatenating raw Buffers would corrupt
+  // any multi-byte character split across a chunk boundary — including the
+  // marker this harness looks for.
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
 
   child.stdout.on('data', (chunk) => { output += chunk })
   child.stderr.on('data', (chunk) => { output += chunk })

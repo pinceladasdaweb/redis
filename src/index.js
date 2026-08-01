@@ -416,15 +416,28 @@ class RedisClient extends EventEmitter {
   // Sorted sets. Scores come back as numbers (Redis speaks strings) and
   // WITHSCORES replies as { member, score } pairs instead of a flat array.
   async zadd (key, ...args) {
-    // The common case reads better as { member: score }; anything else is
-    // passed straight through, so flags like NX/GT/CH stay available.
-    if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
-      const pairs = Object.entries(args[0]).flatMap(([member, score]) => [score, member])
+    const [first] = args
 
-      return this.executeCommand('zadd', key, ...pairs)
+    // The common case reads better as { member: score }; arrays and anything
+    // else are passed straight through, so flags like NX/GT/CH stay available.
+    const isMemberMap = args.length === 1 &&
+      typeof first === 'object' &&
+      first !== null &&
+      !Array.isArray(first)
+
+    const commandArgs = isMemberMap
+      ? Object.entries(first).flatMap(([member, score]) => [score, member])
+      : args
+
+    if (commandArgs.length === 0) {
+      throw new RedisClientError(
+        'zadd requires at least one member to add.',
+        'zadd',
+        'INVALID_ARGUMENT'
+      )
     }
 
-    return this.executeCommand('zadd', key, ...args)
+    return this.executeCommand('zadd', key, ...commandArgs)
   }
 
   async zscore (key, member) {
