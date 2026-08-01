@@ -18,6 +18,7 @@ Every reliability claim in this README is enforced by the integration suite agai
 - **Bulk deletion done right**: `deleteByPattern` uses `SCAN` + `UNLINK` in batches (non-blocking, prefix-aware) instead of `KEYS`.
 - **Sentinel support**: pass `sentinels` + `name` and the client rides ioredis' native high-availability failover.
 - **Prefixed keyspace scan**: `getAllStream(pattern)` dumps your keys (and only yours — `keyPrefix` is honored, unlike raw `SCAN`), skipping non-string types gracefully.
+- **Rankings without the footguns**: sorted-set scores return as real numbers (infinities included) and `withScores` gives you `{ member, score }` pairs instead of a flat array.
 - **TypeScript declarations**: hand-maintained `index.d.ts`, checked with `tsc --strict` in CI.
 - **One runtime dependency**: ioredis. Nothing else.
 
@@ -56,6 +57,34 @@ console.log(await redis.getJson('user:1')) // { name: 'Ada' }
 
 await redis.disconnect()
 ```
+
+## Examples
+
+Every example below is a runnable script that asserts its own outcome — if the documented behavior ever breaks, the example fails instead of quietly printing something wrong. Start a server (`docker compose up -d`) and run them all with `npm run examples`, or one at a time:
+
+```bash
+node "examples/5 - cache-stampede/index.mjs"
+```
+
+| # | Example | What it shows |
+| --- | --- | --- |
+| 1 | [connection](examples/1%20-%20connection) | Connecting, lifecycle events (`ready`/`close`/`end`), health probe, clean shutdown |
+| 2 | [strings-and-expiration](examples/2%20-%20strings-and-expiration) | `set`/`get`, `setex`, `ttl`/`persist`, atomic counters, `mset`/`mget` |
+| 3 | [json-documents](examples/3%20-%20json-documents) | `setJson`/`getJson`/`setexJson` and why serialization stays explicit |
+| 4 | [cache-aside](examples/4%20-%20cache-aside) | `getOrSetJson`: miss produces, hit serves — with the producer call counted |
+| 5 | [cache-stampede](examples/5%20-%20cache-stampede) | 50 concurrent misses: 50 database hits without the lock, **1** with `{ lock: true }` |
+| 6 | [cache-invalidation](examples/6%20-%20cache-invalidation) | `deleteByPattern` (SCAN + UNLINK) and dumping the keyspace with `getAllStream` |
+| 7 | [hashes](examples/7%20-%20hashes) | Partial updates and atomic field increments |
+| 8 | [lists-and-sets](examples/8%20-%20lists-and-sets) | Queues with lists, membership with sets |
+| 9 | [distributed-lock](examples/9%20-%20distributed-lock) | Two workers, one critical section: `withLock`, contention, token-checked release |
+| 10 | [long-running-lock](examples/10%20-%20long-running-lock) | `autoExtend`: a 1500ms job safely holding a 500ms lock |
+| 11 | [pubsub](examples/11%20-%20pubsub) | Channel and pattern subscriptions, handlers vs events, unsubscribing |
+| 12 | [streams](examples/12%20-%20streams) | Consumer groups end to end: `xreadgroup`, `xack`, pending entries, `xclaim`, `xtrim` |
+| 13 | [transactions](examples/13%20-%20transactions) | `multi()` batches and real optimistic locking, including an aborted conflict |
+| 14 | [resilience](examples/14%20-%20resilience) | Fail-fast `REDIS_UNAVAILABLE`, error codes and graceful degradation |
+| 15 | [custom-logger](examples/15%20-%20custom-logger) | Injecting your own logger and proving the hot path stays silent |
+| 16 | [rate-limiting](examples/16%20-%20rate-limiting) | A fixed-window limiter built from `incr` + `expire`, correct under bursts |
+| 17 | [leaderboard](examples/17%20-%20leaderboard) | Sorted sets: rankings, pagination by score, infinite scores, priority queue, trimming |
 
 ## Constructor options
 
@@ -292,12 +321,44 @@ await redis.withLock('report:build', { ttl: 30000, autoExtend: true, retries: 10
 
 Without `autoExtend`, keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
 
+## Sorted sets and rankings
+
+Sorted sets keep members ordered by score — the backbone of leaderboards, priority queues and score-based windows. Two conveniences over the raw protocol:
+
+- **Scores come back as numbers.** Redis sends them as strings, infinities included, and `Number('inf')` is `NaN`. `zscore`, `zincrby` and every `withScores` result parse them for you (`Infinity` and `-Infinity` survive the round-trip). A member that is not in the set reads as `null`, never `NaN`.
+- **`withScores` returns pairs**, not the flat `[member, score, member, score]` array that is so easy to mis-index.
+
+```javascript
+await redis.zadd('leaderboard', { ada: 120, alan: 95, grace: 180 })
+await redis.zincrby('leaderboard', 45, 'ada')   // → 165
+
+await redis.zrevrange('leaderboard', 0, 2, { withScores: true })
+// → [{ member: 'grace', score: 180 }, { member: 'ada', score: 165 }, { member: 'alan', score: 95 }]
+
+await redis.zrevrank('leaderboard', 'ada')      // → 1 (zero-based)
+await redis.zrangebyscore('leaderboard', 100, '+inf')
+await redis.zremrangebyrank('leaderboard', 0, -101)   // keep the top 100
+```
+
+`zadd` also accepts raw arguments, so flags stay available: `zadd(key, 'NX', 'CH', 50, 'member')`. Pagination by score uses `zrange` with `byScore`:
+
+```javascript
+await redis.zrange('leaderboard', '+inf', '-inf', {
+  byScore: true, rev: true, limit: { offset: 20, count: 10 }, withScores: true
+})
+```
+
+Popping follows the `spop` convention — without a count you get a single `{ member, score }` (or `null`), with one you get an array. That makes `zpopmin` a natural priority queue: [example 17](examples/17%20-%20leaderboard).
+
 ## Streams
 
 All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xlen`, `xinfo`, `xrange`, `xrevrange`, `xdel`, `xtrim`, `xpending`, `xclaim`). Two behaviors worth knowing:
 
 - **Blocking reads run on a dedicated connection.** `xread`/`xreadgroup` with `block` (including `block: 0`, which blocks forever) never stall other commands.
 - **`xgroup` respects each subcommand's arity** — `CREATE` (with optional `MKSTREAM`), `DESTROY`, `SETID`, `CREATECONSUMER`, `DELCONSUMER`.
+- **`keyPrefix` is honored everywhere**, including `xgroup` and `xinfo` — whose key sits after a subcommand, a position the underlying driver does not prefix on its own.
+
+Consumer groups, acknowledgements and recovery of stalled entries are covered end to end in [example 12](examples/12%20-%20streams).
 
 ```javascript
 await redis.xadd('events', '*', 'type', 'signup')
@@ -324,6 +385,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Hashes**: `hset` (pairs or object), `hget`, `hgetall`, `hmset` (delegates to `HSET`; returns the number of new fields), `hmget`, `hincrby`, `hexists`, `hdel`
 **Lists**: `lpush`, `rpop`, `lrange`, `llen`, `lrem`, `lpushx`, `rpushx`
 **Sets**: `sadd`, `smembers`, `sismember`, `scard`, `spop` (single member without `count`, array with it), `srem`
+**Sorted sets**: `zadd`, `zscore`, `zincrby`, `zcard`, `zcount`, `zrank`, `zrevrank`, `zrem`, `zrange`, `zrevrange`, `zrangebyscore`, `zremrangebyrank`, `zremrangebyscore`, `zpopmin`, `zpopmax` — see [Sorted sets](#sorted-sets-and-rankings)
 **Keys**: `del`, `exists`, `type`, `rename`, `renamenx`, `persist`, `expire`, `ttl`, `sort`
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
 **Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`
@@ -336,6 +398,7 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 ## Notes on semantics
 
 - Values are sent as-is: no implicit JSON serialization anywhere (`mset` included). Use the `*Json` helpers.
+- `sort()`'s `by` and `get` patterns are sent verbatim: unlike keys, the driver never rewrites them, so include your `keyPrefix` yourself when using them.
 - `getJson` returns `null` for missing keys and throws `SyntaxError` on non-JSON payloads.
 - A command issued while disconnected rejects with `REDIS_UNAVAILABLE` — it is **not** queued (the tiny race window that slips into the driver's offline queue is resent on reconnection; bound it with `commandTimeout` if needed).
 

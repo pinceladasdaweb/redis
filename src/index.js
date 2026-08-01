@@ -6,6 +6,7 @@ import HealthChecker from './connection/health.js'
 import SubscriptionManager from './messaging/pubsub.js'
 import ConnectionManager from './connection/manager.js'
 import Logger, { createLogger } from './utils/logger.js'
+import { parseScore, parseScoredMembers } from './utils/scores.js'
 import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
 
 // Thin facade: wires the collaborators together through a small context
@@ -412,6 +413,123 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('srem', key, ...members)
   }
 
+  // Sorted sets. Scores come back as numbers (Redis speaks strings) and
+  // WITHSCORES replies as { member, score } pairs instead of a flat array.
+  async zadd (key, ...args) {
+    const [first] = args
+
+    // The common case reads better as { member: score }; arrays and anything
+    // else are passed straight through, so flags like NX/GT/CH stay available.
+    const isMemberMap = args.length === 1 &&
+      typeof first === 'object' &&
+      first !== null &&
+      !Array.isArray(first)
+
+    const commandArgs = isMemberMap
+      ? Object.entries(first).flatMap(([member, score]) => [score, member])
+      : args
+
+    if (commandArgs.length === 0) {
+      throw new RedisClientError(
+        'zadd requires at least one member to add.',
+        'zadd',
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    return this.executeCommand('zadd', key, ...commandArgs)
+  }
+
+  async zscore (key, member) {
+    return parseScore(await this.executeCommand('zscore', key, member))
+  }
+
+  async zincrby (key, increment, member) {
+    return parseScore(await this.executeCommand('zincrby', key, increment, member))
+  }
+
+  async zcard (key) {
+    return this.executeCommand('zcard', key)
+  }
+
+  async zcount (key, min, max) {
+    return this.executeCommand('zcount', key, min, max)
+  }
+
+  async zrank (key, member) {
+    return this.executeCommand('zrank', key, member)
+  }
+
+  async zrevrank (key, member) {
+    return this.executeCommand('zrevrank', key, member)
+  }
+
+  async zrem (key, ...members) {
+    return this.executeCommand('zrem', key, ...members)
+  }
+
+  async zrange (key, start, stop, options = {}) {
+    const args = [key, start, stop]
+
+    if (options.byScore) args.push('BYSCORE')
+    if (options.byLex) args.push('BYLEX')
+    if (options.rev) args.push('REV')
+    if (options.limit) args.push('LIMIT', options.limit.offset, options.limit.count)
+    if (options.withScores) args.push('WITHSCORES')
+
+    const reply = await this.executeCommand('zrange', ...args)
+
+    return options.withScores ? parseScoredMembers(reply) : reply
+  }
+
+  async zrevrange (key, start, stop, options = {}) {
+    const args = [key, start, stop]
+
+    if (options.withScores) args.push('WITHSCORES')
+
+    const reply = await this.executeCommand('zrevrange', ...args)
+
+    return options.withScores ? parseScoredMembers(reply) : reply
+  }
+
+  async zrangebyscore (key, min, max, options = {}) {
+    const args = [key, min, max]
+
+    if (options.withScores) args.push('WITHSCORES')
+    if (options.limit) args.push('LIMIT', options.limit.offset, options.limit.count)
+
+    const reply = await this.executeCommand('zrangebyscore', ...args)
+
+    return options.withScores ? parseScoredMembers(reply) : reply
+  }
+
+  async zremrangebyrank (key, start, stop) {
+    return this.executeCommand('zremrangebyrank', key, start, stop)
+  }
+
+  async zremrangebyscore (key, min, max) {
+    return this.executeCommand('zremrangebyscore', key, min, max)
+  }
+
+  // Without a count Redis pops a single member; with one it pops up to count.
+  async zpopmin (key, count) {
+    return this.#popScored('zpopmin', key, count)
+  }
+
+  async zpopmax (key, count) {
+    return this.#popScored('zpopmax', key, count)
+  }
+
+  async #popScored (command, key, count) {
+    const reply = count === undefined
+      ? await this.executeCommand(command, key)
+      : await this.executeCommand(command, key, count)
+
+    const entries = parseScoredMembers(reply)
+
+    return count === undefined ? entries[0] ?? null : entries
+  }
+
   async sort (key, options = {}) {
     const args = [key]
 
@@ -546,11 +664,19 @@ class RedisClient extends EventEmitter {
       : this.executeCommand('xreadgroup', ...args)
   }
 
+  // ioredis applies keyPrefix by argument position, and XGROUP/XINFO carry
+  // their key *after* a subcommand — a position it does not recognize. Left
+  // alone, a prefixed client would create consumer groups on unprefixed keys
+  // while XADD/XREADGROUP used the prefixed ones.
+  #prefixed (key) {
+    return `${this.keyPrefix}${key}`
+  }
+
   // Each XGROUP subcommand has its own arity — a blanket trailing id turned
   // documented calls like xgroup('DESTROY', key, group) into protocol errors.
   async xgroup (command, key, groupName, ...rest) {
     const subcommand = String(command).toUpperCase()
-    const args = [subcommand, key, groupName]
+    const args = [subcommand, this.#prefixed(key), groupName]
 
     switch (subcommand) {
       case 'CREATE': {
@@ -586,7 +712,7 @@ class RedisClient extends EventEmitter {
   }
 
   async xinfo (subcommand, key, ...args) {
-    return this.executeCommand('xinfo', subcommand, key, ...args)
+    return this.executeCommand('xinfo', subcommand, this.#prefixed(key), ...args)
   }
 
   async xrange (key, start, end, options = {}) {
@@ -645,6 +771,12 @@ class RedisClient extends EventEmitter {
     }
 
     return this.executeCommand('xpending', ...args)
+  }
+
+  // Settling a consumer-group entry: without it, every delivered entry stays
+  // in the group's pending list forever.
+  async xack (key, group, ...ids) {
+    return this.executeCommand('xack', key, group, ...ids)
   }
 
   async xclaim (key, group, consumer, minIdleTime, ...ids) {

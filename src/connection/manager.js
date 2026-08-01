@@ -24,16 +24,21 @@ class ConnectionManager {
   }
 
   async connect () {
+    // An attempt in flight must be joined, never skipped: #establishConnection
+    // assigns the client synchronously, so a concurrent caller that checked
+    // for the client first would resolve before the connection was ready.
+    if (this.#connectPromise) {
+      return this.#connectPromise
+    }
+
     if (this.#client) {
       this.logger.debug?.('Redis client already exists. Reusing existing connection.')
       return
     }
 
-    if (!this.#connectPromise) {
-      this.#connectPromise = this.#establishConnection().finally(() => {
-        this.#connectPromise = null
-      })
-    }
+    this.#connectPromise = this.#establishConnection().finally(() => {
+      this.#connectPromise = null
+    })
 
     return this.#connectPromise
   }
@@ -84,6 +89,16 @@ class ConnectionManager {
     } catch (err) {
       if (client.status === 'end') {
         this.logger.error(`Failed to connect to Redis: ${err.message}`)
+
+        // The driver is done with this client. Release it here too: if it
+        // never emits 'end', a stale reference would make every later
+        // connect() short-circuit and leave the caller unable to reconnect.
+        this.#isConnected = false
+
+        if (this.#client === client) {
+          this.#client = null
+        }
+
         return
       }
 
@@ -106,13 +121,18 @@ class ConnectionManager {
     // 'end' fires asynchronously after quit() resolves — wait for it so the
     // handler releases the client and emits the facade event, with a timed
     // escape route in case the driver never gets there.
+    // The escape timer is awaited, so it must be able to fire (an unref'd
+    // timer never does once the loop is otherwise idle) — and it is cleared
+    // the moment 'end' arrives, so a clean shutdown never waits on it.
     const ended = client.status === 'end'
       ? Promise.resolve()
       : new Promise((resolve) => {
-        client.once('end', resolve)
-
         const timer = setTimeout(resolve, 2000)
-        timer.unref?.()
+
+        client.once('end', () => {
+          clearTimeout(timer)
+          resolve()
+        })
       })
 
     try {

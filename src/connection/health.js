@@ -4,7 +4,8 @@
 // `interval` so concurrent callers reuse one in-flight PING.
 class HealthChecker {
   #lastCheckTime = 0
-  #checkPromise = null
+  #lastResult = null
+  #inFlight = null
 
   constructor ({ getClient, logger, interval = 5000, timeout = 1000 }) {
     this.getClient = getClient
@@ -14,22 +15,46 @@ class HealthChecker {
   }
 
   async check () {
+    // Concurrent callers always share the probe that is already running.
+    if (this.#inFlight) {
+      return this.#inFlight
+    }
+
     const now = Date.now()
 
-    if (now - this.#lastCheckTime < this.interval && this.#checkPromise) {
-      return this.#checkPromise
+    // Only a healthy result is cached, and only while the connection is still
+    // up. Caching a failure would keep reporting "down" after the connection
+    // recovered; serving a stale "up" is worse — a readiness endpoint would
+    // keep traffic flowing to a connection that already dropped. Checking the
+    // driver's own status is a free local read.
+    if (this.#lastResult === true && now - this.#lastCheckTime < this.interval && this.#readyClient()) {
+      return true
     }
 
     this.#lastCheckTime = now
-    this.#checkPromise = this.#performCheck()
+    this.#inFlight = this.#performCheck()
+      .then((healthy) => {
+        this.#lastResult = healthy
 
-    return this.#checkPromise
+        return healthy
+      })
+      .finally(() => {
+        this.#inFlight = null
+      })
+
+    return this.#inFlight
+  }
+
+  #readyClient () {
+    const client = this.getClient()
+
+    return client && client.status === 'ready' ? client : null
   }
 
   async #performCheck () {
-    const client = this.getClient()
+    const client = this.#readyClient()
 
-    if (!client || client.status !== 'ready') {
+    if (!client) {
       return false
     }
 
@@ -57,11 +82,13 @@ class HealthChecker {
 
   #timeoutOperation (operation, ms) {
     return new Promise((resolve, reject) => {
+      // Deliberately not unref'd: the caller awaits this promise, and an
+      // unref'd timer never fires once the event loop has nothing else
+      // scheduled — the probe would hang instead of timing out. It is
+      // cleared as soon as the reply lands, so it holds nothing open.
       const timeoutId = setTimeout(() => {
         reject(new Error('Operation timed out'))
       }, ms)
-
-      timeoutId.unref?.()
 
       operation((err, result) => {
         clearTimeout(timeoutId)

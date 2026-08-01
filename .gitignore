@@ -1,6 +1,9 @@
 node_modules/
 dist/
 index.d.cts
+reports/
+.stryker-tmp/
+stryker-output-*.json
 .vscode/
 .DS_Store
 .env

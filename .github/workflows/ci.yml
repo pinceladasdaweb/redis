@@ -40,7 +40,7 @@ jobs:
         run: npm install
 
       - name: Lint
-        run: npx standard src/ tests/
+        run: npx standard src/ tests/ examples/
 
       - name: Type declarations check
         run: npm run check:types
@@ -50,6 +50,11 @@ jobs:
 
       - name: Integration tests (real Redis, includes reconnection)
         run: npm run test:integration
+
+      # Examples are documentation that must keep working: each one asserts
+      # its own outcome, so a broken promise fails the build.
+      - name: Examples (real Redis)
+        run: npm run examples
 
       - name: Build
         run: npm run build

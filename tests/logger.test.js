@@ -54,6 +54,34 @@ describe('logger', () => {
     assert.equal(logMock.mock.callCount(), 1)
   })
 
+  test('takes its default level from LOG_LEVEL', (t) => {
+    const logMock = t.mock.method(console, 'log', () => {})
+    const previous = process.env.LOG_LEVEL
+
+    process.env.LOG_LEVEL = 'debug'
+
+    try {
+      createLogger().debug('visible because LOG_LEVEL says so')
+      assert.equal(logMock.mock.callCount(), 1)
+    } finally {
+      if (previous === undefined) delete process.env.LOG_LEVEL
+      else process.env.LOG_LEVEL = previous
+    }
+  })
+
+  test('labels each line with its own level', (t) => {
+    const errorMock = t.mock.method(console, 'error', () => {})
+    const warnMock = t.mock.method(console, 'warn', () => {})
+
+    const logger = createLogger('debug')
+
+    logger.error('bad')
+    logger.warn('careful')
+
+    assert.match(errorMock.mock.calls[0].arguments[0], /\[error\] bad$/)
+    assert.match(warnMock.mock.calls[0].arguments[0], /\[warn\] careful$/)
+  })
+
   test('falls back to info for unknown levels', (t) => {
     const logMock = t.mock.method(console, 'log', () => {})
 

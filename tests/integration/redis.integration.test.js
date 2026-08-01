@@ -154,6 +154,73 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  test('sorted sets keep scores numeric through a real round-trip', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'zset:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.zadd('board', { ada: 120, alan: 95, grace: 180 })
+    assert.equal(await client.zcard('board'), 3)
+
+    assert.equal(await client.zincrby('board', 45, 'ada'), 165, 'increments return a number')
+    assert.equal(await client.zscore('board', 'alan'), 95)
+    assert.equal(await client.zscore('board', 'nobody'), null)
+    assert.equal(await client.zrevrank('board', 'grace'), 0)
+
+    assert.deepEqual(await client.zrevrange('board', 0, 1, { withScores: true }), [
+      { member: 'grace', score: 180 },
+      { member: 'ada', score: 165 }
+    ])
+
+    assert.deepEqual(await client.zrangebyscore('board', 100, '+inf'), ['ada', 'grace'])
+    assert.equal(await client.zcount('board', 90, 130), 1)
+
+    // The infinity round-trip: Number('inf') would be NaN.
+    await client.zadd('board', { pinned: '+inf' })
+    assert.equal(await client.zscore('board', 'pinned'), Number.POSITIVE_INFINITY)
+    assert.equal(await client.zrem('board', 'pinned'), 1)
+
+    assert.deepEqual(await client.zpopmin('board'), { member: 'alan', score: 95 })
+    assert.deepEqual(await client.zpopmax('board', 2), [
+      { member: 'grace', score: 180 },
+      { member: 'ada', score: 165 }
+    ])
+    assert.equal(await client.zpopmin('board'), null, 'an empty set pops null')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  // Regression: ioredis does not prefix the key of XGROUP/XINFO, so a
+  // prefixed client used to create the consumer group on a different key than
+  // the one XADD wrote to — every consumer-group flow was broken under a
+  // keyPrefix.
+  test('consumer groups work under a keyPrefix end to end', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'grp:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.xadd('events', '*', 'type', 'signup')
+    await client.xgroup('CREATE', 'events', 'workers', '0', true)
+
+    // The group must live on the same (prefixed) key the entries went to.
+    assert.equal(await admin.exists('grp:events'), 1)
+    assert.equal(await admin.exists('events'), 0, 'nothing may be created outside the prefix')
+
+    const groups = await client.xinfo('GROUPS', 'events')
+    assert.equal(groups.length, 1, 'xinfo must look at the prefixed key')
+
+    const delivered = await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['events', '>'])
+    assert.equal(delivered[0][1].length, 1, 'the group must see the entries')
+
+    assert.equal(await client.xack('events', 'workers', delivered[0][1][0][0]), 1)
+    assert.equal((await client.xpending('events', 'workers'))[0], 0)
+
+    await client.xgroup('DESTROY', 'events', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
   // Regression (AUDIT B7): a blocking read on the shared connection stalled
   // every other command until the block resolved.
   test('blocking xread does not stall concurrent commands', { timeout: 15000 }, async () => {
