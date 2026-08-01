@@ -82,11 +82,13 @@ class HealthChecker {
 
   #timeoutOperation (operation, ms) {
     return new Promise((resolve, reject) => {
+      // Deliberately not unref'd: the caller awaits this promise, and an
+      // unref'd timer never fires once the event loop has nothing else
+      // scheduled — the probe would hang instead of timing out. It is
+      // cleared as soon as the reply lands, so it holds nothing open.
       const timeoutId = setTimeout(() => {
         reject(new Error('Operation timed out'))
       }, ms)
-
-      timeoutId.unref?.()
 
       operation((err, result) => {
         clearTimeout(timeoutId)

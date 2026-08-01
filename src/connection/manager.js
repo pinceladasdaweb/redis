@@ -121,13 +121,18 @@ class ConnectionManager {
     // 'end' fires asynchronously after quit() resolves — wait for it so the
     // handler releases the client and emits the facade event, with a timed
     // escape route in case the driver never gets there.
+    // The escape timer is awaited, so it must be able to fire (an unref'd
+    // timer never does once the loop is otherwise idle) — and it is cleared
+    // the moment 'end' arrives, so a clean shutdown never waits on it.
     const ended = client.status === 'end'
       ? Promise.resolve()
       : new Promise((resolve) => {
-        client.once('end', resolve)
-
         const timer = setTimeout(resolve, 2000)
-        timer.unref?.()
+
+        client.once('end', () => {
+          clearTimeout(timer)
+          resolve()
+        })
       })
 
     try {
