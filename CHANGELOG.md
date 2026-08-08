@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2.1.0 (2026-08-08)
+
+* fix: cancel blocking reads on disconnect instead of hanging shutdown by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/09254065481ee3958e1558e80f6fa3021d01a71b)
+* feat: xautoclaim, keyspace events and proof for the failover paths by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/6dd1a66d7ff3390a9b122d74d51170dbb27b92c0)
+* feat: redis cluster support with MOVED/ASK redirection by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/35d2f98fbbb57a99c441575bcf52767ecc211812)
+* test: prove recovery twice over, and while the server keeps flapping by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/5ce812949ffe1855f4da6b5a8300116660838547)
+
+
 ## 2.0.0 (2026-08-08)
 
 * fix: stop dropping driver options, starting with tls by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/99e38b0aeea610b660246126c464a2b8288bac01)
