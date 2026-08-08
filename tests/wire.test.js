@@ -267,6 +267,29 @@ describe('wire contract', () => {
     assert.deepEqual(calls[4], ['zrangebyscore', 'z', '-inf', '+inf', 'WITHSCORES', 'LIMIT', 5, 10])
   })
 
+  // Without WITHSCORES the reply is a bare member list and must be handed back
+  // untouched — pairing it up would invent scores that were never asked for.
+  test('ranges without WITHSCORES return the members as they came', async () => {
+    const { redis, calls, fake } = createClient()
+
+    fake.zrevrange = async (...args) => { calls.push(['zrevrange', ...args]); return ['grace', 'ada'] }
+    fake.zrangebyscore = async (...args) => { calls.push(['zrangebyscore', ...args]); return ['ada', 'grace'] }
+
+    assert.deepEqual(await redis.zrevrange('z', 0, 9), ['grace', 'ada'])
+    assert.deepEqual(await redis.zrangebyscore('z', 0, 100), ['ada', 'grace'])
+
+    assert.deepEqual(calls[0], ['zrevrange', 'z', 0, 9])
+    assert.deepEqual(calls[1], ['zrangebyscore', 'z', 0, 100])
+  })
+
+  test('zrange speaks BYLEX for lexicographic ranges', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.zrange('z', '[a', '[z', { byLex: true, limit: { offset: 0, count: 5 } })
+
+    assert.deepEqual(calls[0], ['zrange', 'z', '[a', '[z', 'BYLEX', 'LIMIT', 0, 5])
+  })
+
   test('scores are returned as numbers, and WITHSCORES as member/score pairs', async () => {
     const { redis, fake } = createClient()
 
@@ -443,6 +466,24 @@ describe('wire contract', () => {
     )
   })
 
+  // A pooled connection can die between two reads — the server restarted, the
+  // socket dropped. Handing it to the next read would fail a command that had
+  // nothing wrong with it.
+  test('a pooled connection that died is discarded, not handed out again', async () => {
+    const { redis, fake, calls } = createClient()
+
+    await redis.xread({ block: 0 }, ['s', '$'])
+
+    // Whatever was pooled is no longer usable.
+    fake.status = 'end'
+    calls.length = 0
+
+    await redis.xread({ block: 0 }, ['s', '$'])
+
+    assert.deepEqual(calls[0], ['<disconnect>'], 'the dead connection is dropped before anything else')
+    assert.deepEqual(calls[1], ['xread', 'BLOCK', 0, 'STREAMS', 's', '$'], 'and the read still runs')
+  })
+
   // Regression: a blocking read parked on a dedicated connection used to
   // survive disconnect() — its promise never settled and its socket kept the
   // process alive, so graceful shutdown never finished.
@@ -549,6 +590,38 @@ describe('wire contract', () => {
 
     await redis.xautoclaim('st', 'g', 'worker-2', 60000, '0-0', { justId: true })
     assert.deepEqual(calls[2].at(-1), 'JUSTID')
+  })
+
+  // Redis 6.2 answers XAUTOCLAIM with two elements; the deleted-ids list only
+  // arrived in 7.0. The named fields must not turn into undefined there.
+  test('xautoclaim tolerates the two-element reply of Redis 6.2', async () => {
+    const { redis, fake } = createClient()
+
+    fake.xautoclaim = async () => ['0-0', [['1-1', ['f', 'v']]]]
+
+    assert.deepEqual(await redis.xautoclaim('st', 'g', 'worker-2', 60000), {
+      cursor: '0-0',
+      entries: [['1-1', ['f', 'v']]],
+      deleted: []
+    })
+
+    fake.xautoclaim = async () => ['0-0']
+
+    assert.deepEqual(await redis.xautoclaim('st', 'g', 'worker-2', 60000), {
+      cursor: '0-0',
+      entries: [],
+      deleted: []
+    })
+  })
+
+  // Mid-failover a cluster can report no masters at all while it refreshes
+  // its slot map. Reading the flags off nothing must not crash the probe.
+  test('keyspaceNotifications survives a cluster with no masters yet', async () => {
+    const { redis, fake } = createClient()
+
+    fake.nodes = () => []
+
+    assert.equal(await redis.keyspaceNotifications(), '')
   })
 
   test('keyspace event subscriptions probe the server config first', async () => {

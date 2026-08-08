@@ -58,9 +58,17 @@ const createClient = ({ batches, pipelineResults, unlinkResults, fail }) => {
           if (fail === 'pipeline' && commands[0]?.[0] === 'get') throw new Error('pipeline exploded')
           if (fail === 'unlink' && commands[0]?.[0] === 'unlink') throw new Error('unlink exploded')
 
-          return commands[0]?.[0] === 'unlink'
-            ? commands.map(() => [null, unlinkResults.shift() ?? 1])
-            : pipelineResults.shift()
+          if (commands[0]?.[0] !== 'unlink') {
+            return pipelineResults.shift()
+          }
+
+          // A pipeline reports per-command failures inside the reply, not by
+          // rejecting: an Error here stands for one key that refused to go.
+          return commands.map(() => {
+            const reply = unlinkResults.shift() ?? 1
+
+            return reply instanceof Error ? [reply, null] : [null, reply]
+          })
         }
       }
     }
@@ -187,6 +195,22 @@ describe('keyspace scanner', () => {
 
     assert.equal(await deletePattern({ client, logger: quietLogger, pattern: '*' }), 0)
     assert.deepEqual(state.unlinked, [], 'an empty batch must not issue UNLINK')
+  })
+
+  // A pipeline resolves even when one of its commands failed, reporting the
+  // failure inside the reply. Reading past that would report a deletion that
+  // only partly happened as a clean success.
+  test('deletePattern surfaces a key that refused to be removed', async () => {
+    const { client } = createClient({
+      batches: [['app:a', 'app:b']],
+      pipelineResults: [],
+      unlinkResults: [1, new Error('WRONGTYPE Operation against a key holding the wrong kind of value')]
+    })
+
+    await assert.rejects(
+      deletePattern({ client, keyPrefix: 'app:', logger: quietLogger, pattern: '*' }),
+      /WRONGTYPE/
+    )
   })
 
   test('deletePattern rejects when the scan stream itself errors', async () => {

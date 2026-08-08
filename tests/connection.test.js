@@ -387,6 +387,70 @@ describe('facade wiring', () => {
     return { redis, driver }
   }
 
+  // The subscriber runs on its own connection, so its traffic has to be
+  // bridged onto the facade explicitly. Without this, redis.on('message')
+  // stays silent while the handler passed to subscribe() still fires — half
+  // the documented API working is worse than none of it.
+  test('subscriber traffic reaches the facade events too', async () => {
+    const { redis, driver } = createFacade()
+    const subscriber = new EventEmitter()
+
+    subscriber.status = 'ready'
+    subscriber.subscribe = async () => 1
+    subscriber.psubscribe = async () => 1
+    driver.duplicate = () => subscriber
+
+    await redis.connect()
+
+    const seen = []
+    redis.on('message', (...args) => seen.push(['message', ...args]))
+    redis.on('pmessage', (...args) => seen.push(['pmessage', ...args]))
+    redis.on('connectionError', (err) => seen.push(['connectionError', err.message]))
+
+    await redis.subscribe('news')
+    await redis.psubscribe('logs.*')
+
+    subscriber.emit('message', 'news', 'hello')
+    subscriber.emit('pmessage', 'logs.*', 'logs.app', 'entry')
+    subscriber.emit('error', new Error('subscriber socket reset'))
+
+    assert.deepEqual(seen, [
+      ['message', 'news', 'hello'],
+      ['pmessage', 'logs.*', 'logs.app', 'entry'],
+      ['connectionError', 'subscriber socket reset']
+    ])
+  })
+
+  // The library logs through whatever the application injects; the built-in
+  // console logger only exists so the out-of-the-box experience still has
+  // visible logs. Omitting the option must land on it, not on undefined.
+  test('without a logger the client falls back to the built-in one', () => {
+    const redis = new RedisClient({ host: 'h', port: 6379 })
+
+    for (const level of ['error', 'warn', 'info', 'debug']) {
+      assert.equal(typeof redis.logger[level], 'function', `the fallback logger must expose ${level}()`)
+    }
+  })
+
+  // Drivers do not always emit an Error: a bare string or a plain object must
+  // still produce a readable line instead of "undefined".
+  test('a non-Error failure is still logged and re-emitted', async () => {
+    const logged = []
+    const { redis, driver } = createFacade({
+      logger: { ...quietLogger, error: (message) => logged.push(message) }
+    })
+
+    await redis.connect()
+
+    const seen = []
+    redis.on('connectionError', (err) => seen.push(err))
+
+    driver.emit('error', 'ECONNRESET without an Error wrapper')
+
+    assert.deepEqual(seen, ['ECONNRESET without an Error wrapper'])
+    assert.match(logged.at(-1), /ECONNRESET without an Error wrapper/)
+  })
+
   test('driver events are re-emitted by the client itself', async () => {
     const { redis, driver } = createFacade()
     const seen = []

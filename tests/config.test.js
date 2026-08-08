@@ -213,4 +213,106 @@ describe('redis config', () => {
 
     assert.equal(config.retryStrategy(1), null)
   })
+
+  // The cluster option split is the whole reason this class knows about
+  // clusters: ioredis reads cluster-level options off the top and node-level
+  // ones out of redisOptions, and an option filed under the wrong one is
+  // silently ignored — the exact failure this library removed for standalone.
+  test('cluster options are split between the cluster and its nodes', () => {
+    const config = new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }, { host: 'n2', port: 7002 }],
+      keyPrefix: 'app:',
+      password: 'secret',
+      maxRedirections: 32,
+      scaleReads: 'slave',
+      connectTimeout: 250,
+      maxRetryAttempts: Infinity,
+      baseRetryDelay: 10,
+      maxRetryDelay: 100
+    })
+    const options = config.getOptions()
+
+    assert.equal(config.isCluster, true)
+    assert.deepEqual(config.nodes, [{ host: 'n1', port: 7001 }, { host: 'n2', port: 7002 }])
+
+    // Cluster-level: read by the Cluster itself.
+    assert.equal(options.maxRedirections, 32)
+    assert.equal(options.scaleReads, 'slave')
+    assert.equal(options.lazyConnect, true)
+    assert.equal(typeof options.clusterRetryStrategy, 'function')
+
+    // Node-level: read by each connection the cluster opens.
+    assert.equal(options.redisOptions.password, 'secret')
+    assert.equal(options.redisOptions.keyPrefix, 'app:')
+    assert.equal(options.redisOptions.connectTimeout, 250)
+    assert.equal(options.redisOptions.maxRetriesPerRequest, null)
+    assert.equal(typeof options.redisOptions.retryStrategy, 'function')
+
+    // And neither level may carry the other's options, or the one that
+    // landed in the wrong place is dropped without a word.
+    assert.equal('nodes' in options, false, 'startup nodes are a constructor argument, not an option')
+    assert.equal('maxRedirections' in options.redisOptions, false)
+    assert.equal('password' in options, false)
+
+    // The backoff a cluster uses is the one this library documents.
+    assert.equal(options.clusterRetryStrategy(1), 20, 'exponential backoff, same as a single node')
+  })
+
+  test('the cluster keeps database 0 and rejects anything else', () => {
+    assert.throws(() => new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      db: 3
+    }), { code: 'INVALID_OPTION', message: /only supports database 0 \(got 3\)/ })
+
+    // Zero is the one valid value, and must not be read as "not provided".
+    assert.doesNotThrow(() => new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      db: 0
+    }))
+  })
+
+  test('startup nodes must be a non-empty array', () => {
+    for (const nodes of [[], 'n1:7001', {}, null]) {
+      assert.throws(() => new RedisConfig({ logger: quietLogger, nodes }), {
+        code: 'INVALID_OPTION',
+        message: /non-empty array of startup nodes/
+      }, `nodes: ${JSON.stringify(nodes)} must be refused`)
+    }
+  })
+
+  test('cluster and sentinel are different topologies and cannot be combined', () => {
+    assert.throws(() => new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      sentinels: [{ host: 's1', port: 26379 }],
+      name: 'mymaster'
+    }), { code: 'INVALID_OPTION', message: /different topologies/ })
+  })
+
+  // Construction only: lazyConnect means no socket is opened here, so this
+  // asserts which driver class is built without needing a live cluster.
+  test('createRedisClient builds a Cluster for nodes and a Redis otherwise', async () => {
+    const { default: Redis } = await import('ioredis')
+    const announced = []
+    const logger = { ...quietLogger, info: (message) => announced.push(message) }
+
+    const cluster = new RedisConfig({
+      logger,
+      nodes: [{ host: '127.0.0.1', port: 7001 }, { host: '127.0.0.1', port: 7002 }]
+    }).createRedisClient()
+
+    assert.ok(cluster instanceof Redis.Cluster, 'nodes must produce a cluster client')
+    assert.match(announced.at(-1), /cluster client with 2 startup node\(s\)/)
+    cluster.disconnect()
+
+    const standalone = new RedisConfig({ logger, host: '127.0.0.1', port: 6379 }).createRedisClient()
+
+    assert.ok(standalone instanceof Redis, 'no nodes must produce a plain client')
+    assert.equal(standalone instanceof Redis.Cluster, false)
+    assert.match(announced.at(-1), /client with host: 127\.0\.0\.1/)
+    standalone.disconnect()
+  })
 })

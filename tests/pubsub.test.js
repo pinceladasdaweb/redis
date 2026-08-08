@@ -490,6 +490,22 @@ describe('cluster keyspace-event fan-out', () => {
     assert.equal(cluster.listenerCount('+node'), 0, 'and detached on shutdown')
   })
 
+  test('a cluster still refreshing its slot map reports no subscriptions yet', async () => {
+    const { manager } = createClusterManager([])
+
+    assert.equal(await manager.subscribeEverywhere(KEY_EVENT, () => {}), 0)
+  })
+
+  test('a non-Error from a node subscriber is still readable', async () => {
+    const { manager, masters, logs, events } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    masters[0].subscriber.emit('error', 'socket reset with no Error wrapper')
+
+    assert.match(logs.at(-1)[1], /socket reset with no Error wrapper/)
+    assert.deepEqual(events.at(-1), ['connectionError', 'socket reset with no Error wrapper'])
+  })
+
   test('close releases every per-node subscriber', async () => {
     const { manager, masters } = createClusterManager()
 
