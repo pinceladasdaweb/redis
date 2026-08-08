@@ -1,6 +1,12 @@
 name: Publish package
+# Gated on CI, never on the push itself: an npm version is immutable, so it
+# must not go out while the integration, cluster, examples and package-artifact
+# jobs are still running (or already red). This fires only after the whole CI
+# matrix for main has finished, and only if it went green.
 on:
-  push:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
     branches:
       - main
 permissions:
@@ -17,10 +23,14 @@ jobs:
   publish-npm:
     name: Publish package on npm
     runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # workflow_run checks out the default branch by default; be explicit,
+          # since this job commits the version bump back to it.
+          ref: main
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -38,10 +48,13 @@ jobs:
       - name: Install dependencies
         run: |
           npm install
+      # CI already proved this commit across the whole matrix; this is the
+      # cheap last look at exactly the tree about to be packed.
       - name: Lint and unit tests
         run: |
           npx standard src/ tests/
           npm test
+          npm run check:types
       - name: Bump version based on commit message
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%B)

@@ -263,6 +263,83 @@ describe('connection manager', () => {
     assert.equal(manager.client, null, 'the client is released regardless')
   })
 
+  // Regression: ioredis only answers QUIT while its offline queue is empty.
+  // With anything queued it parks the QUIT behind it and replies once the
+  // connection is back — which, under the default infinite retries, is never.
+  // The escape timer above used to sit BEHIND this await, so it could not fire
+  // and disconnect() hung for the lifetime of the process.
+  test('disconnect gives up on a quit that never answers', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+
+    created[0].quit = () => {
+      created[0].calls.push('quit')
+
+      return new Promise(() => {})
+    }
+
+    let done = false
+    const shutdown = manager.disconnect().then(() => { done = true })
+
+    await clock.advance(1999)
+    assert.equal(done, false, 'one millisecond before the deadline it is still waiting')
+
+    await clock.advance(1)
+    await shutdown
+
+    assert.equal(done, true, 'and on the deadline it finishes instead of hanging forever')
+    assert.deepEqual(created[0].calls, ['connect', 'quit', 'disconnect'], 'the socket is forced closed')
+    assert.equal(manager.client, null, 'and the client is released')
+  })
+
+  // Regression: disconnect() left the in-flight connect promise in place, so
+  // the next connect() joined an attempt whose client had already been closed
+  // — it resolved with nothing behind it and every command failed until a
+  // third connect() happened to build a real one.
+  test('connect after a disconnect mid-attempt starts a fresh cycle', async () => {
+    const created = []
+    const clock = createManualClock()
+    let releaseFirstConnect
+
+    const manager = new ConnectionManager({
+      redisConfig: {
+        createRedisClient: () => {
+          const client = createDriverClient()
+
+          if (created.length === 0) {
+            // The first attempt is still negotiating when shutdown arrives.
+            client.connect = () => {
+              client.calls.push('connect')
+
+              return new Promise((resolve) => { releaseFirstConnect = resolve })
+            }
+          }
+
+          created.push(client)
+
+          return client
+        }
+      },
+      logger: quietLogger,
+      clock,
+      emit: () => {}
+    })
+
+    const first = manager.connect()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await manager.disconnect()
+
+    const second = manager.connect()
+    releaseFirstConnect()
+    await Promise.all([first, second])
+
+    assert.equal(created.length, 2, 'the second connect must build its own client')
+    assert.equal(manager.client, created[1], 'and leave that client in place')
+    assert.equal(manager.isConnected, true)
+  })
+
   test('reconnecting is reported even when the driver omits the delay', async () => {
     const { manager, created, events } = createManager()
 
@@ -309,6 +386,70 @@ describe('facade wiring', () => {
 
     return { redis, driver }
   }
+
+  // The subscriber runs on its own connection, so its traffic has to be
+  // bridged onto the facade explicitly. Without this, redis.on('message')
+  // stays silent while the handler passed to subscribe() still fires — half
+  // the documented API working is worse than none of it.
+  test('subscriber traffic reaches the facade events too', async () => {
+    const { redis, driver } = createFacade()
+    const subscriber = new EventEmitter()
+
+    subscriber.status = 'ready'
+    subscriber.subscribe = async () => 1
+    subscriber.psubscribe = async () => 1
+    driver.duplicate = () => subscriber
+
+    await redis.connect()
+
+    const seen = []
+    redis.on('message', (...args) => seen.push(['message', ...args]))
+    redis.on('pmessage', (...args) => seen.push(['pmessage', ...args]))
+    redis.on('connectionError', (err) => seen.push(['connectionError', err.message]))
+
+    await redis.subscribe('news')
+    await redis.psubscribe('logs.*')
+
+    subscriber.emit('message', 'news', 'hello')
+    subscriber.emit('pmessage', 'logs.*', 'logs.app', 'entry')
+    subscriber.emit('error', new Error('subscriber socket reset'))
+
+    assert.deepEqual(seen, [
+      ['message', 'news', 'hello'],
+      ['pmessage', 'logs.*', 'logs.app', 'entry'],
+      ['connectionError', 'subscriber socket reset']
+    ])
+  })
+
+  // The library logs through whatever the application injects; the built-in
+  // console logger only exists so the out-of-the-box experience still has
+  // visible logs. Omitting the option must land on it, not on undefined.
+  test('without a logger the client falls back to the built-in one', () => {
+    const redis = new RedisClient({ host: 'h', port: 6379 })
+
+    for (const level of ['error', 'warn', 'info', 'debug']) {
+      assert.equal(typeof redis.logger[level], 'function', `the fallback logger must expose ${level}()`)
+    }
+  })
+
+  // Drivers do not always emit an Error: a bare string or a plain object must
+  // still produce a readable line instead of "undefined".
+  test('a non-Error failure is still logged and re-emitted', async () => {
+    const logged = []
+    const { redis, driver } = createFacade({
+      logger: { ...quietLogger, error: (message) => logged.push(message) }
+    })
+
+    await redis.connect()
+
+    const seen = []
+    redis.on('connectionError', (err) => seen.push(err))
+
+    driver.emit('error', 'ECONNRESET without an Error wrapper')
+
+    assert.deepEqual(seen, ['ECONNRESET without an Error wrapper'])
+    assert.match(logged.at(-1), /ECONNRESET without an Error wrapper/)
+  })
 
   test('driver events are re-emitted by the client itself', async () => {
     const { redis, driver } = createFacade()

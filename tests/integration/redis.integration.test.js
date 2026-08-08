@@ -414,6 +414,59 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // A consumer loop calls a blocking read on every iteration. Opening a fresh
+  // connection each time is a full handshake per iteration, so they are pooled
+  // — but only if the driver really leaves the socket 'ready' when the block
+  // ends. Against a fake it always does; this is the real one saying so.
+  test('consecutive blocking reads reuse one connection', { timeout: 20000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      connectionName: 'it-blockpool',
+      logger: quietLogger
+    })
+    await client.connect()
+
+    for (let round = 0; round < 3; round++) {
+      assert.equal(await client.xread({ block: 50 }, ['it:blockpool:stream', '$']), null)
+    }
+
+    const ids = await listClientIdsNamed('it-blockpool')
+
+    assert.equal(ids.length, 2, `three blocking reads must leave one shared + one pooled connection, got ${ids.length}`)
+
+    await client.disconnect()
+
+    await waitFor(async () => (await listClientIdsNamed('it-blockpool')).length === 0, {
+      message: 'shutdown to release the pooled connection too'
+    })
+  })
+
+  // Regression: a quit() parked behind the driver's offline queue never
+  // answers, and disconnect() used to await it with no deadline — shutdown
+  // hung for the lifetime of the process.
+  test('disconnect finishes even with a command stuck in the offline queue', { timeout: 20000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: 6399, // nothing listens here: the driver retries forever
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      logger: quietLogger
+    })
+
+    await client.connect()
+
+    // The escape hatch the README advertises, used during an outage.
+    client.client?.get('it:queued').catch(() => {})
+
+    const started = Date.now()
+    await client.disconnect()
+    const elapsed = Date.now() - started
+
+    assert.ok(elapsed < 5000, `disconnect took ${elapsed}ms — the deadline did not hold`)
+    assert.equal(client.client, null, 'and the client is released')
+  })
+
   // The facade is an EventEmitter: connection lifecycle is observable.
   test('emits connection lifecycle events across a server-side kill', { timeout: 30000 }, async () => {
     const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
@@ -1181,6 +1234,59 @@ describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER
       message: 'the subscription to register across the cluster'
     })
     await waitFor(() => received.includes('hello'), { message: 'the message to arrive' })
+
+    await client.disconnect()
+  })
+
+  // Unlike publish, keyspace notifications are NOT carried by the cluster bus:
+  // each node emits them for its own slots and never forwards them, while a
+  // cluster subscriber attaches to a single node. Subscribing the plain way
+  // delivers one shard's events and looks exactly like one that works — so
+  // this asserts events arriving from more than one master.
+  test('keyspace events arrive from every master, not just one', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    for (const node of client.client.nodes('master')) {
+      await node.config('SET', 'notify-keyspace-events', 'Ex')
+    }
+
+    const expired = []
+    await client.subscribeToKeyEvents('expired', (key) => expired.push(key))
+
+    const keys = Array.from({ length: 24 }, (_, index) => `ttl:${index}`)
+
+    for (const key of keys) {
+      await client.set(key, 'x')
+    }
+
+    // The premise of the test, asserted rather than assumed: these keys really
+    // do live on more than one master, so a subscription pinned to a single
+    // node could not possibly report all of them.
+    const perMaster = await Promise.all(
+      client.client.nodes('master').map((node) => node.dbsize())
+    )
+
+    assert.ok(
+      perMaster.filter((size) => size > 0).length >= 2,
+      `the keys must span at least two masters, got ${JSON.stringify(perMaster)}`
+    )
+
+    for (const key of keys) {
+      await client.executeCommand('pexpire', key, 50)
+    }
+
+    await waitFor(() => new Set(expired).size >= keys.length, {
+      timeout: 20000,
+      message: `every shard's expirations to arrive (got ${new Set(expired).size}/${keys.length})`
+    })
+
+    assert.deepEqual(
+      [...new Set(expired)].sort(),
+      keys.map((key) => `ct:${key}`).sort(),
+      'no shard may go silent'
+    )
 
     await client.disconnect()
   })

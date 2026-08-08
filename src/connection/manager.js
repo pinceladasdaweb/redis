@@ -1,4 +1,9 @@
+import withDeadline from '../utils/deadline.js'
 import RedisClientError from '../utils/errors.js'
+
+// How long a shutdown may wait on the driver, per step. Nothing here may block
+// forever: a graceful shutdown that never finishes is worse than an abrupt one.
+const SHUTDOWN_DEADLINE_MS = 2000
 
 // Owns the client lifecycle. Reconnection itself belongs entirely to the
 // ioredis driver (retryStrategy / reconnectOnError in RedisConfig): a single
@@ -37,11 +42,18 @@ class ConnectionManager {
       return
     }
 
-    this.#connectPromise = this.#establishConnection().finally(() => {
-      this.#connectPromise = null
+    // Only the attempt that is still current may clear the slot: disconnect()
+    // drops it on purpose, and a settling older attempt must not wipe the
+    // brand-new one that replaced it.
+    const attempt = this.#establishConnection().finally(() => {
+      if (this.#connectPromise === attempt) {
+        this.#connectPromise = null
+      }
     })
 
-    return this.#connectPromise
+    this.#connectPromise = attempt
+
+    return attempt
   }
 
   async #establishConnection () {
@@ -115,6 +127,11 @@ class ConnectionManager {
   async disconnect () {
     const client = this.#client
 
+    // An attempt still in flight is abandoned here: its client is the one
+    // being closed, so a later connect() must start a fresh cycle instead of
+    // joining a promise that will resolve with nothing behind it.
+    this.#connectPromise = null
+
     if (!client) {
       return
     }
@@ -128,7 +145,7 @@ class ConnectionManager {
     const ended = client.status === 'end'
       ? Promise.resolve()
       : new Promise((resolve) => {
-        const timer = this.clock.setTimeout(resolve, 2000)
+        const timer = this.clock.setTimeout(resolve, SHUTDOWN_DEADLINE_MS)
 
         client.once('end', () => {
           this.clock.clearTimeout(timer)
@@ -138,7 +155,16 @@ class ConnectionManager {
 
     try {
       if (client.status !== 'end') {
-        await client.quit()
+        // quit() only answers immediately while the offline queue is empty:
+        // with anything queued the driver parks the QUIT behind it and only
+        // replies once it reconnects — which, with the default infinite
+        // retries, may be never. Without a deadline here the escape route
+        // above is unreachable and shutdown hangs forever.
+        await withDeadline(client.quit(), {
+          clock: this.clock,
+          ms: SHUTDOWN_DEADLINE_MS,
+          operation: 'quit'
+        })
       }
 
       this.logger.info('Redis client disconnected successfully')

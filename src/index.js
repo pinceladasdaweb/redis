@@ -29,12 +29,20 @@ const KEY_EVENT_CLASSES = {
   new: 'n'
 }
 
+// How many idle connections the blocking-read pool keeps around. A consumer
+// loop reuses one connection instead of paying a full handshake per iteration
+// (a whole cluster pool per iteration, in cluster mode); the cap stops a
+// concurrency spike from leaving sockets parked forever.
+const MAX_IDLE_BLOCKING_CONNECTIONS = 4
+
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
 // always reached through getters — never captured references.
 class RedisClient extends EventEmitter {
   // Dedicated connections currently in use, so shutdown can reclaim them.
   #dedicated = new Set()
+  // Connections a blocking read finished with, ready for the next one.
+  #idleBlocking = []
 
   constructor (options = {}) {
     super()
@@ -80,6 +88,7 @@ class RedisClient extends EventEmitter {
     this.subscriptions = new SubscriptionManager({
       connection: this.connection,
       logger: this.logger,
+      clock: this.clock,
       emit: (event, ...args) => this.emit(event, ...args)
     })
 
@@ -111,11 +120,16 @@ class RedisClient extends EventEmitter {
 
   // A blocking read parked on a dedicated connection would otherwise outlive
   // the client: its promise never settles and its socket keeps the process
-  // alive, so a graceful shutdown never finishes.
+  // alive, so a graceful shutdown never finishes. Idle pooled connections go
+  // too — nothing may hold the loop open past disconnect().
   #releaseDedicatedConnections () {
     for (const held of this.#dedicated) {
       held.cancelled = true
       held.client.disconnect()
+    }
+
+    for (const client of this.#idleBlocking.splice(0)) {
+      client.disconnect()
     }
   }
 
@@ -131,15 +145,11 @@ class RedisClient extends EventEmitter {
     return this.#withDedicatedConnection('withDedicatedConnection', fn)
   }
 
-  async #withDedicatedConnection (operation, fn) {
+  async #withDedicatedConnection (operation, fn, { reuse = false } = {}) {
     const client = this.connection.assertReady(operation)
-    const held = { client: client.duplicate(), cancelled: false }
+    const held = { client: this.#lease(client, reuse), cancelled: false, reuse }
 
     this.#dedicated.add(held)
-
-    held.client.on('error', (err) => {
-      this.logger.debug?.(`Dedicated connection error: ${err.message}`)
-    })
 
     try {
       return await fn(held.client)
@@ -158,16 +168,62 @@ class RedisClient extends EventEmitter {
       throw err
     } finally {
       this.#dedicated.delete(held)
-      held.client.disconnect()
+      this.#return(held)
     }
   }
 
-  // Blocking commands (XREAD/XREADGROUP with BLOCK) run on a short-lived
-  // dedicated connection: on the shared one they would stall every other
-  // command of the application until the block resolves.
+  // A pooled connection when the caller can share one, a fresh one otherwise.
+  #lease (client, reuse) {
+    if (reuse) {
+      const pooled = this.#idleBlocking.pop()
+
+      if (pooled?.status === 'ready') {
+        return pooled
+      }
+
+      // Recycled from a cycle that already ended: not worth reviving.
+      pooled?.disconnect()
+    }
+
+    const fresh = client.duplicate()
+
+    fresh.on('error', (err) => {
+      this.logger.debug?.(`Dedicated connection error: ${err.message}`)
+    })
+
+    return fresh
+  }
+
+  #return ({ client, cancelled, reuse }) {
+    // One-shot connections may carry per-connection state the caller left
+    // behind (WATCH, MULTI, SUBSCRIBE), and a cancelled or unhealthy socket is
+    // never worth recycling.
+    const recyclable = reuse &&
+      !cancelled &&
+      client.status === 'ready' &&
+      this.#idleBlocking.length < MAX_IDLE_BLOCKING_CONNECTIONS
+
+    if (recyclable) {
+      this.#idleBlocking.push(client)
+
+      return
+    }
+
+    client.disconnect()
+  }
+
+  // Blocking commands (XREAD/XREADGROUP with BLOCK) run on a dedicated
+  // connection: on the shared one they would stall every other command of the
+  // application until the block resolves. The connection is pooled afterwards
+  // — a consumer loop calls this on every iteration, and a handshake per
+  // iteration is a cost nobody asked for.
   async executeBlockingCommand (command, args) {
     try {
-      return await this.#withDedicatedConnection(command, (client) => client[command](...args))
+      return await this.#withDedicatedConnection(
+        command,
+        (client) => client[command](...args),
+        { reuse: true }
+      )
     } catch (err) {
       this.logError(err, command)
 
@@ -687,12 +743,27 @@ class RedisClient extends EventEmitter {
 
   /** The server's current `notify-keyspace-events` flags (empty when disabled). */
   async keyspaceNotifications () {
-    const client = this.connection.assertReady('keyspaceNotifications')
-    // CONFIG has no key to route on, so a cluster needs to be asked a node.
-    const target = typeof client.nodes === 'function' ? client.nodes('master')[0] : client
-    const [, flags] = await target.config('GET', 'notify-keyspace-events')
+    const [first] = await this.#keyspaceFlagsByNode()
 
-    return flags ?? ''
+    return first?.flags ?? ''
+  }
+
+  // CONFIG has no key to route on, so a cluster has to be asked node by node —
+  // and every master must answer, because each one is configured on its own and
+  // each one emits only its own slots' events.
+  async #keyspaceFlagsByNode () {
+    const client = this.connection.assertReady('keyspaceNotifications')
+    const isCluster = typeof client.nodes === 'function'
+    const targets = isCluster ? client.nodes('master') : [client]
+
+    return Promise.all(targets.map(async (target) => {
+      const [, flags] = await target.config('GET', 'notify-keyspace-events')
+
+      return {
+        node: isCluster ? `${target.options.host}:${target.options.port}` : null,
+        flags: flags ?? ''
+      }
+    }))
   }
 
   // Keyspace events only exist if the server was configured to emit them, and
@@ -703,14 +774,16 @@ class RedisClient extends EventEmitter {
 
     const db = options.db ?? this.redisConfig.db
 
-    return this.subscribe(`__keyevent@${db}__:${event}`, handler)
+    // Not subscribe(): in a cluster these events are node-local, so they need
+    // one subscriber per master (see SubscriptionManager).
+    return this.subscriptions.subscribeEverywhere(`__keyevent@${db}__:${event}`, handler)
   }
 
   async #assertKeyspaceNotifications (event) {
-    let flags
+    let readings
 
     try {
-      flags = await this.keyspaceNotifications()
+      readings = await this.#keyspaceFlagsByNode()
     } catch (err) {
       // Managed providers commonly block CONFIG. Refusing to subscribe would
       // be worse than subscribing without the guarantee.
@@ -720,17 +793,24 @@ class RedisClient extends EventEmitter {
     }
 
     const required = KEY_EVENT_CLASSES[event]
-    const missing = []
 
-    if (!flags.includes('E')) missing.push('E')
-    if (required && !flags.includes('A') && !flags.includes(required)) missing.push(required)
+    // One misconfigured master is enough to lose that shard's events silently,
+    // so the weakest node decides the verdict — not the first one asked.
+    for (const { node, flags } of readings) {
+      const missing = []
 
-    if (missing.length > 0) {
-      throw new RedisClientError(
-        `Keyspace notifications are not enabled for '${event}': notify-keyspace-events is "${flags}", missing "${missing.join('')}". Enable it with CONFIG SET notify-keyspace-events "${flags}${missing.join('')}".`,
-        'subscribeToKeyEvents',
-        'KEYSPACE_NOTIFICATIONS_DISABLED'
-      )
+      if (!flags.includes('E')) missing.push('E')
+      if (required && !flags.includes('A') && !flags.includes(required)) missing.push(required)
+
+      if (missing.length > 0) {
+        const where = node ? ` on cluster node ${node}` : ''
+
+        throw new RedisClientError(
+          `Keyspace notifications are not enabled for '${event}'${where}: notify-keyspace-events is "${flags}", missing "${missing.join('')}". Enable it with CONFIG SET notify-keyspace-events "${flags}${missing.join('')}".`,
+          'subscribeToKeyEvents',
+          'KEYSPACE_NOTIFICATIONS_DISABLED'
+        )
+      }
     }
   }
 
@@ -871,14 +951,37 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('xtrim', ...args)
   }
 
+  // Two shapes in one command: without a range it returns the group summary
+  // ([total, minId, maxId, consumers]), with one it returns the pending
+  // entries. Silently dropping a partial range would answer a different
+  // question than the caller asked, in a different shape.
   async xpending (key, group, options = {}) {
+    const { start, end, count, consumer } = options
+    const wantsRange = start != null || end != null || count != null
+
+    if (wantsRange && (start == null || end == null || count == null)) {
+      throw new RedisClientError(
+        "xpending needs start, end and count together to list entries (e.g. xpending(key, group, { start: '-', end: '+', count: 10 })). Pass no options for the group summary.",
+        'xpending',
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    if (!wantsRange && consumer != null) {
+      throw new RedisClientError(
+        'xpending can only filter by consumer together with start, end and count.',
+        'xpending',
+        'INVALID_ARGUMENT'
+      )
+    }
+
     const args = [key, group]
 
-    if (options.start != null && options.end != null && options.count != null) {
-      args.push(options.start, options.end, options.count)
+    if (wantsRange) {
+      args.push(start, end, count)
 
-      if (options.consumer) {
-        args.push(options.consumer)
+      if (consumer) {
+        args.push(consumer)
       }
     }
 
