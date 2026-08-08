@@ -221,6 +221,38 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Regression: a blocking read used to survive disconnect() — its promise
+  // never settled and its dedicated socket stayed open on the server, so a
+  // graceful shutdown hung forever.
+  test('disconnect cancels an in-flight blocking read and reclaims its connection', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+    await client.set('it:shutdown:warm', '1')
+
+    // BLOCK 0 waits forever: only the shutdown can end this. The expectation
+    // is attached now, before disconnect() rejects it — otherwise the
+    // rejection lands with no handler and the runner reports it as unhandled.
+    const blocked = client.xread({ block: 0 }, ['it:shutdown:stream', '$'])
+    const cancelled = assert.rejects(blocked, {
+      name: 'RedisClientError',
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'xread'
+    }, 'the caller must be told its read was cancelled, not left waiting')
+
+    await waitFor(async () => (await listOtherClientIds()).length >= 2, {
+      message: 'the dedicated connection to reach the server'
+    })
+
+    await client.disconnect()
+    await cancelled
+
+    await waitFor(async () => (await listOtherClientIds()).length === 0, {
+      message: 'every connection of this client to be gone'
+    })
+
+    await admin.del('it:shutdown:warm')
+  })
+
   // Regression (AUDIT B7): a blocking read on the shared connection stalled
   // every other command until the block resolved.
   test('blocking xread does not stall concurrent commands', { timeout: 15000 }, async () => {

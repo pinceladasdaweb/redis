@@ -14,6 +14,9 @@ import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
 // (logger, config, emit) and exposes the command surface. Mutable state is
 // always reached through getters — never captured references.
 class RedisClient extends EventEmitter {
+  // Dedicated connections currently in use, so shutdown can reclaim them.
+  #dedicated = new Set()
+
   constructor (options = {}) {
     super()
 
@@ -80,8 +83,19 @@ class RedisClient extends EventEmitter {
 
   async disconnect () {
     await this.subscriptions.close()
+    this.#releaseDedicatedConnections()
 
     return this.connection.disconnect()
+  }
+
+  // A blocking read parked on a dedicated connection would otherwise outlive
+  // the client: its promise never settles and its socket keeps the process
+  // alive, so a graceful shutdown never finishes.
+  #releaseDedicatedConnections () {
+    for (const held of this.#dedicated) {
+      held.cancelled = true
+      held.client.disconnect()
+    }
   }
 
   async checkHealth () {
@@ -93,17 +107,37 @@ class RedisClient extends EventEmitter {
   // The dedicated client inherits the full configuration (prefix, retries)
   // and is always released, whatever fn does.
   async withDedicatedConnection (fn) {
-    const client = this.connection.assertReady('withDedicatedConnection')
-    const dedicated = client.duplicate()
+    return this.#withDedicatedConnection('withDedicatedConnection', fn)
+  }
 
-    dedicated.on('error', (err) => {
+  async #withDedicatedConnection (operation, fn) {
+    const client = this.connection.assertReady(operation)
+    const held = { client: client.duplicate(), cancelled: false }
+
+    this.#dedicated.add(held)
+
+    held.client.on('error', (err) => {
       this.logger.debug?.(`Dedicated connection error: ${err.message}`)
     })
 
     try {
-      return await fn(dedicated)
+      return await fn(held.client)
+    } catch (err) {
+      // Shutdown closed this connection under a command that was still
+      // waiting: that is a cancellation, not a failure of its own, and the
+      // caller needs a code it can branch on to leave its loop.
+      if (held.cancelled) {
+        throw new RedisClientError(
+          `disconnect() closed the connection while '${operation}' was still waiting.`,
+          operation,
+          'REDIS_UNAVAILABLE'
+        )
+      }
+
+      throw err
     } finally {
-      dedicated.disconnect()
+      this.#dedicated.delete(held)
+      held.client.disconnect()
     }
   }
 
@@ -112,7 +146,7 @@ class RedisClient extends EventEmitter {
   // command of the application until the block resolves.
   async executeBlockingCommand (command, args) {
     try {
-      return await this.withDedicatedConnection((client) => client[command](...args))
+      return await this.#withDedicatedConnection(command, (client) => client[command](...args))
     } catch (err) {
       this.logError(err, command)
 

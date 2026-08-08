@@ -15,9 +15,22 @@ const NON_COMMANDS = new Set(['then', 'catch', 'finally', 'constructor', 'inspec
 
 const createRecorder = () => {
   const calls = []
+  // Commands still waiting for a reply. The driver flushes them with an error
+  // when the connection closes; a fake that forgets to would let broken
+  // shutdown code look correct.
+  const waiting = new Set()
 
   const target = {
     status: 'ready',
+    // Stands in for a command that only answers when told to, like XREAD BLOCK 0.
+    blockForever: () => new Promise((resolve, reject) => waiting.add(reject)),
+    flushWaiting: () => {
+      for (const reject of waiting) {
+        reject(new Error('Connection is closed.'))
+      }
+
+      waiting.clear()
+    },
     // Custom commands do not exist until defineCommand creates them — the
     // fake must reproduce that, or the lock manager's registration is skipped.
     releaseLock: undefined,
@@ -25,7 +38,10 @@ const createRecorder = () => {
     on () { return target },
     once () { return target },
     removeAllListeners () { return target },
-    disconnect () { calls.push(['<disconnect>']) },
+    disconnect () {
+      calls.push(['<disconnect>'])
+      target.flushWaiting()
+    },
     async quit () { calls.push(['<quit>']); return 'OK' },
     multi () { calls.push(['multi']); return { exec: async () => [] } },
     defineCommand (name) {
@@ -381,6 +397,44 @@ describe('wire contract', () => {
 
     assert.deepEqual(calls[0], ['xread', 'BLOCK', 0, 'STREAMS', 's', '$'])
     assert.deepEqual(calls[1], ['<disconnect>'], 'the dedicated connection must be released')
+  })
+
+  // Regression: a blocking read parked on a dedicated connection used to
+  // survive disconnect() — its promise never settled and its socket kept the
+  // process alive, so graceful shutdown never finished.
+  test('disconnect cancels commands still waiting on a dedicated connection', async () => {
+    const { redis, calls } = createClient()
+    let settled = 'pending'
+
+    // A command that never answers on its own, like XREAD BLOCK 0.
+    redis.client.xread = redis.client.blockForever
+
+    const blocked = redis.xread({ block: 0 }, ['s', '$'])
+      .then(() => { settled = 'resolved' })
+      .catch((err) => { settled = `${err.code}:${err.operation}` })
+
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(settled, 'pending', 'the read is waiting, as intended')
+
+    await redis.disconnect()
+    await blocked
+
+    assert.equal(settled, 'REDIS_UNAVAILABLE:xread', 'shutdown must cancel it with a code the caller can branch on')
+    assert.deepEqual(calls.at(-1), ['<disconnect>'], 'and the dedicated connection must be released')
+  })
+
+  test('a dedicated connection released by shutdown reports cancellation, not its own failure', async () => {
+    const { redis } = createClient()
+
+    const held = redis.withDedicatedConnection((client) => client.blockForever())
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await redis.disconnect()
+
+    await assert.rejects(held, {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'withDedicatedConnection'
+    })
   })
 
   test('withDedicatedConnection releases the connection even when fn throws', async () => {

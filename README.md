@@ -382,6 +382,19 @@ Popping follows the `spop` convention — without a count you get a single `{ me
 All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xlen`, `xinfo`, `xrange`, `xrevrange`, `xdel`, `xtrim`, `xpending`, `xclaim`). Two behaviors worth knowing:
 
 - **Blocking reads run on a dedicated connection.** `xread`/`xreadgroup` with `block` (including `block: 0`, which blocks forever) never stall other commands.
+- **`disconnect()` cancels them.** A read still waiting when you shut down rejects with `REDIS_UNAVAILABLE` and its connection is reclaimed, so a consumer loop can exit instead of hanging the process:
+
+  ```javascript
+  while (running) {
+    try {
+      const entries = await redis.xreadgroup('workers', 'worker-1', { block: 0 }, ['events', '>'])
+      // ...
+    } catch (err) {
+      if (err.code === 'REDIS_UNAVAILABLE') break // shutting down
+      throw err
+    }
+  }
+  ```
 - **`xgroup` respects each subcommand's arity** — `CREATE` (with optional `MKSTREAM`), `DESTROY`, `SETID`, `CREATECONSUMER`, `DELCONSUMER`.
 - **`keyPrefix` is honored everywhere**, including `xgroup` and `xinfo` — whose key sits after a subcommand, a position the underlying driver does not prefix on its own.
 

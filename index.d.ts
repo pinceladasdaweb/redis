@@ -165,6 +165,9 @@ export declare class RedisClient extends EventEmitter {
    * Runs fn with a short-lived dedicated connection (full configuration
    * inherited, always released). Required for WATCH/MULTI/EXEC and anything
    * else that must not share the main connection.
+   *
+   * If disconnect() runs while fn is still waiting, the connection is
+   * reclaimed and the call rejects with REDIS_UNAVAILABLE.
    */
   withDedicatedConnection<T> (fn: (client: Redis) => T | Promise<T>): Promise<T>
 
