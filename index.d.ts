@@ -92,10 +92,15 @@ export interface StreamRangeOptions {
   count?: number
 }
 
+/**
+ * The extended form of XPENDING. `start`, `end` and `count` travel together:
+ * a partial range is rejected with `INVALID_ARGUMENT` rather than silently
+ * answering the other question (the group summary, in a different shape).
+ */
 export interface StreamPendingOptions {
-  start?: string
-  end?: string
-  count?: number
+  start: string
+  end: string
+  count: number
   consumer?: string
 }
 
@@ -326,7 +331,10 @@ export declare class RedisClient extends EventEmitter {
   xdel (key: string, ...ids: string[]): Promise<number>
   /** `count` is required at runtime — omitting it rejects with INVALID_ARGUMENT. */
   xtrim (key: string, strategy: string, approx: boolean, count: number): Promise<number>
-  xpending (key: string, group: string, options?: StreamPendingOptions): Promise<unknown>
+  /** No options: the group summary, `[total, minId, maxId, consumers]`. */
+  xpending (key: string, group: string): Promise<unknown>
+  /** With a full range: the pending entries themselves. */
+  xpending (key: string, group: string, options: StreamPendingOptions): Promise<unknown>
   /** Acknowledges entries so they leave the consumer group's pending list. */
   xack (key: string, group: string, ...ids: string[]): Promise<number>
   /**

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { describe, test } from 'node:test'
 import SubscriptionManager from '../src/messaging/pubsub.js'
+import createManualClock from './helpers/manual-clock.js'
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
@@ -22,6 +23,7 @@ const createSubscriber = () => {
 
 const createManager = () => {
   const subscriber = createSubscriber()
+  const clock = createManualClock()
   const events = []
   const logs = []
   let duplicates = 0
@@ -30,6 +32,7 @@ const createManager = () => {
     connection: {
       assertReady: () => ({ duplicate: () => { duplicates++; return subscriber } })
     },
+    clock,
     logger: {
       info () {},
       debug () {},
@@ -39,7 +42,7 @@ const createManager = () => {
     emit: (...args) => events.push(args)
   })
 
-  return { manager, subscriber, events, logs, duplicates: () => duplicates }
+  return { manager, subscriber, clock, events, logs, duplicates: () => duplicates }
 }
 
 describe('subscription manager', () => {
@@ -239,6 +242,34 @@ describe('subscription manager', () => {
     assert.deepEqual(subscriber.calls.at(-1), ['disconnect'])
   })
 
+  // Regression: this close() runs FIRST on the facade's disconnect(), and a
+  // quit() parked behind the driver's offline queue never answers — an
+  // unbounded wait here hung the entire shutdown before it reached the main
+  // connection, which does have a deadline.
+  test('close gives up on a subscriber whose quit never answers', async () => {
+    const { manager, subscriber, clock } = createManager()
+
+    await manager.subscribe('news', () => {})
+
+    subscriber.quit = () => {
+      subscriber.calls.push(['quit'])
+
+      return new Promise(() => {})
+    }
+
+    let done = false
+    const closing = manager.close().then(() => { done = true })
+
+    await clock.advance(1999)
+    assert.equal(done, false, 'one millisecond before the deadline it is still waiting')
+
+    await clock.advance(1)
+    await closing
+
+    assert.equal(done, true, 'and on the deadline the shutdown continues')
+    assert.deepEqual(subscriber.calls.at(-1), ['disconnect'], 'the socket is forced closed instead')
+  })
+
   test('close skips quit for an already ended connection', async () => {
     const { manager, subscriber } = createManager()
 
@@ -283,5 +314,124 @@ describe('subscription manager', () => {
 
     assert.deepEqual(events.at(-1)[0], 'connectionError')
     assert.match(logs.at(-1)[1], /subscriber error.*socket died/)
+  })
+})
+
+// Keyspace events are the one channel family that is NOT broadcast across the
+// cluster bus: every node emits them for its own slots only, while a cluster
+// subscriber attaches to a single sampled node. A plain subscribe() therefore
+// delivers one shard's events and looks exactly like one that works.
+describe('cluster keyspace-event fan-out', () => {
+  const KEY_EVENT = '__keyevent@0__:expired'
+
+  const createClusterManager = (ports = [7001, 7002, 7003]) => {
+    const clock = createManualClock()
+    const events = []
+    const logs = []
+
+    const makeMaster = (port) => {
+      const node = { options: { host: '127.0.0.1', port } }
+
+      node.duplicate = () => {
+        node.subscriber = createSubscriber()
+
+        return node.subscriber
+      }
+
+      return node
+    }
+
+    const masters = ports.map(makeMaster)
+    const cluster = new EventEmitter()
+
+    cluster.nodes = () => masters
+    cluster.duplicate = () => {
+      throw new Error('a cluster must never be duplicated for node-local events')
+    }
+
+    const manager = new SubscriptionManager({
+      connection: { assertReady: () => cluster },
+      logger: {
+        info () {},
+        debug () {},
+        warn: (message) => logs.push(['warn', message]),
+        error: (message) => logs.push(['error', message])
+      },
+      clock,
+      emit: (...args) => events.push(args)
+    })
+
+    return { manager, masters, cluster, clock, events, logs, addMaster: (port) => masters.push(makeMaster(port)) }
+  }
+
+  test('every master gets its own subscriber', async () => {
+    const { manager, masters } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    for (const node of masters) {
+      assert.deepEqual(
+        node.subscriber.calls,
+        [['subscribe', KEY_EVENT]],
+        `master ${node.options.port} must be subscribed`
+      )
+    }
+  })
+
+  test('events from every shard reach the handler', async () => {
+    const { manager, masters } = createClusterManager()
+    const seen = []
+
+    await manager.subscribeEverywhere(KEY_EVENT, (message) => seen.push(message))
+
+    masters.forEach((node, index) => node.subscriber.emit('message', KEY_EVENT, `key-${index}`))
+    await tick()
+
+    assert.deepEqual(seen, ['key-0', 'key-1', 'key-2'], 'no shard may be silently missing')
+  })
+
+  test('a master added by resharding is subscribed too', async () => {
+    const { manager, masters, cluster, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    addMaster(7004)
+    cluster.emit('+node')
+    await tick()
+
+    assert.deepEqual(masters.at(-1).subscriber.calls, [['subscribe', KEY_EVENT]])
+    assert.equal(masters[0].subscriber.calls.length, 1, 'the existing ones are not re-subscribed')
+  })
+
+  test('unsubscribe reaches every node', async () => {
+    const { manager, masters } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.unsubscribe(KEY_EVENT)
+
+    for (const node of masters) {
+      assert.deepEqual(node.subscriber.calls.at(-1), ['unsubscribe', KEY_EVENT])
+    }
+  })
+
+  test('close releases every per-node subscriber', async () => {
+    const { manager, masters } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.close()
+
+    for (const node of masters) {
+      assert.deepEqual(node.subscriber.calls.at(-1), ['quit'], `master ${node.options.port} must be released`)
+      assert.equal(node.subscriber.listenerCount('message'), 0)
+    }
+  })
+
+  test('outside a cluster it stays a single subscription', async () => {
+    const { manager, subscriber, duplicates } = createManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    assert.equal(duplicates(), 1, 'standalone must not fan out')
+    assert.deepEqual(subscriber.calls, [['subscribe', KEY_EVENT]])
   })
 })

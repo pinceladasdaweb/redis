@@ -361,18 +361,34 @@ describe('wire contract', () => {
     assert.deepEqual(calls[2], ['xtrim', 'st', 'MAXLEN', '~', 1000])
   })
 
-  test('xpending ignores incomplete ranges instead of sending holes', async () => {
+  // XPENDING answers two different questions in two different shapes: the
+  // group summary without a range, the pending entries with one. Dropping a
+  // partial range used to answer the wrong question silently — the caller
+  // asked for entries and got [total, minId, maxId, consumers].
+  test('xpending rejects a partial range instead of silently summarizing', async () => {
     const { redis, calls } = createClient()
 
-    await redis.xpending('st', 'g', { start: '-' })
-    await redis.xpending('st', 'g', { start: '-', count: 5 })
-    await redis.xpending('st', 'g', { end: '+', count: 5 })
-    await redis.xpending('st', 'g', { start: '-', end: '+' })
-    await redis.xpending('st', 'g', { consumer: 'c1' })
+    const partials = [
+      { start: '-' },
+      { start: '-', count: 5 },
+      { end: '+', count: 5 },
+      { start: '-', end: '+' },
+      { consumer: 'c1' }
+    ]
 
-    for (const call of calls) {
-      assert.deepEqual(call, ['xpending', 'st', 'g'], 'a partial range must be dropped entirely')
+    for (const options of partials) {
+      await assert.rejects(redis.xpending('st', 'g', options), {
+        code: 'INVALID_ARGUMENT',
+        operation: 'xpending'
+      }, `${JSON.stringify(options)} must not reach the wire`)
     }
+
+    assert.deepEqual(calls, [], 'no partial range may reach the server')
+
+    // The summary form is still the one you get by asking for nothing.
+    await redis.xpending('st', 'g')
+
+    assert.deepEqual(calls, [['xpending', 'st', 'g']])
   })
 
   test('getAllStream scans everything by default', async () => {
@@ -394,13 +410,37 @@ describe('wire contract', () => {
     assert.deepEqual(patterns, ['*'])
   })
 
-  test('blocking stream reads run on a dedicated connection and release it', async () => {
+  test('blocking stream reads run on a dedicated connection', async () => {
     const { redis, calls } = createClient()
 
     await redis.xread({ block: 0 }, ['s', '$'])
 
     assert.deepEqual(calls[0], ['xread', 'BLOCK', 0, 'STREAMS', 's', '$'])
-    assert.deepEqual(calls[1], ['<disconnect>'], 'the dedicated connection must be released')
+  })
+
+  // A consumer loop calls this on every iteration: a handshake per iteration
+  // (a whole cluster pool per iteration, under cluster) is a cost nobody asked
+  // for. The connection is pooled between reads and only closed on shutdown.
+  test('consecutive blocking reads reuse the pooled connection', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.xread({ block: 0 }, ['s', '$'])
+    await redis.xread({ block: 0 }, ['s', '$'])
+    await redis.xread({ block: 0 }, ['s', '$'])
+
+    assert.equal(
+      calls.filter((call) => call[0] === '<disconnect>').length,
+      0,
+      'no connection may be torn down between reads'
+    )
+
+    await redis.disconnect()
+
+    assert.equal(
+      calls.filter((call) => call[0] === '<disconnect>').length,
+      1,
+      'and the pooled connection must be released on shutdown'
+    )
   })
 
   // Regression: a blocking read parked on a dedicated connection used to
@@ -538,6 +578,37 @@ describe('wire contract', () => {
     })
 
     assert.equal(calls.some(([command]) => command === 'subscribe'), false, 'nothing may be subscribed to a channel that cannot speak')
+  })
+
+  // Each cluster node is configured on its own and emits only its own slots'
+  // events, so asking one master and trusting the answer would let a single
+  // misconfigured shard go silent behind a probe that passed.
+  test('the keyspace probe asks every master, not just the first', async () => {
+    const { redis, fake } = createClient()
+    const asked = []
+
+    const master = (port, flags) => ({
+      options: { host: '127.0.0.1', port },
+      config: async () => {
+        asked.push(port)
+
+        return ['notify-keyspace-events', flags]
+      },
+      duplicate: () => ({
+        on () {},
+        subscribe: async () => 1
+      })
+    })
+
+    // The first two are fine; the last one would silently drop its shard.
+    fake.nodes = () => [master(7001, 'Ex'), master(7002, 'Ex'), master(7003, '')]
+
+    await assert.rejects(redis.subscribeToKeyEvents('expired', () => {}), {
+      code: 'KEYSPACE_NOTIFICATIONS_DISABLED',
+      message: /cluster node 127\.0\.0\.1:7003/
+    }, 'the weakest node decides the verdict')
+
+    assert.deepEqual(asked, [7001, 7002, 7003], 'every master must be asked')
   })
 
   test('an unreadable config downgrades to a warning instead of blocking', async () => {

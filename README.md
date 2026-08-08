@@ -121,6 +121,7 @@ What changes once keys live on different nodes:
 - **Multi-key commands need one slot.** `mget`, `mset`, `del` with several keys, `multi()` batches — all of them fail with `CROSSSLOT` unless the keys hash together. Force that with a hash tag: `{user:1}:name` and `{user:1}:role` share a slot, so a command can span them.
 - **`getAllStream` and `deleteByPattern` walk every master** and merge the results, because a cluster has no keyspace-wide `SCAN`. Deletion issues one `UNLINK` per key for the same slot reason.
 - **Database 0 only** — asking for another one is rejected at construction rather than silently reading from the wrong place.
+- **Keyspace events are node-local.** Unlike `publish`, which the cluster bus spreads everywhere, each node emits keyspace notifications for its own slots and never forwards them. `subscribeToKeyEvents` therefore opens one subscriber per master (and follows resharding), and its probe requires *every* master to be configured — one silent shard is one third of your expirations gone.
 - Everything single-key is unchanged: locks (the Lua scripts declare their key, so they route), cache-aside, counters, sorted sets, streams.
 
 The cluster suite runs against three real masters:
@@ -505,6 +506,9 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 - `sort()`'s `by` and `get` patterns are sent verbatim: unlike keys, the driver never rewrites them, so include your `keyPrefix` yourself when using them.
 - `getJson` returns `null` for missing keys and throws `SyntaxError` on non-JSON payloads.
 - A command issued while disconnected rejects with `REDIS_UNAVAILABLE` — it is **not** queued (the tiny race window that slips into the driver's offline queue is resent on reconnection; bound it with `commandTimeout` if needed).
+- `xpending()` answers two different questions in two different shapes: the group summary with no options, the pending entries with `start`, `end` and `count`. A partial range rejects with `INVALID_ARGUMENT` instead of silently answering the other one.
+- Blocking reads (`xread`/`xreadgroup` with `block`) run on a dedicated connection so they never stall the shared one, and that connection is **pooled** between reads — a consumer loop does not pay a handshake per iteration. `disconnect()` closes the pool along with everything else.
+- `disconnect()` always finishes. Every `quit()` on the way out has a 2-second deadline, after which the socket is forced closed: the driver parks `QUIT` behind whatever is already in its offline queue, and on a connection that is still retrying that reply may never come.
 
 ## Development
 
