@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 2.0.0 (2026-08-08)
+
+* fix: stop dropping driver options, starting with tls by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/99e38b0aeea610b660246126c464a2b8288bac01)
+
+
 ## 1.2.0 (2026-08-08)
 
 * test: drive time through a clock seam instead of sleeping by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/30890648a9bce952fa08344c5b08a53d2a6b8470)
