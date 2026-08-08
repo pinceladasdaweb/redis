@@ -1,39 +1,104 @@
 import Redis from 'ioredis'
+import RedisClientError from '../utils/errors.js'
+
+// Options this library owns: they are consumed here (or by the facade) and
+// must never reach the driver, which would reject or misread them.
+const LIBRARY_OPTIONS = new Set([
+  'logger',
+  'clock',
+  'maxRetryAttempts',
+  'baseRetryDelay',
+  'maxRetryDelay',
+  'healthCheckInterval',
+  'healthCheckTimeout'
+])
+
+// Options the library sets on purpose and will not let a caller replace:
+// reconnection belongs to the driver *through these two hooks*, and swapping
+// them out would silently disable the retry policy this library documents.
+const RESERVED_OPTIONS = new Set(['retryStrategy', 'reconnectOnError'])
+
+// Numbers that must be finite and non-negative if given at all. A typo here
+// used to travel all the way to a hung timer or an infinite retry loop.
+const NON_NEGATIVE_NUMBERS = [
+  'maxRetryAttempts',
+  'baseRetryDelay',
+  'maxRetryDelay',
+  'healthCheckInterval',
+  'healthCheckTimeout',
+  'commandTimeout',
+  'connectTimeout'
+]
 
 class RedisConfig {
   constructor (options = {}) {
     this.logger = options.logger
+
+    this.#assertValid(options)
+
+    // Everything the caller passes reaches ioredis untouched — tls, family,
+    // connectTimeout, keepAlive, path, natMap, enableOfflineQueue and whatever
+    // the driver grows next. An allowlist here silently dropped tls, which
+    // meant no managed Redis (Upstash, ElastiCache in-transit, Azure) could be
+    // reached at all, with no error pointing at the cause.
+    const passthrough = Object.fromEntries(
+      Object.entries(options).filter(([key, value]) =>
+        value !== undefined && !LIBRARY_OPTIONS.has(key) && !RESERVED_OPTIONS.has(key))
+    )
+
     this.configOptions = {
-      host: options.host,
-      port: options.port,
-      username: options.username,
-      password: options.password,
-      db: options.db,
-      keyPrefix: options.keyPrefix,
-      connectionName: options.connectionName,
-      commandTimeout: options.commandTimeout,
+      // Defaults first, so a caller can override any of them...
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      autoResubscribe: true,
+      autoResendUnfulfilledCommands: true,
+      lazyConnect: true,
+      ...passthrough,
+      // ...except these, which the library owns.
       retryStrategy: this.retryStrategy.bind(this),
-      reconnectOnError: this.reconnectOnError.bind(this),
-      maxRetriesPerRequest: options.maxRetriesPerRequest ?? null,
-      // Sentinel mode (high availability): only forwarded when configured,
-      // so standalone options stay exactly as ioredis expects them.
-      ...(options.sentinels
-        ? {
-            sentinels: options.sentinels,
-            name: options.name,
-            sentinelPassword: options.sentinelPassword,
-            role: options.role
-          }
-        : {}),
-      enableReadyCheck: options.enableReadyCheck ?? true,
-      autoResubscribe: options.autoResubscribe ?? true,
-      autoResendUnfulfilledCommands: options.autoResendUnfulfilledCommands ?? true,
-      lazyConnect: options.lazyConnect ?? true
+      reconnectOnError: this.reconnectOnError.bind(this)
     }
 
     this.maxRetryAttempts = options.maxRetryAttempts
     this.baseRetryDelay = options.baseRetryDelay
     this.maxRetryDelay = options.maxRetryDelay
+  }
+
+  // Fail at construction, not at the first command under load.
+  #assertValid (options) {
+    for (const name of NON_NEGATIVE_NUMBERS) {
+      const value = options[name]
+
+      if (value === undefined || value === Infinity) {
+        continue
+      }
+
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new RedisClientError(
+          `${name} must be a non-negative number (got ${JSON.stringify(value)}).`,
+          'constructor',
+          'INVALID_OPTION'
+        )
+      }
+    }
+
+    for (const name of RESERVED_OPTIONS) {
+      if (options[name] !== undefined) {
+        throw new RedisClientError(
+          `${name} is managed by this library and cannot be overridden. Use maxRetryAttempts, baseRetryDelay and maxRetryDelay instead.`,
+          'constructor',
+          'INVALID_OPTION'
+        )
+      }
+    }
+
+    if (options.sentinels !== undefined && !options.name) {
+      throw new RedisClientError(
+        'sentinels requires name: the master group to resolve.',
+        'constructor',
+        'INVALID_OPTION'
+      )
+    }
   }
 
   getOptions () {

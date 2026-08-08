@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { EventEmitter } from 'node:events'
-import { Redis, ChainableCommander } from 'ioredis'
+import { Redis, ChainableCommander, RedisOptions } from 'ioredis'
 
 export interface Logger {
   error: (message: string, ...args: unknown[]) => void
@@ -12,45 +12,22 @@ export interface Logger {
 
 export declare function createLogger (level?: string): Logger
 
-export interface RedisClientOptions {
-  /** Redis server hostname. */
-  host?: string
-  /** Redis server port. */
-  port?: number
-  username?: string
-  password?: string
-  /** Database number. */
-  db?: number
-  /** Prefix automatically applied to every key (including SCAN in getAllStream). */
-  keyPrefix?: string
-  /** CLIENT SETNAME value — makes this client identifiable in CLIENT LIST. */
-  connectionName?: string
-  /** Per-command timeout in ms (ioredis passthrough). No default: blocking reads would break. */
-  commandTimeout?: number
+/**
+ * Everything ioredis accepts — host/port/password, tls, connectTimeout,
+ * keepAlive, family, path, natMap, enableOfflineQueue, the sentinel options —
+ * forwarded to the driver untouched, plus this library's own options below.
+ *
+ * `retryStrategy` and `reconnectOnError` are deliberately absent: the library
+ * owns them, and passing either rejects at construction with INVALID_OPTION.
+ * Shape the backoff with maxRetryAttempts / baseRetryDelay / maxRetryDelay.
+ */
+export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' | 'reconnectOnError'> {
   /** Maximum reconnection attempts before the driver gives up. 0 means never retry. Default: Infinity. */
   maxRetryAttempts?: number
   /** Base delay in ms for the exponential reconnection backoff. Default: 1000. */
   baseRetryDelay?: number
   /** Cap in ms for the exponential reconnection backoff. Default: 30000. */
   maxRetryDelay?: number
-  /** ioredis passthrough. Default: null (unlimited). */
-  maxRetriesPerRequest?: number | null
-  /** ioredis passthrough. Default: true. */
-  enableReadyCheck?: boolean
-  /** ioredis passthrough. Default: true. */
-  autoResubscribe?: boolean
-  /** ioredis passthrough. Default: true. */
-  autoResendUnfulfilledCommands?: boolean
-  /** ioredis passthrough. Default: true. */
-  lazyConnect?: boolean
-  /** Sentinel mode: list of sentinel nodes. Enables high availability via ioredis. */
-  sentinels?: Array<{ host: string, port: number }>
-  /** Sentinel mode: the master group name to resolve. */
-  name?: string
-  /** Sentinel mode: password for the sentinel nodes themselves. */
-  sentinelPassword?: string
-  /** Sentinel mode: connect to the 'master' (default) or a 'slave'. */
-  role?: 'master' | 'slave'
   /** Minimum interval in ms between real PINGs issued by checkHealth(). Default: 5000. */
   healthCheckInterval?: number
   /** Timeout in ms for the checkHealth() PING. Default: 1000. */
@@ -59,7 +36,7 @@ export interface RedisClientOptions {
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'

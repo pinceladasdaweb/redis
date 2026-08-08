@@ -27,9 +27,9 @@ your application:
 
 - **Credentials** are passed to ioredis and never logged. The only connection
   detail that reaches a log line is the host.
-- **TLS** is not configured by this library. Connections are plain TCP unless
-  the driver is configured otherwise; if you need TLS today, use the raw
-  ioredis instance exposed as `client`.
+- **TLS is opt-in and yours to configure.** Pass `tls` (any Node TLS options)
+  and it reaches the driver untouched; without it, connections are plain TCP.
+  Managed providers generally require it — see the README.
 - **Values are never evaluated.** Data read from Redis is returned as-is, and
   the only parsing is `JSON.parse` inside the explicit `*Json` helpers — so a
   malformed payload throws a `SyntaxError` instead of producing something
