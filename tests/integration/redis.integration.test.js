@@ -13,6 +13,14 @@ import Redis from 'ioredis'
 import { RedisClient } from '../../src/index.js'
 
 const RUN = process.env.REDIS_INTEGRATION === '1'
+const RUN_CLUSTER = process.env.REDIS_CLUSTER_INTEGRATION === '1'
+const CLUSTER_NODES = (process.env.REDIS_CLUSTER_NODES || '127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003')
+  .split(',')
+  .map((node) => {
+    const [host, port] = node.split(':')
+
+    return { host, port: Number(port) }
+  })
 const HOST = process.env.REDIS_HOST || '127.0.0.1'
 const PORT = Number(process.env.REDIS_PORT || '6379')
 const ADMIN_NAME = 'integration-admin'
@@ -899,5 +907,130 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
       name: 'RedisClientError',
       code: 'REDIS_UNAVAILABLE'
     })
+  })
+})
+
+// Cluster changes what the library can assume: keys live on different nodes,
+// a command sent to the wrong one is answered with MOVED (or ASK while slots
+// migrate), and there is no cluster-wide SCAN. Gated separately because it
+// needs its own topology: docker compose -f docker-compose.cluster.yml up -d
+describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER_INTEGRATION=1 (needs docker-compose.cluster.yml)' }, () => {
+  const createClusterClient = (options = {}) =>
+    new RedisClient({ nodes: CLUSTER_NODES, keyPrefix: 'ct:', logger: quietLogger, ...options })
+
+  test('follows redirections for keys spread across the masters', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    // Enough distinct keys that they cannot all hash to one slot: every read
+    // that lands on the wrong node has to be redirected to reach its value.
+    const keys = Array.from({ length: 60 }, (_, index) => `spread:${index}`)
+
+    for (const key of keys) {
+      await client.set(key, `value-${key}`)
+    }
+
+    for (const key of keys) {
+      assert.equal(await client.get(key), `value-${key}`)
+    }
+
+    // Prove they really are spread: ask the cluster which slots they map to.
+    const slots = new Set()
+    for (const key of keys.slice(0, 10)) {
+      slots.add(await client.client.cluster('KEYSLOT', `ct:${key}`))
+    }
+    assert.ok(slots.size > 1, 'the sample must span more than one slot for this to mean anything')
+
+    const owners = new Set(client.client.nodes('master').map((node) => node.options.port))
+    assert.equal(owners.size, 3, 'all three masters are in play')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('scans and deletes across every master', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    const written = {}
+    for (let index = 0; index < 30; index++) {
+      written[`scan:${index}`] = String(index)
+      await client.set(`scan:${index}`, String(index))
+    }
+    await client.set('other:1', 'untouched')
+
+    // A cluster has no SCAN of its own; this only works if every master is
+    // walked and the slices are merged.
+    const dumped = Object.assign({}, ...await client.getAllStream('scan:*'))
+    assert.deepEqual(dumped, written, 'every key must come back, wherever it lives')
+
+    assert.equal(await client.deleteByPattern('scan:*'), 30)
+    assert.deepEqual(await client.getAllStream('scan:*'), [])
+    assert.equal(await client.get('other:1'), 'untouched')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('single-key features work unchanged: locks, cache and counters', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    // The lock's Lua scripts declare one key, so the cluster can route them.
+    const held = await client.withLock('cluster-job', { ttl: 5000 }, async () => {
+      await assert.rejects(client.acquireLock('cluster-job'), { code: 'LOCK_NOT_ACQUIRED' })
+
+      return 'critical section ran'
+    })
+    assert.equal(held, 'critical section ran')
+
+    let produced = 0
+    const cached = await client.getOrSetJson('report', 60, () => { produced++; return { ok: true } }, { lock: true })
+    assert.deepEqual(cached, { ok: true })
+    assert.deepEqual(await client.getOrSetJson('report', 60, () => { produced++; return { no: true } }), { ok: true })
+    assert.equal(produced, 1)
+
+    await client.zadd('board', { ada: 120, grace: 180 })
+    assert.deepEqual(await client.zrevrange('board', 0, 0, { withScores: true }), [{ member: 'grace', score: 180 }])
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('multi-key commands need one slot, and hash tags are how you get it', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.set('loose:1', 'a')
+    await client.set('loose:2', 'b')
+
+    // Two keys, two slots: the server refuses rather than guessing.
+    await assert.rejects(client.mget('loose:1', 'loose:2'), /CROSSSLOT/)
+
+    // A hash tag pins both keys to the same slot, so the same call works.
+    await client.mset({ '{user:1}:name': 'Ada', '{user:1}:role': 'admin' })
+    assert.deepEqual(await client.mget('{user:1}:name', '{user:1}:role'), ['Ada', 'admin'])
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('pub/sub reaches subscribers regardless of which node they are on', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+
+    const received = []
+    await client.subscribe('cluster:events', (message) => received.push(message))
+
+    await waitFor(async () => (await client.publish('cluster:events', 'hello')) > 0, {
+      message: 'the subscription to register across the cluster'
+    })
+    await waitFor(() => received.includes('hello'), { message: 'the message to arrive' })
+
+    await client.disconnect()
   })
 })

@@ -1,0 +1,61 @@
+# A three-master cluster for the cluster integration suite. Kept separate from
+# the standalone compose so the two never fight over ports, and so the default
+# `docker compose up -d` stays a single server.
+#
+#   docker compose -f docker-compose.cluster.yml up -d --wait
+#   REDIS_CLUSTER_INTEGRATION=1 npm run test:integration
+#
+# The nodes announce 127.0.0.1 so MOVED/ASK redirections resolve from the host.
+
+services:
+  cluster-node-1: &node
+    image: 'redis:7.4-alpine'
+    command: >-
+      redis-server --port 7001 --cluster-enabled yes
+      --cluster-config-file nodes.conf --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7001
+      --appendonly no --save ""
+    network_mode: host
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-p', '7001', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  cluster-node-2:
+    <<: *node
+    command: >-
+      redis-server --port 7002 --cluster-enabled yes
+      --cluster-config-file nodes.conf --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7002
+      --appendonly no --save ""
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-p', '7002', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  cluster-node-3:
+    <<: *node
+    command: >-
+      redis-server --port 7003 --cluster-enabled yes
+      --cluster-config-file nodes.conf --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7003
+      --appendonly no --save ""
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-p', '7003', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Forms the cluster once every node answers, then exits.
+  cluster-init:
+    image: 'redis:7.4-alpine'
+    network_mode: host
+    depends_on:
+      cluster-node-1: { condition: service_healthy }
+      cluster-node-2: { condition: service_healthy }
+      cluster-node-3: { condition: service_healthy }
+    command: >-
+      sh -c "redis-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-yes
+      && until [ \"$$(redis-cli -p 7001 cluster info | grep -c 'cluster_state:ok')\" = 1 ]; do sleep 1; done"

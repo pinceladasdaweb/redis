@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { EventEmitter } from 'node:events'
-import { Redis, ChainableCommander, RedisOptions } from 'ioredis'
+import { Redis, Cluster, ChainableCommander, RedisOptions, ClusterOptions } from 'ioredis'
 
 export interface Logger {
   error: (message: string, ...args: unknown[]) => void
@@ -21,7 +21,13 @@ export declare function createLogger (level?: string): Logger
  * owns them, and passing either rejects at construction with INVALID_OPTION.
  * Shape the backoff with maxRetryAttempts / baseRetryDelay / maxRetryDelay.
  */
-export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' | 'reconnectOnError'> {
+export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' | 'reconnectOnError'>, Omit<ClusterOptions, 'redisOptions' | 'clusterRetryStrategy'> {
+  /**
+   * Startup nodes of a Redis Cluster. Providing them switches the client to
+   * cluster mode: slots are discovered, MOVED/ASK redirections are followed,
+   * and multi-key commands require a shared hash slot.
+   */
+  nodes?: Array<{ host: string, port: number }>
   /** Maximum reconnection attempts before the driver gives up. 0 means never retry. Default: Infinity. */
   maxRetryAttempts?: number
   /** Base delay in ms for the exponential reconnection backoff. Default: 1000. */
@@ -150,8 +156,8 @@ export interface Lock {
 export declare class RedisClient extends EventEmitter {
   constructor (options?: RedisClientOptions)
 
-  /** The underlying ioredis instance, or null while disconnected. */
-  readonly client: Redis | null
+  /** The underlying ioredis instance (a Cluster when `nodes` was given), or null while disconnected. */
+  readonly client: Redis | Cluster | null
   readonly isConnected: boolean
   logger: Logger
   keyPrefix: string

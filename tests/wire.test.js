@@ -35,6 +35,9 @@ const createRecorder = () => {
     // fake must reproduce that, or the lock manager's registration is skipped.
     releaseLock: undefined,
     extendLock: undefined,
+    // A standalone client has no nodes(): leaving it to the proxy would make
+    // every fake look like a cluster.
+    nodes: undefined,
     on () { return target },
     once () { return target },
     removeAllListeners () { return target },

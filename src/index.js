@@ -54,7 +54,9 @@ class RedisClient extends EventEmitter {
     })
 
     this.config = this.redisConfig.getOptions()
-    this.keyPrefix = this.config.keyPrefix ?? ''
+    // Read from the config object, not from the driver options: under cluster
+    // these live inside redisOptions.
+    this.keyPrefix = this.redisConfig.keyPrefix
 
     // One clock for the whole facade: every timer and every reading of "now"
     // in the collaborators goes through it, so time is drivable in tests.
@@ -685,7 +687,10 @@ class RedisClient extends EventEmitter {
 
   /** The server's current `notify-keyspace-events` flags (empty when disabled). */
   async keyspaceNotifications () {
-    const [, flags] = await this.executeCommand('config', 'GET', 'notify-keyspace-events')
+    const client = this.connection.assertReady('keyspaceNotifications')
+    // CONFIG has no key to route on, so a cluster needs to be asked a node.
+    const target = typeof client.nodes === 'function' ? client.nodes('master')[0] : client
+    const [, flags] = await target.config('GET', 'notify-keyspace-events')
 
     return flags ?? ''
   }
@@ -696,7 +701,7 @@ class RedisClient extends EventEmitter {
   async subscribeToKeyEvents (event, handler, options = {}) {
     await this.#assertKeyspaceNotifications(event)
 
-    const db = options.db ?? this.config.db ?? 0
+    const db = options.db ?? this.redisConfig.db
 
     return this.subscribe(`__keyevent@${db}__:${event}`, handler)
   }

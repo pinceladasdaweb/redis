@@ -100,6 +100,36 @@ node "examples/5 - cache-stampede/index.mjs"
 | `keyPrefix` | `string` | `''` | Prefix applied to every key, including `getAllStream` scans |
 | `connectionName` | `string` | — | `CLIENT SETNAME` value; makes the client identifiable in `CLIENT LIST` |
 
+### Cluster
+
+Pass `nodes` and the client talks to a Redis Cluster: slots are discovered, **`MOVED` and `ASK` redirections are followed** (up to `maxRedirections`, 16 by default) and the map is refreshed when the topology changes.
+
+```javascript
+const redis = new RedisClient({
+  nodes: [
+    { host: 'node-1', port: 6379 },
+    { host: 'node-2', port: 6379 }
+  ],
+  keyPrefix: 'app:'
+})
+```
+
+Only startup nodes are needed — the rest of the cluster is discovered. Node-level options (`password`, `tls`, `connectTimeout`, `keyPrefix`…) and cluster-level ones (`maxRedirections`, `scaleReads`, `slotsRefreshTimeout`…) are sorted for you; the retry backoff you configure applies to both a single node and the cluster.
+
+What changes once keys live on different nodes:
+
+- **Multi-key commands need one slot.** `mget`, `mset`, `del` with several keys, `multi()` batches — all of them fail with `CROSSSLOT` unless the keys hash together. Force that with a hash tag: `{user:1}:name` and `{user:1}:role` share a slot, so a command can span them.
+- **`getAllStream` and `deleteByPattern` walk every master** and merge the results, because a cluster has no keyspace-wide `SCAN`. Deletion issues one `UNLINK` per key for the same slot reason.
+- **Database 0 only** — asking for another one is rejected at construction rather than silently reading from the wrong place.
+- Everything single-key is unchanged: locks (the Lua scripts declare their key, so they route), cache-aside, counters, sorted sets, streams.
+
+The cluster suite runs against three real masters:
+
+```bash
+docker compose -f docker-compose.cluster.yml up -d --wait
+npm run test:cluster
+```
+
 ### High availability (Sentinel)
 
 | Option | Type | Default | Description |
