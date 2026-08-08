@@ -54,6 +54,21 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
       .filter(id => id !== adminId)
   }
 
+  // Counting every connection on the server couples each test to the cleanup
+  // of every other one: a single leak elsewhere cascades into unrelated
+  // failures. Tests that care about their own footprint name their client and
+  // count only that name — the same lesson as filtering the RabbitMQ
+  // management API by connection name.
+  const listClientIdsNamed = async (name) => {
+    const list = await admin.client('LIST')
+
+    return list
+      .split('\n')
+      .filter(Boolean)
+      .filter(line => new RegExp(`(?:^|\\s)name=${name}(?:\\s|$)`).test(line))
+      .map(line => Number(/(?:^|\s)id=(\d+)/.exec(line)[1]))
+  }
+
   const killAllOtherClients = async () => {
     const ids = await listOtherClientIds()
 
@@ -351,7 +366,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // never settled and its dedicated socket stayed open on the server, so a
   // graceful shutdown hung forever.
   test('disconnect cancels an in-flight blocking read and reclaims its connection', { timeout: 20000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, connectionName: 'it-shutdown', logger: quietLogger })
     await client.connect()
     await client.set('it:shutdown:warm', '1')
 
@@ -365,14 +380,14 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
       operation: 'xread'
     }, 'the caller must be told its read was cancelled, not left waiting')
 
-    await waitFor(async () => (await listOtherClientIds()).length >= 2, {
+    await waitFor(async () => (await listClientIdsNamed('it-shutdown')).length >= 2, {
       message: 'the dedicated connection to reach the server'
     })
 
     await client.disconnect()
     await cancelled
 
-    await waitFor(async () => (await listOtherClientIds()).length === 0, {
+    await waitFor(async () => (await listClientIdsNamed('it-shutdown')).length === 0, {
       message: 'every connection of this client to be gone'
     })
 
@@ -433,7 +448,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // the transaction when the watched key changes — something the shared
   // connection could never guarantee under concurrency.
   test('withDedicatedConnection provides working optimistic locking', { timeout: 15000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'tx:', logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'tx:', connectionName: 'it-tx', logger: quietLogger })
     await client.connect()
 
     await client.set('balance', '10')
@@ -460,7 +475,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     assert.equal(await client.get('balance'), '99')
 
     // The dedicated connections are released afterwards.
-    await waitFor(async () => (await listOtherClientIds()).length === 1, {
+    await waitFor(async () => (await listClientIdsNamed('it-tx')).length === 1, {
       message: 'dedicated connections to be released'
     })
 
@@ -469,7 +484,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   })
 
   test('pub/sub delivers to channel handlers, pattern handlers and facade events', { timeout: 15000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, connectionName: 'it-pubsub', logger: quietLogger })
     await client.connect()
 
     const received = { handler: [], event: [], pattern: [] }
@@ -498,7 +513,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
 
     // disconnect() releases the subscriber connection too.
     await client.disconnect()
-    const remaining = (await listOtherClientIds()).length
+    const remaining = (await listClientIdsNamed('it-pubsub')).length
     assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
   })
 
@@ -848,19 +863,155 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // One recovery can succeed by luck. Two in a row, with the state carried
+  // across both, is what says the client actually rebuilt itself.
+  test('recovers across two consecutive server-side kills', { timeout: 60000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-cycles', logger: quietLogger })
+    const readyEvents = []
+
+    client.on('ready', () => readyEvents.push(Date.now()))
+    await client.connect()
+
+    for (const cycle of [1, 2]) {
+      assert.equal(await client.set(`it:cycles:${cycle}`, 'before'), 'OK')
+
+      await waitFor(async () => (await listOtherClientIds()).length >= 1, {
+        message: `the connection to be visible before kill ${cycle}`
+      })
+      assert.ok(await killAllOtherClients() >= 1, `kill ${cycle} must land`)
+
+      await waitFor(async () => {
+        try {
+          return (await client.set(`it:cycles:${cycle}`, 'after')) === 'OK'
+        } catch {
+          return false
+        }
+      }, { timeout: 20000, message: `recovery after kill ${cycle}` })
+
+      assert.equal(await client.get(`it:cycles:${cycle}`), 'after', `cycle ${cycle} must be fully usable again`)
+    }
+
+    assert.ok(readyEvents.length >= 3, `each recovery must announce itself: ${readyEvents.length} ready events`)
+
+    // Two full cycles, still one connection: nothing accumulated on the way.
+    await sleep(1000)
+    assert.equal((await listClientIdsNamed('it-cycles')).length, 1)
+
+    await client.del('it:cycles:1', 'it:cycles:2')
+    await client.disconnect()
+  })
+
+  // The nastier shape of the same failure: the server drops the client again
+  // while it is still recovering from the previous drop.
+  test('recovers from a flapping server that keeps dropping it mid-recovery', { timeout: 60000 }, async () => {
+    // The backoff cap matters here: attempts that never reach a ready
+    // connection keep doubling (2^attempt * base), so without a cap a
+    // flapping stretch pushes the next retry half a minute away.
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      connectionName: 'it-flapping',
+      logger: quietLogger
+    })
+    await client.connect()
+    await client.set('it:flapping', 'before')
+
+    // Repeated kills: several land while a reconnection from the previous one
+    // is still in flight.
+    let kills = 0
+
+    for (let round = 0; round < 8; round++) {
+      kills += await killAllOtherClients()
+      await sleep(60)
+    }
+
+    assert.ok(kills >= 2, `the point is repeated drops, only ${kills} landed`)
+
+    await waitFor(async () => {
+      try {
+        return (await client.set('it:flapping', 'after')) === 'OK'
+      } catch {
+        return false
+      }
+    }, { timeout: 25000, message: 'recovery once the server settles' })
+
+    assert.equal(await client.get('it:flapping'), 'after')
+
+    // Every abandoned attempt must be gone, not lingering as a spare socket.
+    await sleep(1000)
+    assert.equal((await listClientIdsNamed('it-flapping')).length, 1, 'flapping must not leave a trail of connections')
+
+    await client.del('it:flapping')
+    await client.disconnect()
+  })
+
+  test('pub/sub survives two consecutive kills and a flapping server', { timeout: 60000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      logger: quietLogger
+    })
+    await client.connect()
+
+    const received = []
+    await client.subscribe('resilient:cycles', (message) => received.push(message))
+
+    const deliverAgain = async (marker) => {
+      await waitFor(async () => {
+        try {
+          await client.publish('resilient:cycles', marker)
+        } catch {
+          return false
+        }
+
+        return received.includes(marker)
+      }, { timeout: 25000, message: `delivery of '${marker}'` })
+    }
+
+    await deliverAgain('before')
+
+    // Two clean cycles.
+    for (const cycle of [1, 2]) {
+      await killAllOtherClients()
+      await deliverAgain(`after-kill-${cycle}`)
+    }
+
+    // Then a flapping stretch on top.
+    for (let round = 0; round < 8; round++) {
+      await killAllOtherClients()
+      await sleep(60)
+    }
+
+    await deliverAgain('after-flapping')
+
+    // Deduplicated: delivery is retried until it lands, so a marker can
+    // legitimately arrive more than once.
+    const markers = [...new Set(received.filter((message) => message.startsWith('after')))].sort()
+
+    assert.deepEqual(markers, [
+      'after-flapping', 'after-kill-1', 'after-kill-2'
+    ], 'the subscription must be restored every single time')
+
+    await client.disconnect()
+  })
+
   // Regression probe for AUDIT C1/C2: the manual reconnection layer spawns a
   // brand-new ioredis client per attempt while the driver's own retryStrategy
   // also reconnects the old one — every recovery must end with the SAME
   // number of connections it started with.
   test('does not leak extra connections while recovering', { timeout: 60000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-leak', logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:leak:probe', '1'), 'OK')
-    await waitFor(async () => (await listOtherClientIds()).length >= 1, {
+    await waitFor(async () => (await listClientIdsNamed('it-leak')).length >= 1, {
       message: 'library connection to appear in CLIENT LIST'
     })
-    const baseline = (await listOtherClientIds()).length
+    const baseline = (await listClientIdsNamed('it-leak')).length
 
     await killAllOtherClients()
 
@@ -875,7 +1026,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     // Give competing reconnection loops time to surface extra connections.
     await sleep(3000)
 
-    const settled = (await listOtherClientIds()).length
+    const settled = (await listClientIdsNamed('it-leak')).length
     assert.equal(
       settled,
       baseline,
@@ -888,7 +1039,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // Regression probe for AUDIT C4: quit() emits 'close', and the close
   // handler used to schedule a reconnection — disconnect() must be final.
   test('disconnect() stays disconnected (no self-resurrection)', { timeout: 30000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-final', logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:cycle:probe', '1'), 'OK')
@@ -900,7 +1051,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     assert.equal(client.client, null, 'internal client must remain null after disconnect()')
     assert.equal(client.isConnected, false, 'isConnected must remain false after disconnect()')
 
-    const remaining = (await listOtherClientIds()).length
+    const remaining = (await listClientIdsNamed('it-final')).length
     assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
 
     await assert.rejects(client.set('it:cycle:probe', '2'), {
