@@ -139,6 +139,8 @@ Reconnection is handled entirely by the ioredis driver — there is exactly one 
 
 ### Advanced (ioredis passthrough)
 
+**Every option not listed as this library's own is forwarded to ioredis untouched** — `tls`, `connectTimeout`, `keepAlive`, `family`, `path`, `natMap`, `enableOfflineQueue` and anything the driver adds later. These are the ones with a default worth knowing:
+
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `commandTimeout` | `number` | — | Per-command timeout (ms). No default on purpose: it would break blocking reads |
@@ -147,7 +149,32 @@ Reconnection is handled entirely by the ioredis driver — there is exactly one 
 | `autoResubscribe` | `boolean` | `true` | Resubscribe channels after reconnection |
 | `autoResendUnfulfilledCommands` | `boolean` | `true` | Resend in-flight commands after reconnection |
 | `lazyConnect` | `boolean` | `true` | Do not connect on instantiation |
+| `enableOfflineQueue` | `boolean` | `true` | Queue commands issued while the connection is down. Set `false` to make the driver reject them instead of holding them until it recovers |
 | `logger` | `object` | built-in | See [Logging](#logging) |
+
+`retryStrategy` and `reconnectOnError` are managed by this library and cannot be overridden — reconnection is the driver's job *through those hooks*, and replacing them would silently disable the documented retry policy. Use `maxRetryAttempts`, `baseRetryDelay` and `maxRetryDelay` instead.
+
+Malformed options fail at construction rather than at the first command under load:
+
+```javascript
+new RedisClient({ healthCheckTimeout: 'soon' })
+// RedisClientError: healthCheckTimeout must be a non-negative number (got "soon"). [INVALID_OPTION]
+```
+
+### TLS and managed providers
+
+Managed Redis (Upstash, Redis Cloud, Azure Cache, ElastiCache with encryption in transit) requires TLS. Pass `tls` and it goes straight to the driver:
+
+```javascript
+const redis = new RedisClient({
+  host: 'my-db.upstash.io',
+  port: 6380,
+  password: process.env.REDIS_PASSWORD,
+  tls: {} // an empty object is enough for a provider with a public certificate
+})
+```
+
+For a private CA, `tls` takes the usual Node TLS options (`ca`, `cert`, `key`, `servername`).
 
 ## Events
 

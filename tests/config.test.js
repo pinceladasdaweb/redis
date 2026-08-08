@@ -26,6 +26,95 @@ describe('redis config', () => {
     assert.equal(options.role, 'slave')
   })
 
+  // Regression: an allowlist used to drop every option it did not know,
+  // silently including tls — which meant no managed Redis (Upstash,
+  // ElastiCache in-transit, Azure Cache) could be reached at all.
+  test('forwards every driver option, including the ones added after this code', () => {
+    const options = new RedisConfig({
+      logger: quietLogger,
+      host: 'cache.upstash.io',
+      port: 6380,
+      tls: { servername: 'cache.upstash.io' },
+      family: 6,
+      keepAlive: 5000,
+      path: '/tmp/redis.sock',
+      enableOfflineQueue: false,
+      natMap: { '10.0.0.1:6379': { host: '203.0.113.1', port: 6379 } },
+      anOptionInventedTomorrow: 'passes through'
+    }).getOptions()
+
+    assert.deepEqual(options.tls, { servername: 'cache.upstash.io' })
+    assert.equal(options.family, 6)
+    assert.equal(options.keepAlive, 5000)
+    assert.equal(options.path, '/tmp/redis.sock')
+    assert.equal(options.enableOfflineQueue, false)
+    assert.deepEqual(options.natMap, { '10.0.0.1:6379': { host: '203.0.113.1', port: 6379 } })
+    assert.equal(options.anOptionInventedTomorrow, 'passes through')
+  })
+
+  test('keeps the library options to itself', () => {
+    const options = new RedisConfig({
+      logger: quietLogger,
+      clock: {},
+      maxRetryAttempts: 5,
+      baseRetryDelay: 10,
+      maxRetryDelay: 100,
+      healthCheckInterval: 1000,
+      healthCheckTimeout: 100
+    }).getOptions()
+
+    for (const name of ['logger', 'clock', 'maxRetryAttempts', 'baseRetryDelay', 'maxRetryDelay', 'healthCheckInterval', 'healthCheckTimeout']) {
+      assert.equal(name in options, false, `${name} is ours and must not reach the driver`)
+    }
+  })
+
+  test('the reconnection hooks stay under library control', () => {
+    const config = new RedisConfig({ logger: quietLogger })
+    const options = config.getOptions()
+
+    assert.equal(typeof options.retryStrategy, 'function')
+    assert.equal(typeof options.reconnectOnError, 'function')
+
+    for (const hook of ['retryStrategy', 'reconnectOnError']) {
+      assert.throws(() => new RedisConfig({ logger: quietLogger, [hook]: () => 1 }), {
+        name: 'RedisClientError',
+        code: 'INVALID_OPTION',
+        operation: 'constructor'
+      }, `overriding ${hook} would silently disable the documented retry policy`)
+    }
+  })
+
+  test('rejects malformed numeric options at construction', () => {
+    for (const [name, value] of [
+      ['healthCheckTimeout', 'soon'],
+      ['healthCheckInterval', -1],
+      ['baseRetryDelay', NaN],
+      ['maxRetryDelay', null],
+      ['commandTimeout', -5],
+      ['connectTimeout', '3000']
+    ]) {
+      assert.throws(() => new RedisConfig({ logger: quietLogger, [name]: value }), {
+        code: 'INVALID_OPTION'
+      }, `${name}: ${JSON.stringify(value)} must not reach the driver`)
+    }
+
+    // Infinity is meaningful for the attempt limit, and zero is legitimate.
+    assert.doesNotThrow(() => new RedisConfig({ logger: quietLogger, maxRetryAttempts: Infinity }))
+    assert.doesNotThrow(() => new RedisConfig({ logger: quietLogger, maxRetryAttempts: 0, healthCheckInterval: 0 }))
+  })
+
+  test('sentinel mode demands the master group name', () => {
+    assert.throws(() => new RedisConfig({ logger: quietLogger, sentinels: [{ host: 's', port: 26379 }] }), {
+      code: 'INVALID_OPTION'
+    }, 'sentinels without name resolves nothing')
+
+    assert.doesNotThrow(() => new RedisConfig({
+      logger: quietLogger,
+      sentinels: [{ host: 's', port: 26379 }],
+      name: 'mymaster'
+    }))
+  })
+
   test('driver defaults follow the documented table', () => {
     const options = new RedisConfig({ logger: quietLogger }).getOptions()
 

@@ -64,7 +64,22 @@ try {
   const usage = `
     import RedisClient, { ScoredMember } from '@pinceladasdaweb/redis'
 
-    const redis = new RedisClient({ host: 'localhost', port: 6379 })
+    // Driver options are typed, not swallowed by an index signature: tls must
+    // be accepted, a typo must not, and the reserved hooks must be rejected.
+    const redis = new RedisClient({
+      host: 'localhost',
+      port: 6380,
+      tls: { servername: 'localhost' },
+      connectTimeout: 3000,
+      enableOfflineQueue: false
+    })
+
+    // @ts-expect-error a misspelled option must still be a type error
+    new RedisClient({ hots: 'localhost' })
+
+    // @ts-expect-error reconnection hooks belong to the library
+    new RedisClient({ retryStrategy: () => 1 })
+
     export const top = (): Promise<ScoredMember[]> =>
       redis.zrevrange('board', 0, 9, { withScores: true })
   `
