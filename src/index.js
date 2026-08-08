@@ -10,6 +10,25 @@ import Logger, { createLogger } from './utils/logger.js'
 import { parseScore, parseScoredMembers } from './utils/scores.js'
 import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
 
+// Which notify-keyspace-events class each event needs, for the ones worth
+// naming. Anything else is only checked for the 'E' (key-event) flag.
+const KEY_EVENT_CLASSES = {
+  expired: 'x',
+  evicted: 'e',
+  set: '$',
+  del: 'g',
+  rename_from: 'g',
+  rename_to: 'g',
+  expire: 'g',
+  lpush: 'l',
+  rpush: 'l',
+  sadd: 's',
+  hset: 'h',
+  zadd: 'z',
+  xadd: 't',
+  new: 'n'
+}
+
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
 // always reached through getters — never captured references.
@@ -664,6 +683,52 @@ class RedisClient extends EventEmitter {
     return this.subscriptions.punsubscribe(pattern)
   }
 
+  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  async keyspaceNotifications () {
+    const [, flags] = await this.executeCommand('config', 'GET', 'notify-keyspace-events')
+
+    return flags ?? ''
+  }
+
+  // Keyspace events only exist if the server was configured to emit them, and
+  // a subscription to a silent channel looks exactly like one that works.
+  // Probing turns that silence into an error that says what to enable.
+  async subscribeToKeyEvents (event, handler, options = {}) {
+    await this.#assertKeyspaceNotifications(event)
+
+    const db = options.db ?? this.config.db ?? 0
+
+    return this.subscribe(`__keyevent@${db}__:${event}`, handler)
+  }
+
+  async #assertKeyspaceNotifications (event) {
+    let flags
+
+    try {
+      flags = await this.keyspaceNotifications()
+    } catch (err) {
+      // Managed providers commonly block CONFIG. Refusing to subscribe would
+      // be worse than subscribing without the guarantee.
+      this.logger.warn(`Could not read notify-keyspace-events (${err.message}). Subscribing without verifying it.`)
+
+      return
+    }
+
+    const required = KEY_EVENT_CLASSES[event]
+    const missing = []
+
+    if (!flags.includes('E')) missing.push('E')
+    if (required && !flags.includes('A') && !flags.includes(required)) missing.push(required)
+
+    if (missing.length > 0) {
+      throw new RedisClientError(
+        `Keyspace notifications are not enabled for '${event}': notify-keyspace-events is "${flags}", missing "${missing.join('')}". Enable it with CONFIG SET notify-keyspace-events "${flags}${missing.join('')}".`,
+        'subscribeToKeyEvents',
+        'KEYSPACE_NOTIFICATIONS_DISABLED'
+      )
+    }
+  }
+
   // Single-instance distributed lock (SET NX PX + token-checked Lua release).
   async acquireLock (name, options) {
     return this.locks.acquire(name, options)
@@ -819,6 +884,22 @@ class RedisClient extends EventEmitter {
   // in the group's pending list forever.
   async xack (key, group, ...ids) {
     return this.executeCommand('xack', key, group, ...ids)
+  }
+
+  // Sweeps the group's pending list for entries idle longer than
+  // minIdleTime and hands them to `consumer` — the recovery path for a
+  // consumer that died holding deliveries. The reply is positional
+  // ([cursor, entries, deleted]); it is returned as named fields so callers
+  // do not index into it.
+  async xautoclaim (key, group, consumer, minIdleTime, start = '0-0', options = {}) {
+    const args = [key, group, consumer, minIdleTime, start]
+
+    if (options.count != null) args.push('COUNT', options.count)
+    if (options.justId) args.push('JUSTID')
+
+    const [cursor, entries, deleted] = await this.executeCommand('xautoclaim', ...args)
+
+    return { cursor, entries: entries ?? [], deleted: deleted ?? [] }
   }
 
   async xclaim (key, group, consumer, minIdleTime, ...ids) {

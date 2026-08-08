@@ -36,7 +36,7 @@ export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' |
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
@@ -91,6 +91,20 @@ export interface StreamPendingOptions {
   end?: string
   count?: number
   consumer?: string
+}
+
+export interface StreamAutoClaimOptions {
+  count?: number
+  /** Return only the ids, without the field/value payloads. */
+  justId?: boolean
+}
+
+export interface AutoClaimResult {
+  /** Where to resume the sweep; '0-0' means the pending list was covered. */
+  cursor: string
+  entries: StreamEntry[]
+  /** Ids that were pending for entries no longer in the stream. */
+  deleted: string[]
 }
 
 export type StreamEntry = [id: string, fields: string[]]
@@ -280,6 +294,16 @@ export declare class RedisClient extends EventEmitter {
   psubscribe (pattern: string, handler?: PubSubHandler): Promise<unknown>
   punsubscribe (pattern: string): Promise<unknown>
 
+  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  keyspaceNotifications (): Promise<string>
+  /**
+   * Subscribes to `__keyevent@<db>__:<event>` after checking the server is
+   * configured to emit it — otherwise a silent channel would be
+   * indistinguishable from a working one. Rejects with
+   * KEYSPACE_NOTIFICATIONS_DISABLED, naming the CONFIG SET that fixes it.
+   */
+  subscribeToKeyEvents (event: string, handler?: PubSubHandler, options?: { db?: number }): Promise<unknown>
+
   /** Single-instance lock (SET NX PX + token-checked Lua release). Not Redlock. */
   acquireLock (name: string, options?: LockOptions): Promise<Lock>
   withLock<T> (name: string, fn: (lock: Lock) => T | Promise<T>): Promise<T>
@@ -299,6 +323,13 @@ export declare class RedisClient extends EventEmitter {
   xpending (key: string, group: string, options?: StreamPendingOptions): Promise<unknown>
   /** Acknowledges entries so they leave the consumer group's pending list. */
   xack (key: string, group: string, ...ids: string[]): Promise<number>
+  /**
+   * Sweeps the group's pending list for entries idle longer than
+   * `minIdleTime` and hands them to `consumer` — the recovery path for a
+   * consumer that died holding deliveries. Returned as named fields instead
+   * of the positional reply.
+   */
+  xautoclaim (key: string, group: string, consumer: string, minIdleTime: number, start?: string, options?: StreamAutoClaimOptions): Promise<AutoClaimResult>
   xclaim (key: string, group: string, consumer: string, minIdleTime: number, ...ids: string[]): Promise<StreamEntry[]>
 
   /** SCAN-based dump of the (prefixed) keyspace: [{ key: value }, ...]. Skips non-string keys. */

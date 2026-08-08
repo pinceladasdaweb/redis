@@ -221,6 +221,124 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // A consumer that dies holding deliveries leaves them pending forever;
+  // XAUTOCLAIM is how another worker sweeps them up.
+  test('xautoclaim recovers entries abandoned by a dead consumer', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'claim:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.xadd('jobs', '*', 'task', 'one')
+    await client.xadd('jobs', '*', 'task', 'two')
+    await client.xgroup('CREATE', 'jobs', 'workers', '0', true)
+
+    // worker-1 takes both and then "dies" without acknowledging.
+    const taken = await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['jobs', '>'])
+    assert.equal(taken[0][1].length, 2)
+    assert.equal((await client.xpending('jobs', 'workers'))[0], 2, 'both are stuck pending')
+
+    // worker-2 sweeps anything idle, however briefly.
+    const swept = await client.xautoclaim('jobs', 'workers', 'worker-2', 0)
+
+    assert.equal(swept.entries.length, 2, 'the abandoned work is handed over')
+    assert.equal(swept.cursor, '0-0', 'a full sweep ends back at the start')
+    assert.deepEqual(swept.deleted, [])
+
+    await client.xack('jobs', 'workers', ...swept.entries.map(([id]) => id))
+    assert.equal((await client.xpending('jobs', 'workers'))[0], 0, 'and the group is settled again')
+
+    await client.xgroup('DESTROY', 'jobs', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  // The lock's Lua scripts are cached by SHA on the server, and that cache
+  // dies with a restart or a failover. Proving the reload works is the
+  // difference between "ioredis probably handles it" and knowing.
+  test('locking survives the script cache being wiped (NOSCRIPT)', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const lock = await client.acquireLock('script-cache', { ttl: 10000 })
+    assert.equal(await lock.extend(10000), true)
+
+    // Exactly what a restarted server looks like to a client that already
+    // registered its scripts.
+    await admin.script('FLUSH')
+
+    assert.equal(await lock.extend(10000), true, 'extend must reload the script instead of failing')
+    assert.equal(await lock.release(), true, 'and so must release')
+
+    const again = await client.acquireLock('script-cache')
+    assert.equal(await again.release(), true)
+
+    await client.disconnect()
+  })
+
+  // Pipelines answer positionally: one failing command must not shift the
+  // replies of its neighbours.
+  test('a failing command in a pipeline does not desynchronize the replies', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'pipe:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.lpush('list', 'not-a-counter')
+
+    const transaction = await client.multi()
+    const results = await transaction
+      .set('first', 'ok')
+      .incr('list') // WRONGTYPE: fails in the middle
+      .set('third', 'ok')
+      .exec()
+
+    assert.equal(results.length, 3, 'every command still reports back')
+    assert.deepEqual(results[0], [null, 'OK'])
+    assert.equal(results[1][0] instanceof Error, true, 'the failure stays in its own slot')
+    assert.match(results[1][0].message, /WRONGTYPE/)
+    assert.deepEqual(results[2], [null, 'OK'], 'the command after the failure keeps its position')
+
+    assert.equal(await client.get('first'), 'ok')
+    assert.equal(await client.get('third'), 'ok', 'a runtime error does not roll the batch back')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('keyspace events are delivered once enabled, and refused when they are not', { timeout: 20000 }, async () => {
+    const [, original] = await admin.config('GET', 'notify-keyspace-events')
+
+    try {
+      await admin.config('SET', 'notify-keyspace-events', '')
+
+      const disabled = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+      await disabled.connect()
+
+      await assert.rejects(disabled.subscribeToKeyEvents('expired', () => {}), {
+        code: 'KEYSPACE_NOTIFICATIONS_DISABLED'
+      }, 'a channel that cannot speak must not look like one that works')
+      await disabled.disconnect()
+
+      // Now the server is configured to emit expiration events.
+      await admin.config('SET', 'notify-keyspace-events', 'Ex')
+
+      const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+      await client.connect()
+
+      const expired = []
+      await client.subscribeToKeyEvents('expired', (key) => expired.push(key))
+
+      await client.setex('it:vanishing', 1, 'value')
+      await waitFor(() => expired.includes('it:vanishing'), {
+        timeout: 8000,
+        message: 'the expiration event to arrive'
+      })
+
+      await client.disconnect()
+    } finally {
+      await admin.config('SET', 'notify-keyspace-events', original)
+    }
+  })
+
   // Regression: a blocking read used to survive disconnect() — its promise
   // never settled and its dedicated socket stayed open on the server, so a
   // graceful shutdown hung forever.

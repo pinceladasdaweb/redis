@@ -37,9 +37,14 @@ await redis.publish('audit:logout', 'user 42 signed out')
 // Delivery is asynchronous: give the subscriber a moment.
 await new Promise((resolve) => setTimeout(resolve, 200))
 
-// Publishing to nobody is not an error — it returns the subscriber count.
+// Pub/sub has no delivery receipt: publish returns how many subscribers got
+// the message, and zero is not an error — it means nobody was listening and
+// the message is gone. Check the count when that matters.
 const listeners = await redis.publish('orders:new', '{"id":"ORD-2","total":"10.00"}')
 console.log(`  subscribers reached → ${listeners}`)
+
+const nobody = await redis.publish('orders:nobody-listens', 'lost')
+console.log(`  publish to nobody   → ${nobody} receivers (silently dropped)`)
 
 await new Promise((resolve) => setTimeout(resolve, 100))
 
@@ -49,6 +54,7 @@ await new Promise((resolve) => setTimeout(resolve, 100))
 console.log(`  after unsubscribe   → ${received.length} orders received (ORD-3 ignored)`)
 
 assert.deepEqual(received, ['ORD-1', 'ORD-2'], 'unsubscribing must stop delivery')
+assert.equal(nobody, 0, 'publishing to an empty channel reports zero receivers')
 assert.deepEqual(patternMatches.sort(), ['audit:login', 'audit:logout'])
 
 // disconnect() releases the subscriber connection too.

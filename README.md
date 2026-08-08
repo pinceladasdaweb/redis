@@ -203,6 +203,8 @@ All library errors are `RedisClientError` instances carrying `operation` and a s
 | `UNSUPPORTED_OPERATION` | The method cannot work safely on the shared connection (`watch`/`unwatch`) |
 | `LOCK_NOT_ACQUIRED` | `acquireLock`/`withLock` could not obtain the lock within the configured retries |
 | `INVALID_ARGUMENT` | A required argument is missing or malformed (e.g. `xtrim` without a count) |
+| `INVALID_OPTION` | A constructor option is malformed or is one the library manages |
+| `KEYSPACE_NOTIFICATIONS_DISABLED` | The server is not configured to emit the requested key event |
 | `REDIS_CLIENT_ERROR` | Generic library error |
 
 ```javascript
@@ -311,6 +313,30 @@ await redis.punsubscribe('logs.*')
 
 Messages also arrive as facade events (`message`, `pmessage`) if you prefer a single listener. Handler rejections are caught and logged — they never crash the process. Note: channels are not keys, so `keyPrefix` does not apply to them.
 
+**Pub/Sub has no delivery receipt.** `publish` returns how many subscribers received the message, and **zero is not an error** — it means nobody was listening and the message is gone. If that matters, check the count:
+
+```javascript
+const receivers = await redis.publish('orders:new', payload)
+if (receivers === 0) {
+  logger.warn('no consumer online; event dropped')
+}
+```
+
+### Keyspace events
+
+Redis only emits keyspace events if the server was configured to, and subscribing to a channel that will never speak looks exactly like a subscription that works. `subscribeToKeyEvents` probes the configuration first and tells you what to enable:
+
+```javascript
+await redis.subscribeToKeyEvents('expired', (key) => {
+  console.log(`${key} expired`)
+})
+// RedisClientError: Keyspace notifications are not enabled for 'expired':
+// notify-keyspace-events is "", missing "Ex". Enable it with
+// CONFIG SET notify-keyspace-events "Ex".   [KEYSPACE_NOTIFICATIONS_DISABLED]
+```
+
+Read the current flags with `keyspaceNotifications()`. Managed providers often block `CONFIG`; when the probe cannot run, the subscription proceeds with a warning rather than being refused.
+
 Each channel/pattern holds **one handler** — subscribing again replaces it (last one wins). Use the `message`/`pmessage` events when you need fan-out to multiple listeners. If the subscriber connection permanently gives up (finite `maxRetryAttempts` exhausted), a warning is logged and the next `subscribe()` starts a fresh connection — resubscribe to restore delivery.
 
 ## Distributed locking
@@ -398,6 +424,14 @@ All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xle
 - **`xgroup` respects each subcommand's arity** — `CREATE` (with optional `MKSTREAM`), `DESTROY`, `SETID`, `CREATECONSUMER`, `DELCONSUMER`.
 - **`keyPrefix` is honored everywhere**, including `xgroup` and `xinfo` — whose key sits after a subcommand, a position the underlying driver does not prefix on its own.
 
+Entries stay in the group's pending list until acknowledged, which is what makes recovery possible: `xack` settles them, and **`xautoclaim` sweeps up whatever a dead consumer left behind**, returning named fields instead of the positional reply:
+
+```javascript
+const { cursor, entries, deleted } = await redis.xautoclaim('events', 'workers', 'worker-2', 60000)
+// entries: deliveries idle for over a minute, now owned by worker-2
+// cursor: '0-0' once the pending list has been covered
+```
+
 Consumer groups, acknowledgements and recovery of stalled entries are covered end to end in [example 12](examples/12%20-%20streams).
 
 ```javascript
@@ -428,7 +462,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Sorted sets**: `zadd`, `zscore`, `zincrby`, `zcard`, `zcount`, `zrank`, `zrevrank`, `zrem`, `zrange`, `zrevrange`, `zrangebyscore`, `zremrangebyrank`, `zremrangebyscore`, `zpopmin`, `zpopmax` — see [Sorted sets](#sorted-sets-and-rankings)
 **Keys**: `del`, `exists`, `type`, `rename`, `renamenx`, `persist`, `expire`, `ttl`, `sort`
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
-**Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`
+**Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `subscribeToKeyEvents`, `keyspaceNotifications`
 **Locking**: `acquireLock`, `withLock`
 **Streams**: see [Streams](#streams)
 **Scan**: `getAllStream(pattern)`
