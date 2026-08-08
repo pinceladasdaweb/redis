@@ -35,7 +35,8 @@
     "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'",
     "check:types": "tsc --noEmit --strict index.d.ts",
     "test:mutation": "stryker run",
-    "examples": "node examples/run-all.mjs"
+    "examples": "node examples/run-all.mjs",
+    "verify:package": "node scripts/verify-package.mjs"
   },
   "engines": {
     "node": ">=22"

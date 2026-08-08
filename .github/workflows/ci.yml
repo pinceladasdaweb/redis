@@ -58,3 +58,8 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      # Validate the artifact, not the repo: pack it, install it in a clean
+      # project and import it through both module systems.
+      - name: Verify the published package
+        run: npm run verify:package
