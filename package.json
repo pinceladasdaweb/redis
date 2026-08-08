@@ -35,6 +35,7 @@
     "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'",
     "check:types": "tsc --noEmit --strict index.d.ts",
     "test:mutation": "stryker run",
+    "mutation:summary": "node scripts/summarize-mutation.mjs",
     "examples": "node examples/run-all.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "test:cluster": "REDIS_CLUSTER_INTEGRATION=1 node --test 'tests/**/*.test.js'"
@@ -59,7 +60,7 @@
     "health-check",
     "json"
   ],
-  "author": "Pedro Rogério <pinceladasdaweb@hotmail.com>",
+  "author": "Pedro Rog\u00e9rio <pinceladasdaweb@hotmail.com>",
   "license": "MIT",
   "description": "A resilient Redis client for Node.js built on ioredis, with automatic reconnection, health checks and JSON helpers.",
   "devDependencies": {

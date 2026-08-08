@@ -353,6 +353,16 @@ if (receivers === 0) {
 }
 ```
 
+**Reconnection is fast, not transparent.** Subscriptions come back on their own, but anything published while the subscriber was away is gone — Redis pub/sub queues nothing. Measured here by publishing a sequence every 5ms and killing the subscriber server-side:
+
+| Run | Published | Received | Lost |
+|---|---|---|---|
+| 1 | 419 | 400 | 19 (~95ms) |
+| 2 | 426 | 406 | 20 (~100ms) |
+| 3 | 424 | 404 | 20 (~100ms) |
+
+The window tracks your reconnect backoff (`baseRetryDelay`/`maxRetryDelay`), so you can shrink it — never close it. If losing those messages is unacceptable, pub/sub is the wrong tool: use [Streams](#streams) with a consumer group, where entries wait in the pending list until acknowledged.
+
 ### Keyspace events
 
 Redis only emits keyspace events if the server was configured to, and subscribing to a channel that will never speak looks exactly like a subscription that works. `subscribeToKeyEvents` probes the configuration first and tells you what to enable:
@@ -461,7 +471,27 @@ Entries stay in the group's pending list until acknowledged, which is what makes
 const { cursor, entries, deleted } = await redis.xautoclaim('events', 'workers', 'worker-2', 60000)
 // entries: deliveries idle for over a minute, now owned by worker-2
 // cursor: '0-0' once the pending list has been covered
+// deleted: entries that were pending but whose data is GONE — see below
 ```
+
+**`deleted` is lost work, not bookkeeping.** `XDEL` removes an entry from the stream but leaves it in the group's pending list, where no consumer can ever process it. `xautoclaim` is what clears those ghosts out, and it reports them here. Ignore the field and the loss is silent.
+
+### Retry budgets: what `delivery_count` actually counts
+
+`xpending` with a range returns `[id, consumer, idleMs, deliveryCount]` per entry. Measured against a real Redis 7.4 rather than assumed:
+
+| Action | `delivery_count` |
+|---|---|
+| First delivery via `xreadgroup(..., ['s', '>'])` | **1** — not 0 |
+| Re-reading your own pending list with `'0'` | **+1** |
+| `xclaim` / `xautoclaim` | **+1** |
+| The same two with `justId: true` | **unchanged** |
+| A server restart | **preserved** |
+
+Two of these bite:
+
+- **The recovery read costs budget.** Re-reading your own pending entries with id `'0'` — what every consumer does on startup — counts as a delivery. A crash loop burns through a retry budget without a single new delivery. Use `justId: true` to inspect a pending entry without spending.
+- **After a restart, the two inputs disagree.** `delivery_count` survives; the idle clock resets to zero. A policy written purely against `minIdleTime` silently forgets everything the moment the server bounces, so use the count for "how many times has this failed" and idle only for "is the owner gone".
 
 Consumer groups, acknowledgements and recovery of stalled entries are covered end to end in [example 12](examples/12%20-%20streams).
 

@@ -275,6 +275,99 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // Probed against a real Redis 7.4 before this test existed, because a fake
+  // written by us would only have confirmed what we already believed. Raw
+  // output, `delivery_count` per entry:
+  //
+  //   after XREADGROUP '>' (first delivery)          -> 1     (NOT 0)
+  //   after XREADGROUP '0' (re-reading own PEL)      -> 2     (counts as a delivery!)
+  //   after XCLAIM                                   -> 3
+  //   after XCLAIM ... JUSTID                        -> unchanged
+  //   after XAUTOCLAIM                               -> +1
+  //   after XAUTOCLAIM ... JUSTID                    -> unchanged
+  //   after a real server restart (SAVE + restart)   -> preserved
+  //   idle after that same restart                   -> reset to ~0
+  //
+  // Two of those are traps. The recovery pattern every streams consumer runs
+  // on startup — re-read my own pending with id '0' — BURNS retry budget, so
+  // a crash loop exhausts it without a single new delivery. And after a
+  // restart the two inputs to a retry policy disagree: the count survives,
+  // the idle clock does not.
+  test('delivery_count counts deliveries, and JUSTID is how you look without spending', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'dc:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.xadd('jobs', '*', 'task', 'one')
+    await client.xgroup('CREATE', 'jobs', 'workers', '0', true)
+
+    const countOf = async () => {
+      const [entry] = await client.xpending('jobs', 'workers', { start: '-', end: '+', count: 10 })
+
+      return entry[3]
+    }
+
+    await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['jobs', '>'])
+    assert.equal(await countOf(), 1, 'the first delivery already counts as one')
+
+    // The standard restart-recovery read, and it is not free.
+    await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['jobs', '0'])
+    assert.equal(await countOf(), 2, 're-reading your own pending list spends budget')
+
+    await client.xautoclaim('jobs', 'workers', 'worker-2', 0, '0-0', { justId: true })
+    assert.equal(await countOf(), 2, 'JUSTID hands the entry over without spending')
+
+    await client.xautoclaim('jobs', 'workers', 'worker-3', 0)
+    assert.equal(await countOf(), 3, 'a normal claim does spend')
+
+    await client.xgroup('DESTROY', 'jobs', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  // Probed first as well. XDEL removes the entry from the stream but leaves
+  // it in the group's pending list — a ghost no consumer can ever process:
+  //
+  //   pending before XDEL        -> [id-0, id-1, id-2]
+  //   after XDEL id-1            -> [id-0, id-1, id-2]   (still pending!)
+  //   XAUTOCLAIM entries         -> [id-0, id-2]
+  //   XAUTOCLAIM deleted (3rd)   -> [id-1]
+  //   pending after the sweep    -> [id-0, id-2]
+  //
+  // So `deleted` is not bookkeeping: it is the list of work that is GONE, and
+  // the sweep is what clears the ghosts out of the PEL. A caller that ignores
+  // the field loses entries silently — the same class as PUBLISH with zero
+  // receivers.
+  test('xautoclaim reports entries whose data was deleted and clears them from the PEL', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'ghost:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    const ids = []
+    for (const task of ['one', 'two', 'three']) {
+      ids.push(await client.xadd('jobs', '*', 'task', task))
+    }
+
+    await client.xgroup('CREATE', 'jobs', 'workers', '0', true)
+    await client.xreadgroup('workers', 'dead-worker', { count: 10 }, ['jobs', '>'])
+
+    await client.xdel('jobs', ids[1])
+    assert.equal(
+      (await client.xpending('jobs', 'workers'))[0], 3,
+      'deleting the entry does NOT take it out of the pending list'
+    )
+
+    const swept = await client.xautoclaim('jobs', 'workers', 'live-worker', 0)
+
+    assert.deepEqual(swept.entries.map(([id]) => id), [ids[0], ids[2]], 'only the surviving entries are handed over')
+    assert.deepEqual(swept.deleted, [ids[1]], 'and the lost one is reported, not swallowed')
+    assert.equal((await client.xpending('jobs', 'workers'))[0], 2, 'the ghost is gone from the PEL')
+
+    await client.xgroup('DESTROY', 'jobs', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
   // The lock's Lua scripts are cached by SHA on the server, and that cache
   // dies with a restart or a failover. Proving the reload works is the
   // difference between "ioredis probably handles it" and knowing.
@@ -468,16 +561,34 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   })
 
   // The facade is an EventEmitter: connection lifecycle is observable.
-  test('emits connection lifecycle events across a server-side kill', { timeout: 30000 }, async () => {
+  // Probed before this test was written, because presence is not the contract
+  // — order is. Applications wire on('close', pause) / on('ready', resume),
+  // and a ready that arrives before its own close inverts their state. Raw
+  // sequence from a real CLIENT KILL:
+  //
+  //       6ms  ready           (connect)
+  //      12ms  close           (the kill)
+  //      12ms  reconnecting
+  //     116ms  ready           (recovered)
+  //    2516ms  close           (disconnect)
+  //    2517ms  end
+  //
+  // And the thing the probe settled that no fake would have: a server-side
+  // kill emits NO connectionError. The socket closes cleanly from the
+  // client's side, so anyone alerting on connectionError is blind to exactly
+  // the failure they think they are watching.
+  test('emits the connection lifecycle in order across a server-side kill', { timeout: 30000 }, async () => {
     const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
     const events = []
+    const errors = []
 
     for (const name of ['ready', 'close', 'reconnecting', 'end']) {
       client.on(name, () => events.push(name))
     }
+    client.on('connectionError', (err) => errors.push(err))
 
     await client.connect()
-    assert.ok(events.includes('ready'), 'ready must fire on connect')
+    assert.deepEqual(events, ['ready'], 'connect emits ready, and nothing else')
 
     await client.set('it:events', '1')
     await waitFor(async () => (await listOtherClientIds()).length >= 1, {
@@ -488,11 +599,27 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await waitFor(async () => events.filter((e) => e === 'ready').length >= 2, {
       message: 'a second ready after the server-side kill'
     })
-    assert.ok(events.includes('close'), 'close must fire when the connection drops')
-    assert.ok(events.includes('reconnecting'), 'reconnecting must fire during recovery')
 
     await client.disconnect()
-    assert.ok(events.includes('end'), 'end must fire after disconnect()')
+    await waitFor(async () => events.includes('end'), { message: 'end after disconnect()' })
+
+    // Repetitions are allowed (the driver may bounce more than once); an
+    // inversion is not.
+    const positionOf = (name) => events.indexOf(name)
+    const recovery = events.indexOf('ready', 1)
+
+    assert.ok(positionOf('close') > 0, 'close fires when the connection drops')
+    assert.ok(
+      positionOf('close') < positionOf('reconnecting'),
+      `close must precede reconnecting, got ${JSON.stringify(events)}`
+    )
+    assert.ok(
+      positionOf('reconnecting') < recovery,
+      `reconnecting must precede the recovery ready, got ${JSON.stringify(events)}`
+    )
+    assert.equal(events.at(-1), 'end', 'end is last, and only after disconnect()')
+
+    assert.deepEqual(errors, [], 'a server-side kill is not an error event — do not alert on it')
 
     await client.del?.('it:events').catch(() => {})
   })
@@ -597,6 +724,73 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     }, { timeout: 20000, message: 'delivery to resume after the kill' })
 
     await client.disconnect()
+  })
+
+  // The test above proves delivery RESUMES. It does not — cannot — say what
+  // happens to whatever was published while the subscriber was away, because
+  // it publishes in a loop until something gets through, which routes around
+  // the gap instead of measuring it.
+  //
+  // Measured with a sequence published every 5ms across three runs:
+  //
+  //   run 1: published=419 received=400 lost=19  (~95ms window)
+  //   run 2: published=426 received=406 lost=20  (~100ms window)
+  //   run 3: published=424 received=404 lost=20  (~100ms window)
+  //
+  // Redis pub/sub is fire-and-forget: a message published while nobody is
+  // subscribed is not queued, it is dropped. Reconnection cannot be
+  // transparent, only fast. This test pins the part that IS a contract —
+  // the gap closes and stays closed — rather than the size of the window.
+  test('pub/sub loses messages published during the reconnect window, then recovers cleanly', { timeout: 30000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      connectionName: 'it-gap',
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      logger: quietLogger
+    })
+    await client.connect()
+
+    const seen = new Set()
+    await client.subscribe('it:gap', (message) => seen.add(Number(message)))
+
+    let published = 0
+    const publisher = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await publisher.connect()
+
+    const pump = setInterval(() => { publisher.publish('it:gap', String(++published)).catch(() => {}) }, 5)
+
+    try {
+      await waitFor(async () => seen.size >= 5, { message: 'delivery to start' })
+
+      await killAllOtherClients()
+      const killedAround = published
+
+      await waitFor(async () => published > killedAround + 10 && [...seen].some((n) => n > killedAround + 5), {
+        timeout: 20000,
+        message: 'delivery to resume after the kill'
+      })
+
+      // Everything published from here on must arrive: the window is a
+      // window, not a leak that keeps dripping.
+      const resumedAt = published
+      await waitFor(async () => published > resumedAt + 20, { message: 'more traffic after recovery' })
+      clearInterval(pump)
+      await sleep(300)
+
+      const lostAfterRecovery = []
+      for (let n = resumedAt + 2; n <= published - 2; n++) {
+        if (!seen.has(n)) lostAfterRecovery.push(n)
+      }
+
+      assert.deepEqual(lostAfterRecovery, [], 'once resubscribed, nothing may be dropped')
+      assert.ok(seen.size < published, 'and the kill did cost messages — pub/sub is fire-and-forget')
+    } finally {
+      clearInterval(pump)
+      await publisher.disconnect()
+      await client.disconnect()
+    }
   })
 
   // Review gap: releases go through Lua/defineCommand — this proves ioredis
@@ -1243,6 +1437,65 @@ describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER
   // cluster subscriber attaches to a single node. Subscribing the plain way
   // delivers one shard's events and looks exactly like one that works — so
   // this asserts events arriving from more than one master.
+  // The standalone suite proves the lock's Lua scripts survive SCRIPT FLUSH.
+  // That says nothing about a cluster, where the SHA cache is PER NODE and
+  // locks route by slot: a master that never ran the script answers NOSCRIPT.
+  // Probed first — a script loaded on 7001 reports EXISTS=1 there and 0 on
+  // both other masters, so the isolation is real and not an assumption.
+  test('locks survive a script cache wiped on one master only', { timeout: 40000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+
+    const masters = client.client.nodes('master')
+    assert.ok(masters.length >= 3, 'this test needs a multi-master cluster')
+
+    // Which master owns a given key, straight from the protocol.
+    const ownerOf = async (key) => {
+      const slot = await client.client.cluster('KEYSLOT', key)
+      const slots = await client.client.cluster('SLOTS')
+      const range = slots.find(([from, to]) => slot >= from && slot <= to)
+
+      return `${range[2][0]}:${range[2][1]}`
+    }
+
+    // Lock names that land on three different masters. The lock manager keys
+    // them as `lock:<name>`, and the client prefixes with 'ct:'.
+    const byOwner = new Map()
+    for (let i = 0; i < 200 && byOwner.size < 3; i++) {
+      const name = `noscript-${i}`
+      const owner = await ownerOf(`ct:lock:${name}`)
+
+      if (!byOwner.has(owner)) byOwner.set(owner, name)
+    }
+    assert.equal(byOwner.size, 3, 'the locks must be spread across all three masters')
+
+    const held = []
+    for (const name of byOwner.values()) {
+      held.push(await client.acquireLock(name, { ttl: 30000 }))
+    }
+
+    // A script is known to the node that ran it, and to no other.
+    const sha = await masters[0].script('LOAD', 'return 1')
+    const known = await Promise.all(masters.map(async (node) => (await node.script('EXISTS', sha))[0]))
+
+    assert.deepEqual(known, [1, 0, 0], 'the SHA cache lives on one node, not on the cluster')
+
+    // Wipe the cache of a single master and prove every lock still settles:
+    // ioredis has to reload the script on the node that answered NOSCRIPT.
+    await masters[0].script('FLUSH')
+
+    for (const lock of held) {
+      assert.equal(await lock.extend(30000), true, `extend must survive on '${lock.name}'`)
+    }
+
+    for (const lock of held) {
+      assert.equal(await lock.release(), true, `release must survive on '${lock.name}'`)
+    }
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
   test('keyspace events arrive from every master, not just one', { timeout: 30000 }, async () => {
     const client = createClusterClient()
     await client.connect()

@@ -653,6 +653,87 @@ describe('wire contract', () => {
     assert.equal(calls.some(([command]) => command === 'subscribe'), false, 'nothing may be subscribed to a channel that cannot speak')
   })
 
+  // The library calls `logger.debug?.()` in eight places. The `?.` is not
+  // decoration: pino, winston and bunyan all ship `debug`, but a hand-rolled
+  // three-level logger is a perfectly ordinary thing to inject, and without
+  // the guard every one of those call sites is a TypeError on the hot path.
+  test('a logger without debug() is not a crash', async () => {
+    const seen = []
+    const threeLevels = {
+      error: (message) => seen.push(['error', message]),
+      warn: (message) => seen.push(['warn', message]),
+      info: (message) => seen.push(['info', message])
+      // no debug, on purpose
+    }
+
+    const { redis, fake } = createClient({ logger: threeLevels })
+
+    fake.scanStream = () => ({
+      on (event, handler) {
+        if (event === 'data') queueMicrotask(() => handler(['a']))
+        if (event === 'end') queueMicrotask(handler)
+        return this
+      },
+      pause () {},
+      resume () {},
+      destroy () {}
+    })
+
+    // Paths that reach for debug: the scanner (twice), the lock, and the
+    // readiness gate rejecting a command.
+    await redis.getAllStream('*')
+    await redis.deleteByPattern('*')
+    await redis.acquireLock('l', { ttl: 1000 })
+
+    // And the readiness gate, on a client that was never connected.
+    const offline = new RedisClient({ logger: threeLevels })
+    await assert.rejects(offline.get('k'), { code: 'REDIS_UNAVAILABLE' })
+
+    assert.deepEqual(seen.filter(([level]) => level === 'error'), [], 'nothing crashed on the way')
+  })
+
+  // The class letters are load-bearing: each keyspace event only fires if the
+  // server has its class enabled, so a wrong letter here either refuses a
+  // subscription that would have worked or — worse — waves through one that
+  // will never speak. Only 'expired' had a test; the map has thirteen entries.
+  test('every keyspace event demands its own notify-keyspace-events class', async () => {
+    const cases = [
+      ['expired', 'x'], ['evicted', 'e'], ['set', '$'], ['del', 'g'],
+      ['rename_from', 'g'], ['rename_to', 'g'], ['expire', 'g'], ['lpush', 'l'],
+      ['rpush', 'l'], ['sadd', 's'], ['hset', 'h'], ['zadd', 'z'],
+      ['xadd', 't'], ['new', 'n']
+    ]
+
+    for (const [event, required] of cases) {
+      const { redis, fake } = createClient()
+
+      // 'E' alone is never enough: the class has to be there too.
+      fake.config = async () => ['notify-keyspace-events', 'E']
+
+      await assert.rejects(redis.subscribeToKeyEvents(event, () => {}), {
+        code: 'KEYSPACE_NOTIFICATIONS_DISABLED',
+        message: new RegExp(`missing "${required.replace('$', '\\$')}"`)
+      }, `'${event}' must demand class '${required}'`)
+
+      // With its class present it goes through...
+      fake.config = async () => ['notify-keyspace-events', `E${required}`]
+      await redis.subscribeToKeyEvents(event, () => {})
+
+      // ...and 'A' (all classes) satisfies every one of them.
+      fake.config = async () => ['notify-keyspace-events', 'EA']
+      await redis.subscribeToKeyEvents(event, () => {})
+    }
+  })
+
+  test('an unnamed event only needs the E flag', async () => {
+    const { redis, fake, calls } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', 'E']
+    await redis.subscribeToKeyEvents('json.set', () => {})
+
+    assert.deepEqual(calls.at(-1), ['subscribe', '__keyevent@0__:json.set'])
+  })
+
   test('keyspaceNotifications reports the flags, and an empty string when there are none', async () => {
     const { redis, fake } = createClient()
 

@@ -94,7 +94,8 @@ describe('redis config', () => {
       ['connectTimeout', '3000']
     ]) {
       assert.throws(() => new RedisConfig({ logger: quietLogger, [name]: value }), {
-        code: 'INVALID_OPTION'
+        code: 'INVALID_OPTION',
+        operation: 'constructor'
       }, `${name}: ${JSON.stringify(value)} must not reach the driver`)
     }
 
@@ -105,7 +106,8 @@ describe('redis config', () => {
 
   test('sentinel mode demands the master group name', () => {
     assert.throws(() => new RedisConfig({ logger: quietLogger, sentinels: [{ host: 's', port: 26379 }] }), {
-      code: 'INVALID_OPTION'
+      code: 'INVALID_OPTION',
+      operation: 'constructor'
     }, 'sentinels without name resolves nothing')
 
     assert.doesNotThrow(() => new RedisConfig({
@@ -259,12 +261,69 @@ describe('redis config', () => {
     assert.equal(options.clusterRetryStrategy(1), 20, 'exponential backoff, same as a single node')
   })
 
+  // Every name in the split is load-bearing. ioredis reads cluster-level
+  // options off the top and node-level ones out of `redisOptions`, and an
+  // option filed on the wrong side is not an error — it is silently ignored,
+  // which is the exact failure this library already removed once for `tls`.
+  // So each one gets asserted by name, not sampled.
+  test('every cluster-level option lands at cluster level, and nothing else does', () => {
+    const clusterLevel = {
+      dnsLookup: () => {},
+      enableOfflineQueue: false,
+      enableReadyCheck: false,
+      scaleReads: 'slave',
+      maxRedirections: 32,
+      retryDelayOnFailover: 111,
+      retryDelayOnClusterDown: 222,
+      retryDelayOnTryAgain: 333,
+      retryDelayOnMoved: 444,
+      slotsRefreshTimeout: 555,
+      slotsRefreshInterval: 666,
+      natMap: { '10.0.0.1:6379': { host: '127.0.0.1', port: 7001 } },
+      enableAutoPipelining: true,
+      lazyConnect: false
+    }
+    const nodeLevel = {
+      password: 'secret',
+      keyPrefix: 'app:',
+      connectTimeout: 250,
+      commandTimeout: 300,
+      tls: {},
+      family: 6,
+      connectionName: 'worker-1'
+    }
+
+    const options = new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      ...clusterLevel,
+      ...nodeLevel,
+      maxRetryAttempts: Infinity,
+      baseRetryDelay: 10,
+      maxRetryDelay: 100
+    }).getOptions()
+
+    for (const [name, value] of Object.entries(clusterLevel)) {
+      assert.deepEqual(options[name], value, `${name} belongs to the cluster itself`)
+      assert.equal(name in options.redisOptions, false, `${name} must NOT reach redisOptions`)
+    }
+
+    for (const [name, value] of Object.entries(nodeLevel)) {
+      assert.deepEqual(options.redisOptions[name], value, `${name} describes each node`)
+      assert.equal(name in options, false, `${name} must NOT sit at cluster level`)
+    }
+
+    // `nodes` is a constructor argument, never an option on either side.
+    assert.equal('nodes' in options, false)
+    assert.equal('nodes' in options.redisOptions, false)
+  })
+
   test('the cluster keeps database 0 and rejects anything else', () => {
     assert.throws(() => new RedisConfig({
       logger: quietLogger,
       nodes: [{ host: 'n1', port: 7001 }],
       db: 3
-    }), { code: 'INVALID_OPTION', message: /only supports database 0 \(got 3\)/ })
+    }), { code: 'INVALID_OPTION', operation: 'constructor', message: /only supports database 0 \(got 3\)/ })
 
     // Zero is the one valid value, and must not be read as "not provided".
     assert.doesNotThrow(() => new RedisConfig({
@@ -278,6 +337,7 @@ describe('redis config', () => {
     for (const nodes of [[], 'n1:7001', {}, null]) {
       assert.throws(() => new RedisConfig({ logger: quietLogger, nodes }), {
         code: 'INVALID_OPTION',
+        operation: 'constructor',
         message: /non-empty array of startup nodes/
       }, `nodes: ${JSON.stringify(nodes)} must be refused`)
     }
@@ -289,7 +349,7 @@ describe('redis config', () => {
       nodes: [{ host: 'n1', port: 7001 }],
       sentinels: [{ host: 's1', port: 26379 }],
       name: 'mymaster'
-    }), { code: 'INVALID_OPTION', message: /different topologies/ })
+    }), { code: 'INVALID_OPTION', operation: 'constructor', message: /different topologies/ })
   })
 
   // Construction only: lazyConnect means no socket is opened here, so this
