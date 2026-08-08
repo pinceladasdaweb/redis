@@ -342,9 +342,19 @@ describe('cluster keyspace-event fan-out', () => {
     }
 
     const masters = ports.map(makeMaster)
+    const replica = makeMaster(7101)
     const cluster = new EventEmitter()
 
-    cluster.nodes = () => masters
+    // Faithful to ioredis: nodes(role) filters. A fake that ignores the role
+    // would approve `nodes('')` — which returns masters AND replicas, so
+    // keyspace events would be delivered twice per shard.
+    cluster.nodes = (role) => {
+      if (role === 'master') return masters
+      if (role === 'slave') return [replica]
+      if (role === 'all' || role === undefined) return [...masters, replica]
+
+      throw new Error(`ioredis rejects an unknown role: ${JSON.stringify(role)}`)
+    }
     cluster.duplicate = () => {
       throw new Error('a cluster must never be duplicated for node-local events')
     }

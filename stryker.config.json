@@ -9,7 +9,8 @@
     "nodeArgs": [
       "--test",
       "--test-reporter=tap",
-      "--experimental-test-isolation=none"
+      "--experimental-test-isolation=none",
+      "--test-timeout=3000"
     ]
   },
   "mutate": [
@@ -36,5 +37,11 @@
   },
   "jsonReporter": {
     "fileName": "reports/mutation/mutation.json"
-  }
+  },
+  "appendPlugins": [
+    "./stryker-mutation-policy.js"
+  ],
+  "ignorers": [
+    "message-text"
+  ]
 }
