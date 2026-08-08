@@ -9,9 +9,10 @@ class ConnectionManager {
   #client = null
   #isConnected = false
 
-  constructor ({ redisConfig, logger, emit }) {
+  constructor ({ redisConfig, logger, clock, emit }) {
     this.redisConfig = redisConfig
     this.logger = logger
+    this.clock = clock
     this.emit = emit
   }
 
@@ -127,10 +128,10 @@ class ConnectionManager {
     const ended = client.status === 'end'
       ? Promise.resolve()
       : new Promise((resolve) => {
-        const timer = setTimeout(resolve, 2000)
+        const timer = this.clock.setTimeout(resolve, 2000)
 
         client.once('end', () => {
-          clearTimeout(timer)
+          this.clock.clearTimeout(timer)
           resolve()
         })
       })

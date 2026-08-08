@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { createClock } from './utils/clock.js'
 import LockManager from './resilience/lock.js'
 import RedisConfig from './connection/config.js'
 import RedisClientError from './utils/errors.js'
@@ -33,15 +34,21 @@ class RedisClient extends EventEmitter {
     this.config = this.redisConfig.getOptions()
     this.keyPrefix = this.config.keyPrefix ?? ''
 
+    // One clock for the whole facade: every timer and every reading of "now"
+    // in the collaborators goes through it, so time is drivable in tests.
+    this.clock = options.clock ?? createClock()
+
     this.connection = new ConnectionManager({
       redisConfig: this.redisConfig,
       logger: this.logger,
+      clock: this.clock,
       emit: (event, ...args) => this.emit(event, ...args)
     })
 
     this.health = new HealthChecker({
       getClient: () => this.connection.client,
       logger: this.logger,
+      clock: this.clock,
       interval: options.healthCheckInterval ?? 5000,
       timeout: options.healthCheckTimeout ?? 1000
     })
@@ -54,7 +61,8 @@ class RedisClient extends EventEmitter {
 
     this.locks = new LockManager({
       connection: this.connection,
-      logger: this.logger
+      logger: this.logger,
+      clock: this.clock
     })
   }
 

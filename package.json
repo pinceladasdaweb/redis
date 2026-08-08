@@ -31,7 +31,7 @@
     "prepack": "npm run build",
     "standard:fix": "standard --fix",
     "test": "node --test 'tests/**/*.test.js'",
-    "test:coverage": "node --test --experimental-test-coverage 'tests/**/*.test.js'",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include='src/**' 'tests/**/*.test.js'",
     "test:integration": "REDIS_INTEGRATION=1 node --test 'tests/**/*.test.js'",
     "check:types": "tsc --noEmit --strict index.d.ts",
     "test:mutation": "stryker run",
