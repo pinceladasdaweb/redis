@@ -7,9 +7,10 @@ class HealthChecker {
   #lastResult = null
   #inFlight = null
 
-  constructor ({ getClient, logger, interval = 5000, timeout = 1000 }) {
+  constructor ({ getClient, logger, clock, interval = 5000, timeout = 1000 }) {
     this.getClient = getClient
     this.logger = logger
+    this.clock = clock
     this.interval = interval
     this.timeout = timeout
   }
@@ -20,7 +21,7 @@ class HealthChecker {
       return this.#inFlight
     }
 
-    const now = Date.now()
+    const now = this.clock.now()
 
     // Only a healthy result is cached, and only while the connection is still
     // up. Caching a failure would keep reporting "down" after the connection
@@ -86,12 +87,12 @@ class HealthChecker {
       // unref'd timer never fires once the event loop has nothing else
       // scheduled — the probe would hang instead of timing out. It is
       // cleared as soon as the reply lands, so it holds nothing open.
-      const timeoutId = setTimeout(() => {
+      const timeoutId = this.clock.setTimeout(() => {
         reject(new Error('Operation timed out'))
       }, ms)
 
       operation((err, result) => {
-        clearTimeout(timeoutId)
+        this.clock.clearTimeout(timeoutId)
 
         if (err) {
           reject(err)

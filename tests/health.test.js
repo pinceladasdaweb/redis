@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import HealthChecker from '../src/connection/health.js'
+import { createManualClock } from './helpers/manual-clock.js'
 
 const quietLogger = { error () {}, warn () {}, info () {}, debug () {} }
 
-const createChecker = ({ client, ...options } = {}) =>
-  new HealthChecker({ getClient: () => client, logger: quietLogger, ...options })
+const createChecker = ({ client, clock = createManualClock(), ...options } = {}) => {
+  const checker = new HealthChecker({ getClient: () => client, logger: quietLogger, clock, ...options })
+
+  return Object.assign(checker, { clock })
+}
 
 const pingingClient = (reply, { fail = false, silent = false } = {}) => {
   const client = {
@@ -46,17 +50,35 @@ describe('health checker', () => {
     const logged = []
     const checker = new HealthChecker({
       getClient: () => pingingClient('connection lost', { fail: true }),
-      logger: { ...quietLogger, error: (message) => logged.push(message) }
+      logger: { ...quietLogger, error: (message) => logged.push(message) },
+      clock: createManualClock()
     })
 
     assert.equal(await checker.check(), false)
     assert.match(logged[0], /health check failed.*connection lost/)
   })
 
-  test('reports unhealthy when the ping never answers within the timeout', async () => {
-    const checker = createChecker({ client: pingingClient('PONG', { silent: true }), timeout: 20 })
+  test('waits exactly the configured timeout before giving up on a silent ping', async () => {
+    const clock = createManualClock()
+    const checker = createChecker({ client: pingingClient('PONG', { silent: true }), clock, timeout: 1000 })
 
-    assert.equal(await checker.check(), false)
+    let settled = null
+    const probe = checker.check().then((healthy) => { settled = healthy })
+
+    await clock.advance(999)
+    assert.equal(settled, null, 'one millisecond before the deadline it must still be waiting')
+
+    await clock.advance(1)
+    await probe
+    assert.equal(settled, false, 'and exactly on the deadline it gives up')
+  })
+
+  test('a reply cancels the timeout instead of leaving it armed', async () => {
+    const clock = createManualClock()
+    const checker = createChecker({ client: pingingClient('PONG'), clock, timeout: 1000 })
+
+    assert.equal(await checker.check(), true)
+    assert.equal(clock.pending(), 0, 'no timer may outlive the reply')
   })
 
   test('shares one in-flight ping between concurrent callers', async () => {
@@ -129,14 +151,23 @@ describe('health checker', () => {
     assert.equal(client.pings, 1, 'a healthy connection must not be re-pinged within the interval')
   })
 
-  test('pings again once the interval has elapsed', async () => {
+  test('re-pings exactly when the interval expires, not a millisecond earlier', async () => {
+    const clock = createManualClock()
     const client = pingingClient('PONG')
-    const checker = createChecker({ client, interval: 0 })
+    const checker = createChecker({ client, clock, interval: 5000 })
 
     await checker.check()
-    await checker.check()
+    assert.equal(client.pings, 1)
 
-    assert.equal(client.pings, 2)
+    // The cache is still valid right up to the boundary...
+    clock.jump(4999)
+    await checker.check()
+    assert.equal(client.pings, 1, 'inside the interval the cached result is reused')
+
+    // ...and expires on it.
+    clock.jump(1)
+    await checker.check()
+    assert.equal(client.pings, 2, 'the interval must expire at exactly interval ms')
   })
 
   test('never mutates connection state — it only observes', async () => {

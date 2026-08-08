@@ -407,9 +407,12 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 ```bash
 npm run hooks              # once per clone: enable the repo's git hooks (lint, commitlint)
 docker compose up -d       # pinned redis:7.4-alpine
-npm test                   # unit tests (no server required)
+npm test                   # unit tests (no server required, under a second)
 npm run test:integration   # full suite against the real Redis, including CLIENT KILL recovery
+npm run examples           # all 17 examples against the real Redis
+npm run test:mutation      # the mutation gate: do the tests actually assert?
 npm run check:types        # tsc --strict on index.d.ts
+npm run verify:package     # pack, install in a clean project, import via ESM and CJS
 ```
 
 The published package declares **zero lifecycle scripts**, so it installs without any `allow-scripts` approval friction.
@@ -418,9 +421,9 @@ The integration suite is destructive (it kills connections server-side) — neve
 
 ## Contributing
 
-- For a small change, just send a PR.
-- For bigger changes open an issue for discussion before sending a PR.
-- PRs should come with tests — reliability claims here are only as good as the suite that enforces them.
+Reliability claims here are only as good as the suite that enforces them, so every change needs a test that fails without it. [CONTRIBUTING.md](CONTRIBUTING.md) covers the invariants worth knowing before changing code — where reconnection lives, why zero is a legitimate option value, how timing is tested — plus the commands to run.
+
+Found a vulnerability? Please follow [SECURITY.md](SECURITY.md) instead of opening a public issue.
 
 ## Author
 

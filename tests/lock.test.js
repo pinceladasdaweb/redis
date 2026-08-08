@@ -2,10 +2,9 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import LockManager from '../src/resilience/lock.js'
 import RedisClientError from '../src/utils/errors.js'
+import { createManualClock, flush } from './helpers/manual-clock.js'
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-const createManager = ({ acquireReplies = ['OK'], releaseReply = 1, extendReply = 1 } = {}) => {
+const createManager = ({ acquireReplies = ['OK'], releaseReply = 1, extendReply = 1, clock = createManualClock() } = {}) => {
   const calls = []
   const logs = []
   let defineCommandCalls = 0
@@ -32,6 +31,7 @@ const createManager = ({ acquireReplies = ['OK'], releaseReply = 1, extendReply 
 
   const manager = new LockManager({
     connection: { assertReady: () => client },
+    clock,
     logger: {
       info () {},
       debug () {},
@@ -40,8 +40,33 @@ const createManager = ({ acquireReplies = ['OK'], releaseReply = 1, extendReply 
     }
   })
 
-  return { manager, calls, logs, client, defineCommandCalls: () => defineCommandCalls }
+  return { manager, calls, logs, client, clock, defineCommandCalls: () => defineCommandCalls }
 }
+
+// Drives the manual clock until a retrying acquire settles: no real time
+// passes, and the recorded delays are what the assertions read.
+const drive = async (promise, clock, step = 1000) => {
+  const state = { settled: false }
+  const outcome = promise.then((value) => ({ value }), (error) => ({ error }))
+
+  outcome.then(() => { state.settled = true })
+
+  for (let round = 0; round < 100 && !state.settled; round++) {
+    await clock.advance(step)
+  }
+
+  return outcome
+}
+
+// A critical section the test opens and closes on demand.
+const deferred = () => {
+  const handle = {}
+  handle.promise = new Promise((resolve) => { handle.resolve = resolve })
+
+  return handle
+}
+
+const extensions = (calls) => calls.filter(([name]) => name === 'extendLock').length
 
 describe('lock manager', () => {
   test('acquires with SET NX PX under a lock: namespace', async () => {
@@ -84,21 +109,38 @@ describe('lock manager', () => {
     assert.equal(calls.length, 1, 'no retries by default')
   })
 
-  test('retries the configured number of times before giving up', async () => {
-    const { manager, calls } = createManager({ acquireReplies: [null] })
+  test('retries the configured number of times, waiting the configured delay', async () => {
+    const { manager, calls, clock } = createManager({ acquireReplies: [null] })
 
-    await assert.rejects(manager.acquire('job', { retries: 3, retryDelay: 1 }), { code: 'LOCK_NOT_ACQUIRED' })
+    const outcome = await drive(manager.acquire('job', { retries: 3, retryDelay: 30 }), clock)
 
+    assert.equal(outcome.error.code, 'LOCK_NOT_ACQUIRED')
     assert.equal(calls.length, 4, 'the first attempt plus three retries')
+    assert.deepEqual(clock.delays(), [30, 30, 30], 'one configured wait between attempts, never after the last')
   })
 
-  test('stops retrying as soon as it wins the lock', async () => {
-    const { manager, calls } = createManager({ acquireReplies: [null, null, 'OK', 'OK'] })
+  test('stops retrying — and stops waiting — as soon as it wins', async () => {
+    const { manager, calls, clock } = createManager({ acquireReplies: [null, null, 'OK', 'OK'] })
 
-    const lock = await manager.acquire('job', { retries: 5, retryDelay: 1, retryJitter: 2 })
+    const outcome = await drive(manager.acquire('job', { retries: 5, retryDelay: 10 }), clock)
 
-    assert.equal(lock.name, 'job')
+    assert.equal(outcome.value.name, 'job')
     assert.equal(calls.length, 3)
+    assert.deepEqual(clock.delays(), [10, 10], 'the winning attempt must not be followed by a wait')
+  })
+
+  test('jitter spreads the waits so contenders stop retrying in lockstep', async () => {
+    const { manager, clock } = createManager({ acquireReplies: [null] })
+
+    await drive(manager.acquire('job', { retries: 20, retryDelay: 40, retryJitter: 20 }), clock)
+
+    const delays = clock.delays()
+
+    assert.equal(delays.length, 20)
+    for (const delay of delays) {
+      assert.ok(delay >= 40 && delay < 60, `each wait is the base plus 0..jitter, got ${delay}`)
+    }
+    assert.ok(new Set(delays).size > 1, 'jitter that never varies is not jitter')
   })
 
   test('release deletes the key only while the token still holds', async () => {
@@ -124,17 +166,6 @@ describe('lock manager', () => {
     assert.deepEqual(logs, [], 'only a lost lock deserves a warning')
   })
 
-  test('waits exactly the configured delay between attempts', async () => {
-    const { manager } = createManager({ acquireReplies: [null] })
-
-    const started = Date.now()
-    await assert.rejects(manager.acquire('job', { retries: 3, retryDelay: 30 }), { code: 'LOCK_NOT_ACQUIRED' })
-    const elapsed = Date.now() - started
-
-    assert.ok(elapsed >= 60, `three 30ms delays should take at least 60ms, took ${elapsed}ms`)
-    assert.ok(elapsed < 250, `it must not sleep longer than configured, took ${elapsed}ms`)
-  })
-
   test('failing to acquire names the operation', async () => {
     const { manager } = createManager({ acquireReplies: [null] })
 
@@ -155,6 +186,7 @@ describe('lock manager', () => {
           }
         }
       },
+      clock: createManualClock(),
       logger: { info () {}, debug () {}, warn () {}, error () {} }
     })
 
@@ -219,65 +251,99 @@ describe('lock manager', () => {
     assert.match(logs.at(-1), /Failed to release lock 'job'.*release exploded/)
   })
 
-  test('autoExtend keeps extending while the section runs, then stops', async () => {
-    const { manager, calls } = createManager()
+  test('the watchdog first extends at exactly half the ttl', async () => {
+    const { manager, calls, clock } = createManager()
+    const job = deferred()
 
-    await manager.withLock('job', { ttl: 100, autoExtend: true }, () => sleep(260))
+    const running = manager.withLock('job', { ttl: 400, autoExtend: true }, () => job.promise)
+    await flush()
 
-    const extendsDuringSection = calls.filter(([name]) => name === 'extendLock').length
-    assert.ok(extendsDuringSection >= 2, `expected the watchdog to extend at least twice, got ${extendsDuringSection}`)
+    await clock.advance(199)
+    assert.equal(extensions(calls), 0, 'nothing is renewed before half the ttl')
 
-    await sleep(150)
-    assert.equal(
-      calls.filter(([name]) => name === 'extendLock').length,
-      extendsDuringSection,
-      'the watchdog must stop once the section ends'
-    )
+    await clock.advance(1)
+    assert.equal(extensions(calls), 1, 'and the first renewal lands exactly on it')
+
+    job.resolve('done')
+    assert.equal(await running, 'done')
   })
 
-  test('autoExtend gives up and warns when the lock is definitively lost', async () => {
-    const { manager, calls, logs } = createManager({ extendReply: 0 })
+  test('the watchdog renews until the section ends, then leaves no timer behind', async () => {
+    const { manager, calls, clock } = createManager()
+    const job = deferred()
 
-    await manager.withLock('job', { ttl: 100, autoExtend: true }, () => sleep(260))
+    const running = manager.withLock('job', { ttl: 1000, autoExtend: true }, () => job.promise)
+    await flush()
 
-    assert.equal(calls.filter(([name]) => name === 'extendLock').length, 1, 'a lost lock stops the watchdog')
+    await clock.advance(500)
+    await clock.advance(500)
+    await clock.advance(500)
+    assert.equal(extensions(calls), 3, 'one renewal per half-ttl while the section runs')
+
+    job.resolve()
+    await running
+
+    await clock.advance(10000)
+    assert.equal(extensions(calls), 3, 'the watchdog stops with the section')
+    assert.equal(clock.pending(), 0, 'and no timer outlives withLock')
+  })
+
+  test('a lock lost mid-section stops the watchdog and warns', async () => {
+    const { manager, calls, logs, clock } = createManager({ extendReply: 0 })
+    const job = deferred()
+
+    const running = manager.withLock('job', { ttl: 1000, autoExtend: true }, () => job.promise)
+    await flush()
+
+    await clock.advance(500)
+    await clock.advance(500)
+
+    assert.equal(extensions(calls), 1, 'a definitively lost lock is not renewed again')
     assert.match(logs.find((message) => /could not be extended/.test(message)), /it was lost/)
-  })
 
-  test('the watchdog extends at half the ttl, not at the floor', async () => {
-    const { manager, calls } = createManager()
-
-    await manager.withLock('job', { ttl: 400, autoExtend: true }, () => sleep(500))
-
-    const extensions = calls.filter(([name]) => name === 'extendLock').length
-    assert.ok(
-      extensions >= 1 && extensions <= 4,
-      `a 400ms ttl means a ~200ms cadence (about 2 extensions), got ${extensions}`
-    )
+    job.resolve()
+    await running
   })
 
   test('a transient extend failure is logged and the watchdog keeps trying', async () => {
-    const { manager, logs, client } = createManager()
+    const { manager, client, logs, clock } = createManager()
+    const job = deferred()
     let attempts = 0
 
-    await manager.withLock('job', { ttl: 100, autoExtend: true }, async () => {
+    // Replaced inside the section: acquiring is what registers the scripts,
+    // so an earlier override would just be overwritten.
+    const running = manager.withLock('job', { ttl: 1000, autoExtend: true }, () => {
       client.extendLock = async () => {
         attempts++
         throw new Error('extend exploded')
       }
 
-      await sleep(260)
+      return job.promise
     })
+    await flush()
 
-    assert.ok(attempts >= 2, `a throwing extend must not kill the watchdog (attempts: ${attempts})`)
+    await clock.advance(500)
+    await clock.advance(500)
+
+    assert.equal(attempts, 2, 'a throwing extend must not kill the watchdog')
     assert.match(logs.find((message) => /Failed to extend lock/.test(message)), /extend exploded/)
+
+    job.resolve()
+    await running
   })
 
   test('no watchdog runs unless autoExtend is requested', async () => {
-    const { manager, calls } = createManager()
+    const { manager, calls, clock } = createManager()
+    const job = deferred()
 
-    await manager.withLock('job', { ttl: 100 }, () => sleep(260))
+    const running = manager.withLock('job', { ttl: 1000 }, () => job.promise)
+    await flush()
 
-    assert.equal(calls.filter(([name]) => name === 'extendLock').length, 0)
+    await clock.advance(10000)
+    assert.equal(extensions(calls), 0)
+    assert.equal(clock.pending(), 0, 'nothing is scheduled at all')
+
+    job.resolve()
+    await running
   })
 })

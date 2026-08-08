@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { describe, test } from 'node:test'
 import ConnectionManager from '../src/connection/manager.js'
 import { RedisClient } from '../src/index.js'
+import { createManualClock } from './helpers/manual-clock.js'
 
 const quietLogger = { error () {}, warn () {}, info () {}, debug () {} }
 
@@ -41,6 +42,7 @@ const createDriverClient = ({ connectFails = false, quitFails = false } = {}) =>
 const createManager = (clientOptions = {}) => {
   const created = []
   const events = []
+  const clock = createManualClock()
 
   const manager = new ConnectionManager({
     redisConfig: {
@@ -51,10 +53,11 @@ const createManager = (clientOptions = {}) => {
       }
     },
     logger: quietLogger,
+    clock,
     emit: (...args) => events.push(args)
   })
 
-  return { manager, created, events }
+  return { manager, created, events, clock }
 }
 
 describe('connection manager', () => {
@@ -226,14 +229,38 @@ describe('connection manager', () => {
     assert.equal(manager.client, null)
   })
 
-  test('disconnect resolves promptly instead of waiting on its escape timer', async () => {
-    const { manager } = createManager()
+  test('disconnect reacts to the end event, never to its escape timer', async () => {
+    const { manager, clock } = createManager()
 
     await manager.connect()
-    const started = Date.now()
     await manager.disconnect()
 
-    assert.ok(Date.now() - started < 500, 'shutdown must react to the end event, not to the 2s fallback')
+    // Resolved without the clock moving at all, and nothing left armed.
+    assert.equal(clock.pending(), 0, 'the escape timer must be cleared by the end event')
+  })
+
+  // A driver that goes quiet must not hang shutdown forever: the escape timer
+  // is the deadline, and it fires exactly when it says it does.
+  test('disconnect gives up on a silent driver after exactly two seconds', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+    created[0].quit = async () => {
+      created[0].calls.push('quit')
+      return 'OK'
+    }
+
+    let done = false
+    const shutdown = manager.disconnect().then(() => { done = true })
+
+    await clock.advance(1999)
+    assert.equal(done, false, 'one millisecond before the deadline it is still waiting')
+
+    await clock.advance(1)
+    await shutdown
+
+    assert.equal(done, true, 'and exactly on it, shutdown completes anyway')
+    assert.equal(manager.client, null, 'the client is released regardless')
   })
 
   test('reconnecting is reported even when the driver omits the delay', async () => {
@@ -258,16 +285,15 @@ describe('connection manager', () => {
     assert.equal(manager.client, null)
   })
 
-  test('disconnecting an already ended client does not wait either', async () => {
-    const { manager, created } = createManager()
+  test('disconnecting an already ended client schedules no wait at all', async () => {
+    const { manager, created, clock } = createManager()
 
     await manager.connect()
     created[0].status = 'end'
 
-    const started = Date.now()
     await manager.disconnect()
 
-    assert.ok(Date.now() - started < 500, 'an ended client has no end event left to wait for')
+    assert.deepEqual(clock.delays(), [], 'there is no end event left to wait for')
   })
 })
 

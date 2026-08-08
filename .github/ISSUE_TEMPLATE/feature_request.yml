@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a command, an option or a behavior
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Anything not wrapped is already reachable through `redis.client` (the raw
+        ioredis instance) or `executeCommand()`. A wrapper earns its place when it
+        removes a footgun — a prefix the driver misses, a score that arrives as a
+        string, a reply shape that invites index arithmetic.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The use case, not the proposed API.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What does it look like today?
+      description: Show it with `redis.client` or `executeCommand()`, and what is awkward about that.
+      render: javascript
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: |
+        Keep it consistent with what is there: `??` for defaults so zero survives,
+        options objects for optional clauses, structured errors with a `code`.
+      render: javascript

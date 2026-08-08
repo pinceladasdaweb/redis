@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves differently from what the README promises
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reliability bugs are the ones this library cares about most. If yours
+        involves a dropped connection or a failover, the details of *how* the
+        connection was interrupted are usually the whole bug — please include them.
+
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+      placeholder: 1.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Node.js and Redis versions
+      placeholder: Node 22.11.0, Redis 7.4 (docker)
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Quote the README or the types if it documents the behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include the full error, with its `code` and `operation` if it is a RedisClientError.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest snippet that shows it. Include the constructor options — `keyPrefix` in particular.
+      render: javascript
+    validations:
+      required: true
+
+  - type: textarea
+    id: interruption
+    attributes:
+      label: How the connection was interrupted (if relevant)
+      description: |
+        For example: server restarted, `CLIENT KILL`, network partition, Sentinel
+        failover, container stopped. Skip if the connection stayed up.

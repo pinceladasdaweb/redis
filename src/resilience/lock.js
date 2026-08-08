@@ -25,12 +25,11 @@ else
 end
 `
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
 class LockManager {
-  constructor ({ connection, logger }) {
+  constructor ({ connection, logger, clock }) {
     this.connection = connection
     this.logger = logger
+    this.clock = clock
   }
 
   // The main client is recreated on every connect() cycle, so the custom
@@ -81,7 +80,7 @@ class LockManager {
       }
 
       if (attempt < retries) {
-        await sleep(retryDelay + (retryJitter > 0 ? Math.floor(Math.random() * retryJitter) : 0))
+        await this.clock.sleep(retryDelay + (retryJitter > 0 ? Math.floor(Math.random() * retryJitter) : 0))
       }
     }
 
@@ -109,12 +108,12 @@ class LockManager {
       const ttl = options.ttl ?? 30000
       const interval = Math.max(Math.floor(ttl / 2), 50)
 
-      watchdog = setInterval(async () => {
+      watchdog = this.clock.setInterval(async () => {
         try {
           const extended = await lock.extend(ttl)
 
           if (!extended) {
-            clearInterval(watchdog)
+            this.clock.clearInterval(watchdog)
             this.logger.warn(`Lock '${name}' could not be extended — it was lost (expired or taken over).`)
           }
         } catch (err) {
@@ -129,7 +128,7 @@ class LockManager {
       return await fn(lock)
     } finally {
       if (watchdog) {
-        clearInterval(watchdog)
+        this.clock.clearInterval(watchdog)
       }
 
       // Releasing must never mask fn's outcome: failures are logged, not
