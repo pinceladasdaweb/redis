@@ -760,7 +760,7 @@ class RedisClient extends EventEmitter {
       const [, flags] = await target.config('GET', 'notify-keyspace-events')
 
       return {
-        node: isCluster ? `${target.options?.host}:${target.options?.port}` : null,
+        node: isCluster ? `${target.options.host}:${target.options.port}` : null,
         flags: flags ?? ''
       }
     }))

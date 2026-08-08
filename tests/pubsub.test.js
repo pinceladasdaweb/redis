@@ -414,6 +414,82 @@ describe('cluster keyspace-event fan-out', () => {
     }
   })
 
+  test('a node subscriber that dies for good is released and reported', async () => {
+    const { manager, masters, logs } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    masters[1].subscriber.emit('end')
+
+    assert.match(logs.at(-1)[1], /node 127\.0\.0\.1:7002 ended permanently/)
+    assert.equal(masters[1].subscriber.listenerCount('message'), 0, 'the dead client is detached')
+
+    // The slot is free again, so the next fan-out rebuilds that shard.
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    assert.notEqual(masters[1].subscriber.listenerCount('message'), 0, 'a fresh subscriber replaces it')
+  })
+
+  test('a node that refuses the subscription is reported, not swallowed silently', async () => {
+    const { manager, masters, cluster, logs, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    addMaster(7004)
+    const joining = masters.at(-1)
+    const failing = joining.duplicate
+    joining.duplicate = () => {
+      const subscriber = failing()
+      subscriber.subscribe = async () => { throw new Error('LOADING Redis is loading the dataset') }
+
+      return subscriber
+    }
+
+    cluster.emit('+node')
+    await tick()
+
+    assert.match(logs.at(-1)[1], /extend keyspace-event subscriptions to cluster node 127\.0\.0\.1:7004.*LOADING/)
+  })
+
+  test('resharding before any subscription does no work', async () => {
+    const { cluster, masters, addMaster } = createClusterManager()
+
+    cluster.emit('+node')
+    addMaster(7004)
+    cluster.emit('+node')
+    await tick()
+
+    assert.deepEqual(
+      masters.map((node) => node.subscriber),
+      [undefined, undefined, undefined, undefined],
+      'no channels means no connections to open'
+    )
+  })
+
+  test('a handler is optional: the facade events still carry every shard', async () => {
+    const { manager, masters, events } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT)
+
+    masters[2].subscriber.emit('message', KEY_EVENT, 'ct:orphan')
+    await tick()
+
+    assert.deepEqual(events.at(-1), ['message', KEY_EVENT, 'ct:orphan'])
+  })
+
+  test('the topology watcher is attached once, not once per channel', async () => {
+    const { manager, cluster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.subscribeEverywhere('__keyevent@0__:evicted', () => {})
+
+    assert.equal(cluster.listenerCount('+node'), 1)
+
+    await manager.close()
+
+    assert.equal(cluster.listenerCount('+node'), 0, 'and detached on shutdown')
+  })
+
   test('close releases every per-node subscriber', async () => {
     const { manager, masters } = createClusterManager()
 

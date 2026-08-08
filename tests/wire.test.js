@@ -580,6 +580,17 @@ describe('wire contract', () => {
     assert.equal(calls.some(([command]) => command === 'subscribe'), false, 'nothing may be subscribed to a channel that cannot speak')
   })
 
+  test('keyspaceNotifications reports the flags, and an empty string when there are none', async () => {
+    const { redis, fake } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', 'gxE']
+    assert.equal(await redis.keyspaceNotifications(), 'gxE')
+
+    // A server that answers the key with no value must not become undefined.
+    fake.config = async () => ['notify-keyspace-events']
+    assert.equal(await redis.keyspaceNotifications(), '')
+  })
+
   // Each cluster node is configured on its own and emits only its own slots'
   // events, so asking one master and trusting the answer would let a single
   // misconfigured shard go silent behind a probe that passed.

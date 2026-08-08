@@ -135,7 +135,7 @@ class SubscriptionManager {
   }
 
   #nodeKey (node) {
-    const { host, port } = node.options ?? {}
+    const { host, port } = node.options
 
     return `${host}:${port}`
   }
@@ -168,7 +168,7 @@ class SubscriptionManager {
   // Resharding adds masters after the fan-out: without this, a new shard's
   // events would be missing for the rest of the process's life.
   #watchTopology (client) {
-    if (this.#nodeWatcher || typeof client.on !== 'function') {
+    if (this.#nodeWatcher) {
       return
     }
 
@@ -254,7 +254,7 @@ class SubscriptionManager {
     this.#patternHandlers.clear()
 
     if (this.#nodeWatcher) {
-      this.#nodeWatcher.client.removeListener?.('+node', this.#nodeWatcher.handler)
+      this.#nodeWatcher.client.removeListener('+node', this.#nodeWatcher.handler)
       this.#nodeWatcher = null
     }
 
