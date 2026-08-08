@@ -41,11 +41,15 @@ console.log(`  xack                → ${acked} settled, 1 left pending on purpo
 pending = await redis.xpending(STREAM, GROUP)
 console.log(`  pending after ack   → ${pending[0]} (the unprocessed one)`)
 
-// Another worker can claim entries idle for too long — this is how a crashed
-// consumer's work gets picked up.
+// Another worker can claim a known entry that stayed idle too long.
 const claimed = await redis.xclaim(STREAM, GROUP, 'worker-2', 0, entries[2][0])
 console.log(`  xclaim              → worker-2 took over ${claimed.length} entry`)
 await redis.xack(STREAM, GROUP, entries[2][0])
+
+// xautoclaim is the same idea without knowing the ids: sweep whatever a dead
+// consumer left behind. Here everything is already settled, so it finds none.
+const swept = await redis.xautoclaim(STREAM, GROUP, 'worker-3', 60000)
+console.log(`  xautoclaim          → ${swept.entries.length} abandoned entries (cursor ${swept.cursor})`)
 
 // Reading a range without a group, for inspection or replay.
 const recent = await redis.xrevrange(STREAM, '+', '-', { count: 2 })

@@ -10,10 +10,32 @@ import Logger, { createLogger } from './utils/logger.js'
 import { parseScore, parseScoredMembers } from './utils/scores.js'
 import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
 
+// Which notify-keyspace-events class each event needs, for the ones worth
+// naming. Anything else is only checked for the 'E' (key-event) flag.
+const KEY_EVENT_CLASSES = {
+  expired: 'x',
+  evicted: 'e',
+  set: '$',
+  del: 'g',
+  rename_from: 'g',
+  rename_to: 'g',
+  expire: 'g',
+  lpush: 'l',
+  rpush: 'l',
+  sadd: 's',
+  hset: 'h',
+  zadd: 'z',
+  xadd: 't',
+  new: 'n'
+}
+
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
 // always reached through getters — never captured references.
 class RedisClient extends EventEmitter {
+  // Dedicated connections currently in use, so shutdown can reclaim them.
+  #dedicated = new Set()
+
   constructor (options = {}) {
     super()
 
@@ -32,7 +54,9 @@ class RedisClient extends EventEmitter {
     })
 
     this.config = this.redisConfig.getOptions()
-    this.keyPrefix = this.config.keyPrefix ?? ''
+    // Read from the config object, not from the driver options: under cluster
+    // these live inside redisOptions.
+    this.keyPrefix = this.redisConfig.keyPrefix
 
     // One clock for the whole facade: every timer and every reading of "now"
     // in the collaborators goes through it, so time is drivable in tests.
@@ -80,8 +104,19 @@ class RedisClient extends EventEmitter {
 
   async disconnect () {
     await this.subscriptions.close()
+    this.#releaseDedicatedConnections()
 
     return this.connection.disconnect()
+  }
+
+  // A blocking read parked on a dedicated connection would otherwise outlive
+  // the client: its promise never settles and its socket keeps the process
+  // alive, so a graceful shutdown never finishes.
+  #releaseDedicatedConnections () {
+    for (const held of this.#dedicated) {
+      held.cancelled = true
+      held.client.disconnect()
+    }
   }
 
   async checkHealth () {
@@ -93,17 +128,37 @@ class RedisClient extends EventEmitter {
   // The dedicated client inherits the full configuration (prefix, retries)
   // and is always released, whatever fn does.
   async withDedicatedConnection (fn) {
-    const client = this.connection.assertReady('withDedicatedConnection')
-    const dedicated = client.duplicate()
+    return this.#withDedicatedConnection('withDedicatedConnection', fn)
+  }
 
-    dedicated.on('error', (err) => {
+  async #withDedicatedConnection (operation, fn) {
+    const client = this.connection.assertReady(operation)
+    const held = { client: client.duplicate(), cancelled: false }
+
+    this.#dedicated.add(held)
+
+    held.client.on('error', (err) => {
       this.logger.debug?.(`Dedicated connection error: ${err.message}`)
     })
 
     try {
-      return await fn(dedicated)
+      return await fn(held.client)
+    } catch (err) {
+      // Shutdown closed this connection under a command that was still
+      // waiting: that is a cancellation, not a failure of its own, and the
+      // caller needs a code it can branch on to leave its loop.
+      if (held.cancelled) {
+        throw new RedisClientError(
+          `disconnect() closed the connection while '${operation}' was still waiting.`,
+          operation,
+          'REDIS_UNAVAILABLE'
+        )
+      }
+
+      throw err
     } finally {
-      dedicated.disconnect()
+      this.#dedicated.delete(held)
+      held.client.disconnect()
     }
   }
 
@@ -112,7 +167,7 @@ class RedisClient extends EventEmitter {
   // command of the application until the block resolves.
   async executeBlockingCommand (command, args) {
     try {
-      return await this.withDedicatedConnection((client) => client[command](...args))
+      return await this.#withDedicatedConnection(command, (client) => client[command](...args))
     } catch (err) {
       this.logError(err, command)
 
@@ -630,6 +685,55 @@ class RedisClient extends EventEmitter {
     return this.subscriptions.punsubscribe(pattern)
   }
 
+  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  async keyspaceNotifications () {
+    const client = this.connection.assertReady('keyspaceNotifications')
+    // CONFIG has no key to route on, so a cluster needs to be asked a node.
+    const target = typeof client.nodes === 'function' ? client.nodes('master')[0] : client
+    const [, flags] = await target.config('GET', 'notify-keyspace-events')
+
+    return flags ?? ''
+  }
+
+  // Keyspace events only exist if the server was configured to emit them, and
+  // a subscription to a silent channel looks exactly like one that works.
+  // Probing turns that silence into an error that says what to enable.
+  async subscribeToKeyEvents (event, handler, options = {}) {
+    await this.#assertKeyspaceNotifications(event)
+
+    const db = options.db ?? this.redisConfig.db
+
+    return this.subscribe(`__keyevent@${db}__:${event}`, handler)
+  }
+
+  async #assertKeyspaceNotifications (event) {
+    let flags
+
+    try {
+      flags = await this.keyspaceNotifications()
+    } catch (err) {
+      // Managed providers commonly block CONFIG. Refusing to subscribe would
+      // be worse than subscribing without the guarantee.
+      this.logger.warn(`Could not read notify-keyspace-events (${err.message}). Subscribing without verifying it.`)
+
+      return
+    }
+
+    const required = KEY_EVENT_CLASSES[event]
+    const missing = []
+
+    if (!flags.includes('E')) missing.push('E')
+    if (required && !flags.includes('A') && !flags.includes(required)) missing.push(required)
+
+    if (missing.length > 0) {
+      throw new RedisClientError(
+        `Keyspace notifications are not enabled for '${event}': notify-keyspace-events is "${flags}", missing "${missing.join('')}". Enable it with CONFIG SET notify-keyspace-events "${flags}${missing.join('')}".`,
+        'subscribeToKeyEvents',
+        'KEYSPACE_NOTIFICATIONS_DISABLED'
+      )
+    }
+  }
+
   // Single-instance distributed lock (SET NX PX + token-checked Lua release).
   async acquireLock (name, options) {
     return this.locks.acquire(name, options)
@@ -785,6 +889,22 @@ class RedisClient extends EventEmitter {
   // in the group's pending list forever.
   async xack (key, group, ...ids) {
     return this.executeCommand('xack', key, group, ...ids)
+  }
+
+  // Sweeps the group's pending list for entries idle longer than
+  // minIdleTime and hands them to `consumer` — the recovery path for a
+  // consumer that died holding deliveries. The reply is positional
+  // ([cursor, entries, deleted]); it is returned as named fields so callers
+  // do not index into it.
+  async xautoclaim (key, group, consumer, minIdleTime, start = '0-0', options = {}) {
+    const args = [key, group, consumer, minIdleTime, start]
+
+    if (options.count != null) args.push('COUNT', options.count)
+    if (options.justId) args.push('JUSTID')
+
+    const [cursor, entries, deleted] = await this.executeCommand('xautoclaim', ...args)
+
+    return { cursor, entries: entries ?? [], deleted: deleted ?? [] }
   }
 
   async xclaim (key, group, consumer, minIdleTime, ...ids) {

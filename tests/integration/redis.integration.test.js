@@ -13,6 +13,14 @@ import Redis from 'ioredis'
 import { RedisClient } from '../../src/index.js'
 
 const RUN = process.env.REDIS_INTEGRATION === '1'
+const RUN_CLUSTER = process.env.REDIS_CLUSTER_INTEGRATION === '1'
+const CLUSTER_NODES = (process.env.REDIS_CLUSTER_NODES || '127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003')
+  .split(',')
+  .map((node) => {
+    const [host, port] = node.split(':')
+
+    return { host, port: Number(port) }
+  })
 const HOST = process.env.REDIS_HOST || '127.0.0.1'
 const PORT = Number(process.env.REDIS_PORT || '6379')
 const ADMIN_NAME = 'integration-admin'
@@ -44,6 +52,21 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
       .filter(Boolean)
       .map(line => Number(/(?:^|\s)id=(\d+)/.exec(line)[1]))
       .filter(id => id !== adminId)
+  }
+
+  // Counting every connection on the server couples each test to the cleanup
+  // of every other one: a single leak elsewhere cascades into unrelated
+  // failures. Tests that care about their own footprint name their client and
+  // count only that name — the same lesson as filtering the RabbitMQ
+  // management API by connection name.
+  const listClientIdsNamed = async (name) => {
+    const list = await admin.client('LIST')
+
+    return list
+      .split('\n')
+      .filter(Boolean)
+      .filter(line => new RegExp(`(?:^|\\s)name=${name}(?:\\s|$)`).test(line))
+      .map(line => Number(/(?:^|\s)id=(\d+)/.exec(line)[1]))
   }
 
   const killAllOtherClients = async () => {
@@ -221,6 +244,156 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // A consumer that dies holding deliveries leaves them pending forever;
+  // XAUTOCLAIM is how another worker sweeps them up.
+  test('xautoclaim recovers entries abandoned by a dead consumer', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'claim:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.xadd('jobs', '*', 'task', 'one')
+    await client.xadd('jobs', '*', 'task', 'two')
+    await client.xgroup('CREATE', 'jobs', 'workers', '0', true)
+
+    // worker-1 takes both and then "dies" without acknowledging.
+    const taken = await client.xreadgroup('workers', 'worker-1', { count: 10 }, ['jobs', '>'])
+    assert.equal(taken[0][1].length, 2)
+    assert.equal((await client.xpending('jobs', 'workers'))[0], 2, 'both are stuck pending')
+
+    // worker-2 sweeps anything idle, however briefly.
+    const swept = await client.xautoclaim('jobs', 'workers', 'worker-2', 0)
+
+    assert.equal(swept.entries.length, 2, 'the abandoned work is handed over')
+    assert.equal(swept.cursor, '0-0', 'a full sweep ends back at the start')
+    assert.deepEqual(swept.deleted, [])
+
+    await client.xack('jobs', 'workers', ...swept.entries.map(([id]) => id))
+    assert.equal((await client.xpending('jobs', 'workers'))[0], 0, 'and the group is settled again')
+
+    await client.xgroup('DESTROY', 'jobs', 'workers')
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  // The lock's Lua scripts are cached by SHA on the server, and that cache
+  // dies with a restart or a failover. Proving the reload works is the
+  // difference between "ioredis probably handles it" and knowing.
+  test('locking survives the script cache being wiped (NOSCRIPT)', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    await client.connect()
+
+    const lock = await client.acquireLock('script-cache', { ttl: 10000 })
+    assert.equal(await lock.extend(10000), true)
+
+    // Exactly what a restarted server looks like to a client that already
+    // registered its scripts.
+    await admin.script('FLUSH')
+
+    assert.equal(await lock.extend(10000), true, 'extend must reload the script instead of failing')
+    assert.equal(await lock.release(), true, 'and so must release')
+
+    const again = await client.acquireLock('script-cache')
+    assert.equal(await again.release(), true)
+
+    await client.disconnect()
+  })
+
+  // Pipelines answer positionally: one failing command must not shift the
+  // replies of its neighbours.
+  test('a failing command in a pipeline does not desynchronize the replies', { timeout: 15000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'pipe:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.lpush('list', 'not-a-counter')
+
+    const transaction = await client.multi()
+    const results = await transaction
+      .set('first', 'ok')
+      .incr('list') // WRONGTYPE: fails in the middle
+      .set('third', 'ok')
+      .exec()
+
+    assert.equal(results.length, 3, 'every command still reports back')
+    assert.deepEqual(results[0], [null, 'OK'])
+    assert.equal(results[1][0] instanceof Error, true, 'the failure stays in its own slot')
+    assert.match(results[1][0].message, /WRONGTYPE/)
+    assert.deepEqual(results[2], [null, 'OK'], 'the command after the failure keeps its position')
+
+    assert.equal(await client.get('first'), 'ok')
+    assert.equal(await client.get('third'), 'ok', 'a runtime error does not roll the batch back')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('keyspace events are delivered once enabled, and refused when they are not', { timeout: 20000 }, async () => {
+    const [, original] = await admin.config('GET', 'notify-keyspace-events')
+
+    try {
+      await admin.config('SET', 'notify-keyspace-events', '')
+
+      const disabled = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+      await disabled.connect()
+
+      await assert.rejects(disabled.subscribeToKeyEvents('expired', () => {}), {
+        code: 'KEYSPACE_NOTIFICATIONS_DISABLED'
+      }, 'a channel that cannot speak must not look like one that works')
+      await disabled.disconnect()
+
+      // Now the server is configured to emit expiration events.
+      await admin.config('SET', 'notify-keyspace-events', 'Ex')
+
+      const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+      await client.connect()
+
+      const expired = []
+      await client.subscribeToKeyEvents('expired', (key) => expired.push(key))
+
+      await client.setex('it:vanishing', 1, 'value')
+      await waitFor(() => expired.includes('it:vanishing'), {
+        timeout: 8000,
+        message: 'the expiration event to arrive'
+      })
+
+      await client.disconnect()
+    } finally {
+      await admin.config('SET', 'notify-keyspace-events', original)
+    }
+  })
+
+  // Regression: a blocking read used to survive disconnect() — its promise
+  // never settled and its dedicated socket stayed open on the server, so a
+  // graceful shutdown hung forever.
+  test('disconnect cancels an in-flight blocking read and reclaims its connection', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, connectionName: 'it-shutdown', logger: quietLogger })
+    await client.connect()
+    await client.set('it:shutdown:warm', '1')
+
+    // BLOCK 0 waits forever: only the shutdown can end this. The expectation
+    // is attached now, before disconnect() rejects it — otherwise the
+    // rejection lands with no handler and the runner reports it as unhandled.
+    const blocked = client.xread({ block: 0 }, ['it:shutdown:stream', '$'])
+    const cancelled = assert.rejects(blocked, {
+      name: 'RedisClientError',
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'xread'
+    }, 'the caller must be told its read was cancelled, not left waiting')
+
+    await waitFor(async () => (await listClientIdsNamed('it-shutdown')).length >= 2, {
+      message: 'the dedicated connection to reach the server'
+    })
+
+    await client.disconnect()
+    await cancelled
+
+    await waitFor(async () => (await listClientIdsNamed('it-shutdown')).length === 0, {
+      message: 'every connection of this client to be gone'
+    })
+
+    await admin.del('it:shutdown:warm')
+  })
+
   // Regression (AUDIT B7): a blocking read on the shared connection stalled
   // every other command until the block resolved.
   test('blocking xread does not stall concurrent commands', { timeout: 15000 }, async () => {
@@ -275,7 +448,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // the transaction when the watched key changes — something the shared
   // connection could never guarantee under concurrency.
   test('withDedicatedConnection provides working optimistic locking', { timeout: 15000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'tx:', logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'tx:', connectionName: 'it-tx', logger: quietLogger })
     await client.connect()
 
     await client.set('balance', '10')
@@ -302,7 +475,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     assert.equal(await client.get('balance'), '99')
 
     // The dedicated connections are released afterwards.
-    await waitFor(async () => (await listOtherClientIds()).length === 1, {
+    await waitFor(async () => (await listClientIdsNamed('it-tx')).length === 1, {
       message: 'dedicated connections to be released'
     })
 
@@ -311,7 +484,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   })
 
   test('pub/sub delivers to channel handlers, pattern handlers and facade events', { timeout: 15000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, connectionName: 'it-pubsub', logger: quietLogger })
     await client.connect()
 
     const received = { handler: [], event: [], pattern: [] }
@@ -340,7 +513,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
 
     // disconnect() releases the subscriber connection too.
     await client.disconnect()
-    const remaining = (await listOtherClientIds()).length
+    const remaining = (await listClientIdsNamed('it-pubsub')).length
     assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
   })
 
@@ -690,19 +863,155 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     await client.disconnect()
   })
 
+  // One recovery can succeed by luck. Two in a row, with the state carried
+  // across both, is what says the client actually rebuilt itself.
+  test('recovers across two consecutive server-side kills', { timeout: 60000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-cycles', logger: quietLogger })
+    const readyEvents = []
+
+    client.on('ready', () => readyEvents.push(Date.now()))
+    await client.connect()
+
+    for (const cycle of [1, 2]) {
+      assert.equal(await client.set(`it:cycles:${cycle}`, 'before'), 'OK')
+
+      await waitFor(async () => (await listOtherClientIds()).length >= 1, {
+        message: `the connection to be visible before kill ${cycle}`
+      })
+      assert.ok(await killAllOtherClients() >= 1, `kill ${cycle} must land`)
+
+      await waitFor(async () => {
+        try {
+          return (await client.set(`it:cycles:${cycle}`, 'after')) === 'OK'
+        } catch {
+          return false
+        }
+      }, { timeout: 20000, message: `recovery after kill ${cycle}` })
+
+      assert.equal(await client.get(`it:cycles:${cycle}`), 'after', `cycle ${cycle} must be fully usable again`)
+    }
+
+    assert.ok(readyEvents.length >= 3, `each recovery must announce itself: ${readyEvents.length} ready events`)
+
+    // Two full cycles, still one connection: nothing accumulated on the way.
+    await sleep(1000)
+    assert.equal((await listClientIdsNamed('it-cycles')).length, 1)
+
+    await client.del('it:cycles:1', 'it:cycles:2')
+    await client.disconnect()
+  })
+
+  // The nastier shape of the same failure: the server drops the client again
+  // while it is still recovering from the previous drop.
+  test('recovers from a flapping server that keeps dropping it mid-recovery', { timeout: 60000 }, async () => {
+    // The backoff cap matters here: attempts that never reach a ready
+    // connection keep doubling (2^attempt * base), so without a cap a
+    // flapping stretch pushes the next retry half a minute away.
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      connectionName: 'it-flapping',
+      logger: quietLogger
+    })
+    await client.connect()
+    await client.set('it:flapping', 'before')
+
+    // Repeated kills: several land while a reconnection from the previous one
+    // is still in flight.
+    let kills = 0
+
+    for (let round = 0; round < 8; round++) {
+      kills += await killAllOtherClients()
+      await sleep(60)
+    }
+
+    assert.ok(kills >= 2, `the point is repeated drops, only ${kills} landed`)
+
+    await waitFor(async () => {
+      try {
+        return (await client.set('it:flapping', 'after')) === 'OK'
+      } catch {
+        return false
+      }
+    }, { timeout: 25000, message: 'recovery once the server settles' })
+
+    assert.equal(await client.get('it:flapping'), 'after')
+
+    // Every abandoned attempt must be gone, not lingering as a spare socket.
+    await sleep(1000)
+    assert.equal((await listClientIdsNamed('it-flapping')).length, 1, 'flapping must not leave a trail of connections')
+
+    await client.del('it:flapping')
+    await client.disconnect()
+  })
+
+  test('pub/sub survives two consecutive kills and a flapping server', { timeout: 60000 }, async () => {
+    const client = new RedisClient({
+      host: HOST,
+      port: PORT,
+      baseRetryDelay: 50,
+      maxRetryDelay: 200,
+      logger: quietLogger
+    })
+    await client.connect()
+
+    const received = []
+    await client.subscribe('resilient:cycles', (message) => received.push(message))
+
+    const deliverAgain = async (marker) => {
+      await waitFor(async () => {
+        try {
+          await client.publish('resilient:cycles', marker)
+        } catch {
+          return false
+        }
+
+        return received.includes(marker)
+      }, { timeout: 25000, message: `delivery of '${marker}'` })
+    }
+
+    await deliverAgain('before')
+
+    // Two clean cycles.
+    for (const cycle of [1, 2]) {
+      await killAllOtherClients()
+      await deliverAgain(`after-kill-${cycle}`)
+    }
+
+    // Then a flapping stretch on top.
+    for (let round = 0; round < 8; round++) {
+      await killAllOtherClients()
+      await sleep(60)
+    }
+
+    await deliverAgain('after-flapping')
+
+    // Deduplicated: delivery is retried until it lands, so a marker can
+    // legitimately arrive more than once.
+    const markers = [...new Set(received.filter((message) => message.startsWith('after')))].sort()
+
+    assert.deepEqual(markers, [
+      'after-flapping', 'after-kill-1', 'after-kill-2'
+    ], 'the subscription must be restored every single time')
+
+    await client.disconnect()
+  })
+
   // Regression probe for AUDIT C1/C2: the manual reconnection layer spawns a
   // brand-new ioredis client per attempt while the driver's own retryStrategy
   // also reconnects the old one — every recovery must end with the SAME
   // number of connections it started with.
   test('does not leak extra connections while recovering', { timeout: 60000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-leak', logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:leak:probe', '1'), 'OK')
-    await waitFor(async () => (await listOtherClientIds()).length >= 1, {
+    await waitFor(async () => (await listClientIdsNamed('it-leak')).length >= 1, {
       message: 'library connection to appear in CLIENT LIST'
     })
-    const baseline = (await listOtherClientIds()).length
+    const baseline = (await listClientIdsNamed('it-leak')).length
 
     await killAllOtherClients()
 
@@ -717,7 +1026,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     // Give competing reconnection loops time to surface extra connections.
     await sleep(3000)
 
-    const settled = (await listOtherClientIds()).length
+    const settled = (await listClientIdsNamed('it-leak')).length
     assert.equal(
       settled,
       baseline,
@@ -730,7 +1039,7 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // Regression probe for AUDIT C4: quit() emits 'close', and the close
   // handler used to schedule a reconnection — disconnect() must be final.
   test('disconnect() stays disconnected (no self-resurrection)', { timeout: 30000 }, async () => {
-    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, logger: quietLogger })
+    const client = new RedisClient({ host: HOST, port: PORT, baseRetryDelay: 50, connectionName: 'it-final', logger: quietLogger })
     await client.connect()
 
     assert.equal(await client.set('it:cycle:probe', '1'), 'OK')
@@ -742,12 +1051,137 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
     assert.equal(client.client, null, 'internal client must remain null after disconnect()')
     assert.equal(client.isConnected, false, 'isConnected must remain false after disconnect()')
 
-    const remaining = (await listOtherClientIds()).length
+    const remaining = (await listClientIdsNamed('it-final')).length
     assert.equal(remaining, 0, `server still sees ${remaining} connection(s) after disconnect()`)
 
     await assert.rejects(client.set('it:cycle:probe', '2'), {
       name: 'RedisClientError',
       code: 'REDIS_UNAVAILABLE'
     })
+  })
+})
+
+// Cluster changes what the library can assume: keys live on different nodes,
+// a command sent to the wrong one is answered with MOVED (or ASK while slots
+// migrate), and there is no cluster-wide SCAN. Gated separately because it
+// needs its own topology: docker compose -f docker-compose.cluster.yml up -d
+describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER_INTEGRATION=1 (needs docker-compose.cluster.yml)' }, () => {
+  const createClusterClient = (options = {}) =>
+    new RedisClient({ nodes: CLUSTER_NODES, keyPrefix: 'ct:', logger: quietLogger, ...options })
+
+  test('follows redirections for keys spread across the masters', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    // Enough distinct keys that they cannot all hash to one slot: every read
+    // that lands on the wrong node has to be redirected to reach its value.
+    const keys = Array.from({ length: 60 }, (_, index) => `spread:${index}`)
+
+    for (const key of keys) {
+      await client.set(key, `value-${key}`)
+    }
+
+    for (const key of keys) {
+      assert.equal(await client.get(key), `value-${key}`)
+    }
+
+    // Prove they really are spread: ask the cluster which slots they map to.
+    const slots = new Set()
+    for (const key of keys.slice(0, 10)) {
+      slots.add(await client.client.cluster('KEYSLOT', `ct:${key}`))
+    }
+    assert.ok(slots.size > 1, 'the sample must span more than one slot for this to mean anything')
+
+    const owners = new Set(client.client.nodes('master').map((node) => node.options.port))
+    assert.equal(owners.size, 3, 'all three masters are in play')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('scans and deletes across every master', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    const written = {}
+    for (let index = 0; index < 30; index++) {
+      written[`scan:${index}`] = String(index)
+      await client.set(`scan:${index}`, String(index))
+    }
+    await client.set('other:1', 'untouched')
+
+    // A cluster has no SCAN of its own; this only works if every master is
+    // walked and the slices are merged.
+    const dumped = Object.assign({}, ...await client.getAllStream('scan:*'))
+    assert.deepEqual(dumped, written, 'every key must come back, wherever it lives')
+
+    assert.equal(await client.deleteByPattern('scan:*'), 30)
+    assert.deepEqual(await client.getAllStream('scan:*'), [])
+    assert.equal(await client.get('other:1'), 'untouched')
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('single-key features work unchanged: locks, cache and counters', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    // The lock's Lua scripts declare one key, so the cluster can route them.
+    const held = await client.withLock('cluster-job', { ttl: 5000 }, async () => {
+      await assert.rejects(client.acquireLock('cluster-job'), { code: 'LOCK_NOT_ACQUIRED' })
+
+      return 'critical section ran'
+    })
+    assert.equal(held, 'critical section ran')
+
+    let produced = 0
+    const cached = await client.getOrSetJson('report', 60, () => { produced++; return { ok: true } }, { lock: true })
+    assert.deepEqual(cached, { ok: true })
+    assert.deepEqual(await client.getOrSetJson('report', 60, () => { produced++; return { no: true } }), { ok: true })
+    assert.equal(produced, 1)
+
+    await client.zadd('board', { ada: 120, grace: 180 })
+    assert.deepEqual(await client.zrevrange('board', 0, 0, { withScores: true }), [{ member: 'grace', score: 180 }])
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('multi-key commands need one slot, and hash tags are how you get it', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    await client.set('loose:1', 'a')
+    await client.set('loose:2', 'b')
+
+    // Two keys, two slots: the server refuses rather than guessing.
+    await assert.rejects(client.mget('loose:1', 'loose:2'), /CROSSSLOT/)
+
+    // A hash tag pins both keys to the same slot, so the same call works.
+    await client.mset({ '{user:1}:name': 'Ada', '{user:1}:role': 'admin' })
+    assert.deepEqual(await client.mget('{user:1}:name', '{user:1}:role'), ['Ada', 'admin'])
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
+  test('pub/sub reaches subscribers regardless of which node they are on', { timeout: 30000 }, async () => {
+    const client = createClusterClient()
+    await client.connect()
+
+    const received = []
+    await client.subscribe('cluster:events', (message) => received.push(message))
+
+    await waitFor(async () => (await client.publish('cluster:events', 'hello')) > 0, {
+      message: 'the subscription to register across the cluster'
+    })
+    await waitFor(() => received.includes('hello'), { message: 'the message to arrive' })
+
+    await client.disconnect()
   })
 })

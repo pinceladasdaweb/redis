@@ -49,21 +49,20 @@ const createClient = ({ batches, pipelineResults, unlinkResults, fail }) => {
     pipeline (commands) {
       state.pipelines.push(commands)
 
+      if (commands[0]?.[0] === 'unlink') {
+        state.unlinked.push(commands.map(([, key]) => key))
+      }
+
       return {
         async exec () {
-          if (fail === 'pipeline') throw new Error('pipeline exploded')
+          if (fail === 'pipeline' && commands[0]?.[0] === 'get') throw new Error('pipeline exploded')
+          if (fail === 'unlink' && commands[0]?.[0] === 'unlink') throw new Error('unlink exploded')
 
-          return pipelineResults.shift()
+          return commands[0]?.[0] === 'unlink'
+            ? commands.map(() => [null, unlinkResults.shift() ?? 1])
+            : pipelineResults.shift()
         }
       }
-    },
-
-    async unlink (...keys) {
-      state.unlinked.push(keys)
-
-      if (fail === 'unlink') throw new Error('unlink exploded')
-
-      return unlinkResults.shift()
     }
   }
 
@@ -150,7 +149,7 @@ describe('keyspace scanner', () => {
     const { client, state } = createClient({
       batches: [['app:a', 'app:b'], ['app:c']],
       pipelineResults: [],
-      unlinkResults: [2, 1]
+      unlinkResults: [1, 1, 1]
     })
 
     const removed = await deletePattern({ client, keyPrefix: 'app:', logger: quietLogger, pattern: 'cache:*' })
@@ -158,6 +157,9 @@ describe('keyspace scanner', () => {
     assert.equal(removed, 3)
     assert.deepEqual(state.patterns, ['app:cache:*'])
     assert.deepEqual(state.unlinked, [['a', 'b'], ['c']], 'keys are unlinked without the prefix')
+    // One UNLINK per key: a variadic one would need every key in the same
+    // slot, which nothing guarantees.
+    assert.deepEqual(state.pipelines[0], [['unlink', 'a'], ['unlink', 'b']])
   })
 
   test('deletePattern leaves foreign keys addressable as they came', async () => {
@@ -191,6 +193,30 @@ describe('keyspace scanner', () => {
     const { client } = createClient({ batches: [], pipelineResults: [], unlinkResults: [], fail: 'stream' })
 
     await assert.rejects(deletePattern({ client, logger: quietLogger, pattern: '*' }), /scan exploded/)
+  })
+
+  // A cluster has no scanStream of its own: each master holds a slice of the
+  // keyspace, so a walk means walking every master and merging.
+  test('scans every master of a cluster and merges the slices', async () => {
+    const first = createClient({ batches: [['app:a']], pipelineResults: [[[null, '1']]] })
+    const second = createClient({ batches: [['app:b']], pipelineResults: [[[null, '2']]] })
+    const cluster = { nodes: (role) => { cluster.askedFor = role; return [first.client, second.client] } }
+
+    const data = await scanKeyspace({ client: cluster, keyPrefix: 'app:', logger: quietLogger })
+
+    assert.deepEqual(data, [{ a: '1' }, { b: '2' }], 'both slices come back')
+    assert.equal(cluster.askedFor, 'master', 'replicas would report the same keys twice')
+    assert.deepEqual(first.state.patterns, ['app:*'])
+    assert.deepEqual(second.state.patterns, ['app:*'])
+  })
+
+  test('deletes across every master of a cluster', async () => {
+    const first = createClient({ batches: [['app:a']], pipelineResults: [], unlinkResults: [1] })
+    const second = createClient({ batches: [['app:b', 'app:c']], pipelineResults: [], unlinkResults: [1, 1] })
+    const cluster = { nodes: () => [first.client, second.client] }
+
+    assert.equal(await deletePattern({ client: cluster, keyPrefix: 'app:', logger: quietLogger, pattern: '*' }), 3)
+    assert.deepEqual(second.state.pipelines[0], [['unlink', 'b'], ['unlink', 'c']])
   })
 
   test('deletePattern rejects and destroys the stream when unlink fails', async () => {

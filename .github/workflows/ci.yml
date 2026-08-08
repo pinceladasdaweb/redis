@@ -63,3 +63,40 @@ jobs:
       # project and import it through both module systems.
       - name: Verify the published package
         run: npm run verify:package
+
+  # Cluster needs its own topology, so it gets its own job rather than a
+  # service container: three masters that announce an address the runner can
+  # reach, which is what makes MOVED/ASK resolvable from outside.
+  cluster:
+    name: Cluster suite (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Start a three-master cluster
+        run: docker compose -f docker-compose.cluster.yml up -d --wait
+
+      - name: Wait for the cluster to converge
+        run: |
+          for attempt in $(seq 1 30); do
+            state=$(docker run --rm --network host redis:7.4-alpine redis-cli -p 7001 cluster info | grep -o 'cluster_state:[a-z]*' || true)
+            echo "attempt $attempt: $state"
+            [ "$state" = "cluster_state:ok" ] && exit 0
+            sleep 2
+          done
+          echo "the cluster never reached cluster_state:ok"
+          exit 1
+
+      - name: Cluster integration tests
+        run: npm run test:cluster

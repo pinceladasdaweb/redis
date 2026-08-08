@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { EventEmitter } from 'node:events'
-import { Redis, ChainableCommander, RedisOptions } from 'ioredis'
+import { Redis, Cluster, ChainableCommander, RedisOptions, ClusterOptions } from 'ioredis'
 
 export interface Logger {
   error: (message: string, ...args: unknown[]) => void
@@ -21,7 +21,13 @@ export declare function createLogger (level?: string): Logger
  * owns them, and passing either rejects at construction with INVALID_OPTION.
  * Shape the backoff with maxRetryAttempts / baseRetryDelay / maxRetryDelay.
  */
-export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' | 'reconnectOnError'> {
+export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' | 'reconnectOnError'>, Omit<ClusterOptions, 'redisOptions' | 'clusterRetryStrategy'> {
+  /**
+   * Startup nodes of a Redis Cluster. Providing them switches the client to
+   * cluster mode: slots are discovered, MOVED/ASK redirections are followed,
+   * and multi-key commands require a shared hash slot.
+   */
+  nodes?: Array<{ host: string, port: number }>
   /** Maximum reconnection attempts before the driver gives up. 0 means never retry. Default: Infinity. */
   maxRetryAttempts?: number
   /** Base delay in ms for the exponential reconnection backoff. Default: 1000. */
@@ -36,7 +42,7 @@ export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' |
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
@@ -93,6 +99,20 @@ export interface StreamPendingOptions {
   consumer?: string
 }
 
+export interface StreamAutoClaimOptions {
+  count?: number
+  /** Return only the ids, without the field/value payloads. */
+  justId?: boolean
+}
+
+export interface AutoClaimResult {
+  /** Where to resume the sweep; '0-0' means the pending list was covered. */
+  cursor: string
+  entries: StreamEntry[]
+  /** Ids that were pending for entries no longer in the stream. */
+  deleted: string[]
+}
+
 export type StreamEntry = [id: string, fields: string[]]
 export type StreamReadResult = Array<[key: string, entries: StreamEntry[]]> | null
 
@@ -136,8 +156,8 @@ export interface Lock {
 export declare class RedisClient extends EventEmitter {
   constructor (options?: RedisClientOptions)
 
-  /** The underlying ioredis instance, or null while disconnected. */
-  readonly client: Redis | null
+  /** The underlying ioredis instance (a Cluster when `nodes` was given), or null while disconnected. */
+  readonly client: Redis | Cluster | null
   readonly isConnected: boolean
   logger: Logger
   keyPrefix: string
@@ -165,6 +185,9 @@ export declare class RedisClient extends EventEmitter {
    * Runs fn with a short-lived dedicated connection (full configuration
    * inherited, always released). Required for WATCH/MULTI/EXEC and anything
    * else that must not share the main connection.
+   *
+   * If disconnect() runs while fn is still waiting, the connection is
+   * reclaimed and the call rejects with REDIS_UNAVAILABLE.
    */
   withDedicatedConnection<T> (fn: (client: Redis) => T | Promise<T>): Promise<T>
 
@@ -277,6 +300,16 @@ export declare class RedisClient extends EventEmitter {
   psubscribe (pattern: string, handler?: PubSubHandler): Promise<unknown>
   punsubscribe (pattern: string): Promise<unknown>
 
+  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  keyspaceNotifications (): Promise<string>
+  /**
+   * Subscribes to `__keyevent@<db>__:<event>` after checking the server is
+   * configured to emit it — otherwise a silent channel would be
+   * indistinguishable from a working one. Rejects with
+   * KEYSPACE_NOTIFICATIONS_DISABLED, naming the CONFIG SET that fixes it.
+   */
+  subscribeToKeyEvents (event: string, handler?: PubSubHandler, options?: { db?: number }): Promise<unknown>
+
   /** Single-instance lock (SET NX PX + token-checked Lua release). Not Redlock. */
   acquireLock (name: string, options?: LockOptions): Promise<Lock>
   withLock<T> (name: string, fn: (lock: Lock) => T | Promise<T>): Promise<T>
@@ -296,6 +329,13 @@ export declare class RedisClient extends EventEmitter {
   xpending (key: string, group: string, options?: StreamPendingOptions): Promise<unknown>
   /** Acknowledges entries so they leave the consumer group's pending list. */
   xack (key: string, group: string, ...ids: string[]): Promise<number>
+  /**
+   * Sweeps the group's pending list for entries idle longer than
+   * `minIdleTime` and hands them to `consumer` — the recovery path for a
+   * consumer that died holding deliveries. Returned as named fields instead
+   * of the positional reply.
+   */
+  xautoclaim (key: string, group: string, consumer: string, minIdleTime: number, start?: string, options?: StreamAutoClaimOptions): Promise<AutoClaimResult>
   xclaim (key: string, group: string, consumer: string, minIdleTime: number, ...ids: string[]): Promise<StreamEntry[]>
 
   /** SCAN-based dump of the (prefixed) keyspace: [{ key: value }, ...]. Skips non-string keys. */

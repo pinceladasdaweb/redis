@@ -15,17 +15,36 @@ const NON_COMMANDS = new Set(['then', 'catch', 'finally', 'constructor', 'inspec
 
 const createRecorder = () => {
   const calls = []
+  // Commands still waiting for a reply. The driver flushes them with an error
+  // when the connection closes; a fake that forgets to would let broken
+  // shutdown code look correct.
+  const waiting = new Set()
 
   const target = {
     status: 'ready',
+    // Stands in for a command that only answers when told to, like XREAD BLOCK 0.
+    blockForever: () => new Promise((resolve, reject) => waiting.add(reject)),
+    flushWaiting: () => {
+      for (const reject of waiting) {
+        reject(new Error('Connection is closed.'))
+      }
+
+      waiting.clear()
+    },
     // Custom commands do not exist until defineCommand creates them — the
     // fake must reproduce that, or the lock manager's registration is skipped.
     releaseLock: undefined,
     extendLock: undefined,
+    // A standalone client has no nodes(): leaving it to the proxy would make
+    // every fake look like a cluster.
+    nodes: undefined,
     on () { return target },
     once () { return target },
     removeAllListeners () { return target },
-    disconnect () { calls.push(['<disconnect>']) },
+    disconnect () {
+      calls.push(['<disconnect>'])
+      target.flushWaiting()
+    },
     async quit () { calls.push(['<quit>']); return 'OK' },
     multi () { calls.push(['multi']); return { exec: async () => [] } },
     defineCommand (name) {
@@ -147,6 +166,7 @@ describe('wire contract', () => {
       'getJson', 'setJson', 'setexJson', 'getOrSet', 'getOrSetJson', 'deleteByPattern',
       'getAllStream', 'hset', 'hmset', 'mset', 'spop', 'sort', 'multi', 'watch', 'unwatch',
       'zadd', 'zscore', 'zincrby', 'zrange', 'zrevrange', 'zrangebyscore', 'zpopmin', 'zpopmax',
+      'xautoclaim', 'keyspaceNotifications', 'subscribeToKeyEvents',
       'xread', 'xreadgroup', 'xgroup', 'xtrim', 'publishJson',
       'subscribe', 'unsubscribe', 'psubscribe', 'punsubscribe', 'acquireLock', 'withLock'
     ])
@@ -383,6 +403,44 @@ describe('wire contract', () => {
     assert.deepEqual(calls[1], ['<disconnect>'], 'the dedicated connection must be released')
   })
 
+  // Regression: a blocking read parked on a dedicated connection used to
+  // survive disconnect() — its promise never settled and its socket kept the
+  // process alive, so graceful shutdown never finished.
+  test('disconnect cancels commands still waiting on a dedicated connection', async () => {
+    const { redis, calls } = createClient()
+    let settled = 'pending'
+
+    // A command that never answers on its own, like XREAD BLOCK 0.
+    redis.client.xread = redis.client.blockForever
+
+    const blocked = redis.xread({ block: 0 }, ['s', '$'])
+      .then(() => { settled = 'resolved' })
+      .catch((err) => { settled = `${err.code}:${err.operation}` })
+
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(settled, 'pending', 'the read is waiting, as intended')
+
+    await redis.disconnect()
+    await blocked
+
+    assert.equal(settled, 'REDIS_UNAVAILABLE:xread', 'shutdown must cancel it with a code the caller can branch on')
+    assert.deepEqual(calls.at(-1), ['<disconnect>'], 'and the dedicated connection must be released')
+  })
+
+  test('a dedicated connection released by shutdown reports cancellation, not its own failure', async () => {
+    const { redis } = createClient()
+
+    const held = redis.withDedicatedConnection((client) => client.blockForever())
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await redis.disconnect()
+
+    await assert.rejects(held, {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'withDedicatedConnection'
+    })
+  })
+
   test('withDedicatedConnection releases the connection even when fn throws', async () => {
     const { redis, calls } = createClient()
 
@@ -426,6 +484,73 @@ describe('wire contract', () => {
 
     await lock.extend(5000)
     assert.deepEqual(calls.at(-1), ['extendLock', 'lock:job', lock.token, 5000])
+  })
+
+  test('xautoclaim builds its clause and returns named fields', async () => {
+    const { redis, calls, fake } = createClient()
+
+    fake.xautoclaim = async (...args) => {
+      calls.push(['xautoclaim', ...args])
+
+      return ['5-0', [['1-1', ['f', 'v']]], ['2-2']]
+    }
+
+    const swept = await redis.xautoclaim('st', 'g', 'worker-2', 60000, '0-0', { count: 10 })
+
+    assert.deepEqual(calls[0], ['xautoclaim', 'st', 'g', 'worker-2', 60000, '0-0', 'COUNT', 10])
+    assert.deepEqual(swept, {
+      cursor: '5-0',
+      entries: [['1-1', ['f', 'v']]],
+      deleted: ['2-2']
+    }, 'the positional reply must not leak to the caller')
+
+    await redis.xautoclaim('st', 'g', 'worker-2', 60000)
+    assert.deepEqual(calls[1], ['xautoclaim', 'st', 'g', 'worker-2', 60000, '0-0'], 'the sweep starts at the beginning by default')
+
+    await redis.xautoclaim('st', 'g', 'worker-2', 60000, '0-0', { justId: true })
+    assert.deepEqual(calls[2].at(-1), 'JUSTID')
+  })
+
+  test('keyspace event subscriptions probe the server config first', async () => {
+    const { redis, calls, fake } = createClient()
+
+    fake.config = async (...args) => {
+      calls.push(['config', ...args])
+
+      return ['notify-keyspace-events', 'Ex']
+    }
+
+    await redis.subscribeToKeyEvents('expired', () => {})
+
+    assert.deepEqual(calls[0], ['config', 'GET', 'notify-keyspace-events'])
+    assert.deepEqual(calls[1], ['subscribe', '__keyevent@0__:expired'])
+  })
+
+  test('a silent keyspace channel is refused with the command that fixes it', async () => {
+    const { redis, calls, fake } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', '']
+
+    await assert.rejects(redis.subscribeToKeyEvents('expired', () => {}), {
+      code: 'KEYSPACE_NOTIFICATIONS_DISABLED',
+      operation: 'subscribeToKeyEvents',
+      message: /missing "Ex".*CONFIG SET notify-keyspace-events "Ex"/s
+    })
+
+    assert.equal(calls.some(([command]) => command === 'subscribe'), false, 'nothing may be subscribed to a channel that cannot speak')
+  })
+
+  test('an unreadable config downgrades to a warning instead of blocking', async () => {
+    const { redis, calls, fake } = createClient()
+    const warnings = []
+
+    redis.logger = { ...quietLogger, warn: (message) => warnings.push(message) }
+    fake.config = async () => { throw new Error('ERR unknown command CONFIG') }
+
+    await redis.subscribeToKeyEvents('expired', () => {})
+
+    assert.match(warnings.at(-1), /Could not read notify-keyspace-events/)
+    assert.deepEqual(calls.at(-1), ['subscribe', '__keyevent@0__:expired'], 'managed providers block CONFIG; refusing would be worse')
   })
 
   test('subscribe and unsubscribe reach the subscriber connection', async () => {
