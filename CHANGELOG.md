@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 3.0.1 (2026-08-08)
+
+* test: probe the server before trusting the fakes, and make the mutation score mean something by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/83f08f175efd0ca8a88217a3966fbddde27f3753)
+
+
 ## 3.0.0 (2026-08-08)
 
 * fix: shutdown that never finished, and key events that half arrived by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/f8d703244cb7b6cb0a4bf9901f08626044611c01)

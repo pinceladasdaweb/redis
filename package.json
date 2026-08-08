@@ -1,6 +1,6 @@
 {
   "name": "@pinceladasdaweb/redis",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -60,7 +60,7 @@
     "health-check",
     "json"
   ],
-  "author": "Pedro Rog\u00e9rio <pinceladasdaweb@hotmail.com>",
+  "author": "Pedro Rogério <pinceladasdaweb@hotmail.com>",
   "license": "MIT",
   "description": "A resilient Redis client for Node.js built on ioredis, with automatic reconnection, health checks and JSON helpers.",
   "devDependencies": {
