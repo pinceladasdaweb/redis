@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 3.0.0 (2026-08-08)
+
+* fix: shutdown that never finished, and key events that half arrived by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/f8d703244cb7b6cb0a4bf9901f08626044611c01)
+* test: cover the new shutdown and fan-out paths, and drop dead guards by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/56323c2f718ea2c1fc6312fb80cf1703ad251948)
+* test: take coverage to 100% of lines and functions by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/8695a4ba651fd4dc10b9d1967b8771f430b8fdbf)
+
+
 ## 2.1.0 (2026-08-08)
 
 * fix: cancel blocking reads on disconnect instead of hanging shutdown by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/09254065481ee3958e1558e80f6fa3021d01a71b)
