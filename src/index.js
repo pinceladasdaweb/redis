@@ -856,19 +856,19 @@ class RedisClient extends EventEmitter {
       : this.executeCommand('xreadgroup', ...args)
   }
 
-  // ioredis applies keyPrefix by argument position, and XGROUP/XINFO carry
-  // their key *after* a subcommand — a position it does not recognize. Left
-  // alone, a prefixed client would create consumer groups on unprefixed keys
-  // while XADD/XREADGROUP used the prefixed ones.
-  #prefixed (key) {
-    return `${this.keyPrefix}${key}`
-  }
-
-  // Each XGROUP subcommand has its own arity — a blanket trailing id turned
-  // documented calls like xgroup('DESTROY', key, group) into protocol errors.
+  // The key of XGROUP/XINFO sits *after* a subcommand. Through ioredis 5 the
+  // driver did not recognize that position, so this facade prefixed those two
+  // by hand — otherwise a prefixed client created consumer groups on
+  // unprefixed keys while XADD/XREADGROUP used the prefixed ones.
+  //
+  // @ioredis/commands 2.0.0 (shipped with ioredis 6) declares the position,
+  // so the driver prefixes them like any other key. Doing it here as well
+  // produced `app:app:stream` — the group created on one key and read from
+  // another, which is why this library requires ioredis 6 and cannot support
+  // both majors without branching on the driver's version.
   async xgroup (command, key, groupName, ...rest) {
     const subcommand = String(command).toUpperCase()
-    const args = [subcommand, this.#prefixed(key), groupName]
+    const args = [subcommand, key, groupName]
 
     switch (subcommand) {
       case 'CREATE': {
@@ -904,7 +904,7 @@ class RedisClient extends EventEmitter {
   }
 
   async xinfo (subcommand, key, ...args) {
-    return this.executeCommand('xinfo', subcommand, this.#prefixed(key), ...args)
+    return this.executeCommand('xinfo', subcommand, key, ...args)
   }
 
   async xrange (key, start, end, options = {}) {

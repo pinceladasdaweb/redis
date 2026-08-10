@@ -75,7 +75,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "ioredis": "^5.11.1"
+    "ioredis": "^6.0.0"
   },
   "lint-staged": {
     "src/**/*.js": "standard",

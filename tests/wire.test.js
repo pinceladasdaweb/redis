@@ -866,7 +866,13 @@ describe('wire contract', () => {
   // Regression: ioredis does not prefix the key of XGROUP/XINFO (it sits
   // after the subcommand), so a prefixed client used to create consumer
   // groups on a different key than the one XADD wrote to.
-  test('xgroup and xinfo carry the key prefix themselves', async () => {
+  // Through ioredis 5 this facade prefixed XGROUP/XINFO by hand, because the
+  // driver did not know their key sits after a subcommand. @ioredis/commands
+  // 2.0.0 declares that position, so the driver prefixes them like any other
+  // key — and doing it here too produced `app:app:events`, creating the group
+  // on one key and reading from another. The keys now leave unprefixed, on
+  // purpose, and the integration suite proves the round trip end to end.
+  test('xgroup and xinfo leave prefixing to the driver, like every other key', async () => {
     const { redis, calls } = createClient({ keyPrefix: 'app:' })
 
     await redis.xgroup('CREATE', 'events', 'workers', '$', true)
@@ -874,10 +880,10 @@ describe('wire contract', () => {
     await redis.xinfo('STREAM', 'events')
     await redis.xinfo('CONSUMERS', 'events', 'workers')
 
-    assert.deepEqual(calls[0], ['xgroup', 'CREATE', 'app:events', 'workers', '$', 'MKSTREAM'])
-    assert.deepEqual(calls[1], ['xgroup', 'DESTROY', 'app:events', 'workers'])
-    assert.deepEqual(calls[2], ['xinfo', 'STREAM', 'app:events'])
-    assert.deepEqual(calls[3], ['xinfo', 'CONSUMERS', 'app:events', 'workers'])
+    assert.deepEqual(calls[0], ['xgroup', 'CREATE', 'events', 'workers', '$', 'MKSTREAM'])
+    assert.deepEqual(calls[1], ['xgroup', 'DESTROY', 'events', 'workers'])
+    assert.deepEqual(calls[2], ['xinfo', 'STREAM', 'events'])
+    assert.deepEqual(calls[3], ['xinfo', 'CONSUMERS', 'events', 'workers'])
   })
 
   test('getAllStream and deleteByPattern prefix the scan pattern', async () => {

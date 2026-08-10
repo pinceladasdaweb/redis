@@ -36,7 +36,12 @@ import RedisClient from '@pinceladasdaweb/redis'
 const { RedisClient } = require('@pinceladasdaweb/redis')
 ```
 
-Requires Node.js >= 22.
+Requires **Node.js >= 22** and **Redis >= 6.2** — the floor comes from ioredis 6, which this library depends on.
+
+Two consequences of that driver major worth knowing:
+
+- **RESP3 is the default wire protocol.** Every reply this library translates (`config get`, `WITHSCORES` ranges, `xpending`, `xautoclaim`) was measured under both protocols and comes back in the same shape, so nothing here changes. If you need the old protocol anyway, `protocol: 2` is forwarded to the driver like any other option.
+- **`redis.client` hands you an ioredis 6 instance.** If your application talks to ioredis directly as well, keep it on the same major or you will install two copies of the driver.
 
 ## Quick start
 
@@ -463,7 +468,7 @@ All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xle
   }
   ```
 - **`xgroup` respects each subcommand's arity** — `CREATE` (with optional `MKSTREAM`), `DESTROY`, `SETID`, `CREATECONSUMER`, `DELCONSUMER`.
-- **`keyPrefix` is honored everywhere**, including `xgroup` and `xinfo` — whose key sits after a subcommand, a position the underlying driver does not prefix on its own.
+- **`keyPrefix` is honored everywhere**, `xgroup` and `xinfo` included. Their key sits after a subcommand, which the driver only learned to recognize in ioredis 6; before that this library prefixed those two by hand, and the integration suite proves the round trip either way.
 
 Entries stay in the group's pending list until acknowledged, which is what makes recovery possible: `xack` settles them, and **`xautoclaim` sweeps up whatever a dead consumer left behind**, returning named fields instead of the positional reply:
 
