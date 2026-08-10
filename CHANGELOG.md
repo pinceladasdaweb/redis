@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 4.0.0 (2026-08-10)
+
+* ci: test on Node 26, the version this library is written on by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/79d5d25ae15bded421f3bd0ea46c9791650fc1c7)
+* feat: move to ioredis 6 by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/3990522fe618f8de96921b572e79af97191aff6a)
+* docs: state the real Redis floor, which is ours and not the driver's by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/b6b3a1cd5881239551cd79c17e5282ed28135d46)
+* ci: verify the Redis range this library claims, not one point inside it by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/4b5f0644e17dd922c6cc93ebc8948e86e7e243de)
+
+
 ## 3.0.1 (2026-08-08)
 
 * test: probe the server before trusting the fakes, and make the mutation score mean something by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/83f08f175efd0ca8a88217a3966fbddde27f3753)
