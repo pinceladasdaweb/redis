@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 4.1.0 (2026-08-15)
+
+* feat: register Lua scripts and call them by name by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/d2b48a695c92ceeb72517962cffe0b4e5cbeff5d)
+* test: close the four soft spots the mutation gate found in the script registry by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/f8f0592b5303a0ed7229f2ae79dc5d431a1d0309)
+
+
 ## 4.0.0 (2026-08-10)
 
 * ci: test on Node 26, the version this library is written on by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/79d5d25ae15bded421f3bd0ea46c9791650fc1c7)
