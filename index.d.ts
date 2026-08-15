@@ -126,6 +126,24 @@ export type RedisClientEvent = 'ready' | 'close' | 'reconnecting' | 'end' | 'con
 /** Handler for subscribe()/psubscribe(). `pattern` is set for pattern subscriptions only. */
 export type PubSubHandler = (message: string, channel: string, pattern?: string) => void | Promise<void>
 
+/**
+ * A Lua script registered once and called by name from then on. The driver
+ * sends the SHA rather than the body, reloads it on `NOSCRIPT` after a restart
+ * or failover, and reinstalls it on the new client after a reconnection.
+ */
+export interface ScriptDefinition {
+  /** The Lua source. */
+  lua: string
+  /**
+   * How many of the arguments are KEYS. Required: it is what makes the script
+   * routable in a cluster and prefixable at all, and `runScript` checks the
+   * count on every call.
+   */
+  numberOfKeys: number
+  /** Marks the script as a reader, so `scaleReads` may route it to a replica. */
+  readOnly?: boolean
+}
+
 export interface LockOptions {
   /** Lock lifetime in ms. The critical section must finish within it (or use autoExtend). Default: 30000. */
   ttl?: number
@@ -316,6 +334,26 @@ export declare class RedisClient extends EventEmitter {
   subscribeToKeyEvents (event: string, handler?: PubSubHandler, options?: { db?: number }): Promise<unknown>
 
   /** Single-instance lock (SET NX PX + token-checked Lua release). Not Redlock. */
+  /**
+   * Registers Lua under a name. Prefer this over `executeCommand('eval', …)`
+   * for anything on a hot path: `EVAL` ships the whole program on every call,
+   * a registered script ships its SHA. Registration is lazy — no connection
+   * needed — and survives reconnection cycles.
+   *
+   * Throws `INVALID_ARGUMENT` on a malformed definition, at registration
+   * rather than at first use.
+   */
+  defineScript (name: string, definition: ScriptDefinition): void
+  /**
+   * Runs a registered script. Keys and arguments travel as two arrays, and the
+   * key count declared at registration is enforced here: a misplaced key would
+   * otherwise read something nobody named, on a node nobody meant to reach.
+   *
+   * Rejects with `INVALID_ARGUMENT` for an unknown name or the wrong number of
+   * keys; a server-side script error propagates as the driver's own error.
+   */
+  runScript (name: string, keys?: Array<string | number>, args?: Array<string | number>): Promise<unknown>
+
   acquireLock (name: string, options?: LockOptions): Promise<Lock>
   withLock<T> (name: string, fn: (lock: Lock) => T | Promise<T>): Promise<T>
   withLock<T> (name: string, options: LockOptions, fn: (lock: Lock) => T | Promise<T>): Promise<T>
