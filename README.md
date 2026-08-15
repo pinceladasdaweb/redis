@@ -12,6 +12,7 @@ Every reliability claim in this README is enforced by the integration suite agai
 - **Dedicated connections when they matter**: blocking stream reads (`BLOCK`) never stall the shared connection, and `withDedicatedConnection()` gives you isolated `WATCH`/`MULTI`/`EXEC` optimistic locking that actually works under concurrency.
 - **Pub/Sub that survives outages**: subscriptions live on a dedicated connection and are automatically restored after reconnections — enforced by a server-side `CLIENT KILL` test.
 - **Distributed locking (single instance)**: `withLock()`/`acquireLock()` with `SET NX PX` acquisition and token-checked Lua release — a holder can never release or extend someone else's lock.
+- **Registered Lua**: `defineScript()`/`runScript()` send the SHA instead of the script body, reload themselves on `NOSCRIPT` and survive reconnections — for atomic compare-and-set, rate-limiter windows and anything else on a hot path.
 - **Bring your own logger**: inject any pino/winston/bunyan instance; the built-in fallback is a dependency-free leveled console logger.
 - **JSON helpers**: `setJson`/`getJson`/`setexJson` with explicit serialization — never magic.
 - **Cache-aside with stampede protection**: `getOrSet`/`getOrSetJson` return the cached value or produce-and-store it — and with `{ lock: true }`, concurrent misses collapse into a single producer call.
@@ -422,6 +423,39 @@ await redis.withLock('report:build', { ttl: 30000, autoExtend: true, retries: 10
 
 Without `autoExtend`, keep the critical section shorter than the `ttl` — the ttl is the safety net that prevents dead holders from blocking everyone forever.
 
+## Lua scripts
+
+Anything that has to be atomic across several keys or several steps — a compare-and-set, a rate-limiter window, a fenced state machine — belongs in Lua, because Redis runs a script to completion without interleaving.
+
+`executeCommand('eval', …)` works and sends the script body on every call. That is fine occasionally and wrong on a hot path. Register it instead and the driver sends the SHA (~40 bytes), reloads it by itself on `NOSCRIPT` after a restart or failover, and reinstalls it on the new connection after a reconnection cycle:
+
+```javascript
+redis.defineScript('fencedSet', {
+  numberOfKeys: 1,
+  lua: `
+    local current = tonumber(redis.call("hget", KEYS[1], "generation")) or 0
+    if tonumber(ARGV[1]) < current then return {0, current} end
+    redis.call("hset", KEYS[1], "generation", ARGV[1], "state", ARGV[2])
+    return {1, tonumber(ARGV[1])}
+  `
+})
+
+await redis.runScript('fencedSet', ['breaker:api'], [generation, 'open'])
+// [1, 3] — applied.  [0, 4] — refused: a newer generation already won.
+```
+
+Registration is lazy, so `defineScript` needs no connection and can run at module load.
+
+**Keys and arguments travel as two arrays.** The driver splits a flat list positionally at `numberOfKeys` and cannot tell a misplaced key from a deliberate one: get the boundary wrong and the script reads a key nobody named — and in a cluster, routes to the node that key hashes to. Because the count is declared at registration, this library checks it on every call and rejects with `INVALID_ARGUMENT` instead of letting it through.
+
+Three things follow from `KEYS` being explicit:
+
+- **Your `keyPrefix` applies to them**, exactly as it does to any other key.
+- **Cluster routing works** — the script runs on the node owning its keys. Keys in different slots need a hash tag, same as `mget`.
+- **`readOnly: true`** marks a script as a reader, so `scaleReads` may send it to a replica.
+
+Server-side errors (a Lua syntax error, `WRONGTYPE`, a wrong `numberOfKeys` for what the script actually touches) propagate as the driver's own error after being logged.
+
 ## Sorted sets and rankings
 
 Sorted sets keep members ordered by score — the backbone of leaderboards, priority queues and score-based windows. Two conveniences over the raw protocol:
@@ -532,6 +566,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
 **Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `subscribeToKeyEvents`, `keyspaceNotifications`
 **Locking**: `acquireLock`, `withLock`
+**Lua**: `defineScript`, `runScript` — see [Lua scripts](#lua-scripts)
 **Streams**: see [Streams](#streams)
 **Scan**: `getAllStream(pattern)`
 

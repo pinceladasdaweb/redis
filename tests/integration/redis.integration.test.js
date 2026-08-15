@@ -371,6 +371,47 @@ describe('redis client integration', { skip: !RUN && 'set REDIS_INTEGRATION=1 (r
   // The lock's Lua scripts are cached by SHA on the server, and that cache
   // dies with a restart or a failover. Proving the reload works is the
   // difference between "ioredis probably handles it" and knowing.
+  // The shape a distributed circuit breaker needs: a fenced compare-and-set,
+  // where a stale generation must not be able to close a window a newer one
+  // opened. Registered Lua is what makes it atomic, and EVALSHA is what keeps
+  // it cheap enough to run on every request.
+  test('registered Lua runs a fenced compare-and-set, prefix and all', { timeout: 20000 }, async () => {
+    const client = new RedisClient({ host: HOST, port: PORT, keyPrefix: 'bw:', logger: quietLogger })
+    await client.connect()
+    await client.deleteByPattern('*')
+
+    client.defineScript('fencedSet', {
+      numberOfKeys: 1,
+      lua: `
+        local current = tonumber(redis.call("hget", KEYS[1], "generation")) or 0
+        if tonumber(ARGV[1]) < current then return {0, current} end
+        redis.call("hset", KEYS[1], "generation", ARGV[1], "state", ARGV[2])
+        return {1, tonumber(ARGV[1])}
+      `
+    })
+
+    assert.deepEqual(await client.runScript('fencedSet', ['breaker'], [1, 'open']), [1, 1])
+    assert.deepEqual(await client.runScript('fencedSet', ['breaker'], [2, 'half']), [1, 2])
+
+    // The stale generation loses, which is the entire point of the fence.
+    assert.deepEqual(await client.runScript('fencedSet', ['breaker'], [1, 'closed']), [0, 2])
+    assert.equal((await client.hgetall('breaker')).state, 'half', 'the newer generation stands')
+
+    // keyPrefix reaches the script's KEYS, so the state lives where the rest
+    // of the application's keys live — not next to them. Asked through the
+    // admin connection, which carries no prefix: `client.client` would prefix
+    // the question too and answer about `bw:bw:breaker`.
+    assert.equal(await admin.exists('bw:breaker'), 1, 'the script wrote to the prefixed key')
+    assert.equal(await admin.exists('breaker'), 0, 'and nothing landed unprefixed')
+
+    // And the SHA cache dying does not take the breaker with it.
+    await client.client.script('FLUSH')
+    assert.deepEqual(await client.runScript('fencedSet', ['breaker'], [3, 'closed']), [1, 3])
+
+    await client.deleteByPattern('*')
+    await client.disconnect()
+  })
+
   test('locking survives the script cache being wiped (NOSCRIPT)', { timeout: 20000 }, async () => {
     const client = new RedisClient({ host: HOST, port: PORT, logger: quietLogger })
     await client.connect()

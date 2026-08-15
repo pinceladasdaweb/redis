@@ -84,9 +84,13 @@ const createClient = (options = {}) => {
     disconnect: async () => {}
   }
 
+  // Every collaborator captured the real connection at construction, so each
+  // one has to be pointed at the fake. A new collaborator that is missed here
+  // fails with REDIS_UNAVAILABLE, which reads like a library bug and is not.
   redis.connection = connection
   redis.locks.connection = connection
   redis.subscriptions.connection = connection
+  redis.scripts.connection = connection
   redis.health.getClient = () => fake
 
   return { redis, calls, fake }
@@ -168,7 +172,8 @@ describe('wire contract', () => {
       'zadd', 'zscore', 'zincrby', 'zrange', 'zrevrange', 'zrangebyscore', 'zpopmin', 'zpopmax',
       'xautoclaim', 'keyspaceNotifications', 'subscribeToKeyEvents',
       'xread', 'xreadgroup', 'xgroup', 'xtrim', 'publishJson',
-      'subscribe', 'unsubscribe', 'psubscribe', 'punsubscribe', 'acquireLock', 'withLock'
+      'subscribe', 'unsubscribe', 'psubscribe', 'punsubscribe', 'acquireLock', 'withLock',
+      'defineScript', 'runScript'
     ])
     const covered = new Set(CONTRACTS.map(([method]) => method))
 
@@ -815,6 +820,41 @@ describe('wire contract', () => {
     assert.deepEqual(calls[0], ['xrange', 'st', '-', '+', 'COUNT', 5])
     assert.deepEqual(calls[1], ['xrevrange', 'st', '+', '-', 'COUNT', 5])
     assert.deepEqual(calls[2], ['xpending', 'st', 'g', '-', '+', 5, 'c1'])
+  })
+
+  // The registry has its own suite; this proves the facade is actually wired
+  // to it — including that the key count declared at registration reaches the
+  // call, which is the whole reason keys and args are separate arrays.
+  test('defineScript and runScript reach the registry', async () => {
+    const { redis, fake } = createClient()
+    const defined = []
+
+    fake.defineCommand = (name, definition) => {
+      defined.push({ name, ...definition })
+      fake[name] = async (...argv) => ['ran', ...argv]
+    }
+
+    redis.defineScript('cas', { numberOfKeys: 1, lua: 'return 1' })
+    assert.deepEqual(redis.scripts.names, ['cas'])
+
+    assert.deepEqual(await redis.runScript('cas', ['k'], ['a']), ['ran', 'k', 'a'])
+    assert.deepEqual(defined, [{ name: 'userScript_cas', numberOfKeys: 1, lua: 'return 1', readOnly: false }])
+
+    await assert.rejects(redis.runScript('cas', ['k', 'extra']), {
+      code: 'INVALID_ARGUMENT',
+      operation: 'runScript'
+    }, 'the declared key count is enforced through the facade too')
+
+    assert.throws(() => redis.defineScript('bad', { numberOfKeys: 1 }), {
+      code: 'INVALID_ARGUMENT',
+      operation: 'defineScript'
+    })
+
+    // A keyless script called with neither array: both defaults have to hold
+    // here, not only inside the registry.
+    redis.defineScript('tick', { numberOfKeys: 0, lua: 'return 1' })
+
+    assert.deepEqual(await redis.runScript('tick'), ['ran'])
   })
 
   test('withLock delegates to the lock manager', async () => {

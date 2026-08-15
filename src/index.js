@@ -4,6 +4,7 @@ import LockManager from './resilience/lock.js'
 import RedisConfig from './connection/config.js'
 import RedisClientError from './utils/errors.js'
 import HealthChecker from './connection/health.js'
+import ScriptRegistry from './scripting/scripts.js'
 import SubscriptionManager from './messaging/pubsub.js'
 import ConnectionManager from './connection/manager.js'
 import Logger, { createLogger } from './utils/logger.js'
@@ -96,6 +97,11 @@ class RedisClient extends EventEmitter {
       connection: this.connection,
       logger: this.logger,
       clock: this.clock
+    })
+
+    this.scripts = new ScriptRegistry({
+      connection: this.connection,
+      logger: this.logger
     })
   }
 
@@ -821,6 +827,23 @@ class RedisClient extends EventEmitter {
 
   async withLock (name, options, fn) {
     return this.locks.withLock(name, options, fn)
+  }
+
+  // Registers Lua once and calls it by name from then on. The driver sends the
+  // SHA rather than the script body, reloads it by itself on NOSCRIPT, and
+  // reinstalls it on the new client after a reconnection cycle. Use this over
+  // executeCommand('eval', …) for anything on a hot path — a compare-and-set
+  // that runs per request should not ship a program per request.
+  defineScript (name, definition) {
+    return this.scripts.define(name, definition)
+  }
+
+  // Keys and arguments travel as two arrays, not one flat list: KEYS is what
+  // makes a script routable in a cluster and prefixable at all, and a boundary
+  // the caller can get wrong silently is one this library refuses to have.
+  // The count declared at registration is checked here.
+  async runScript (name, keys = [], args = []) {
+    return this.scripts.run(name, keys, args)
   }
 
   async xadd (key, id, ...args) {
