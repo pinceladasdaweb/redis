@@ -171,14 +171,13 @@ describe('script registry', () => {
 
     registry.define('fetch', { lua: LUA, numberOfKeys: 1 })
 
-    await assert.rejects(registry.run('fetch', 'k'), {
-      code: 'INVALID_ARGUMENT',
-      message: /two arrays/
-    })
-    await assert.rejects(registry.run('fetch', ['k'], 'x'), {
-      code: 'INVALID_ARGUMENT',
-      message: /two arrays/
-    })
+    for (const [keys, args] of [['k', []], [['k'], 'x'], [null, []], [['k'], null]]) {
+      await assert.rejects(registry.run('fetch', keys, args), {
+        code: 'INVALID_ARGUMENT',
+        operation: 'runScript',
+        message: /two arrays/
+      }, `${JSON.stringify([keys, args])} must be refused`)
+    }
   })
 
   test('a malformed definition is refused at registration, not at first use', () => {
@@ -186,6 +185,9 @@ describe('script registry', () => {
 
     const bad = [
       ['', { lua: LUA, numberOfKeys: 1 }, /name to call the script by/],
+      [undefined, { lua: LUA, numberOfKeys: 1 }, /name to call the script by/],
+      [42, { lua: LUA, numberOfKeys: 1 }, /name to call the script by/],
+      [{ toString: () => 'sneaky' }, { lua: LUA, numberOfKeys: 1 }, /name to call the script by/],
       ['ok', { lua: '', numberOfKeys: 1 }, /non-empty string/],
       ['ok', { lua: '   ', numberOfKeys: 1 }, /non-empty string/],
       ['ok', { lua: LUA, numberOfKeys: -1 }, /non-negative integer/],
@@ -213,6 +215,18 @@ describe('script registry', () => {
 
     await assert.rejects(registry.run('boom', ['k']), /wrong number of args/)
     assert.match(logs.at(-1), /Lua script 'boom' failed.*wrong number of args/)
+  })
+
+  // The registry logs a debug line on registration, and `logger.debug?.()` is
+  // not decoration: a hand-rolled three-level logger is an ordinary thing to
+  // inject, and without the guard defineScript would throw on it.
+  test('a logger without debug() is not a crash', async () => {
+    const { registry } = createRegistry()
+
+    registry.logger = { error () {}, warn () {}, info () {} }
+
+    assert.doesNotThrow(() => registry.define('quiet', { lua: LUA, numberOfKeys: 1 }))
+    assert.equal(await registry.run('quiet', ['k']), 'OK')
   })
 
   test('names lists what is registered, in order', () => {

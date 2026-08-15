@@ -849,6 +849,12 @@ describe('wire contract', () => {
       code: 'INVALID_ARGUMENT',
       operation: 'defineScript'
     })
+
+    // A keyless script called with neither array: both defaults have to hold
+    // here, not only inside the registry.
+    redis.defineScript('tick', { numberOfKeys: 0, lua: 'return 1' })
+
+    assert.deepEqual(await redis.runScript('tick'), ['ran'])
   })
 
   test('withLock delegates to the lock manager', async () => {
