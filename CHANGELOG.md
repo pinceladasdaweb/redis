@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 4.2.0 (2026-08-18)
+
+* fix: the ten findings of the second full-source review by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/c3f555fae2868d768755d301b0f2d11517cf1b85)
+* test: mutation pass over the review fixes, and the docs they changed by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/47d3bc6e4c1938cbb566403a30954312bffc0b96)
+
+
 ## 4.1.0 (2026-08-15)
 
 * feat: register Lua scripts and call them by name by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/d2b48a695c92ceeb72517962cffe0b4e5cbeff5d)
