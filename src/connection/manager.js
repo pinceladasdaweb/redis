@@ -11,6 +11,7 @@ const SHUTDOWN_DEADLINE_MS = 2000
 // listeners here only track state and surface events on the facade.
 class ConnectionManager {
   #connectPromise = null
+  #disconnectPromise = null
   #client = null
   #isConnected = false
 
@@ -37,9 +38,37 @@ class ConnectionManager {
       return this.#connectPromise
     }
 
+    // A teardown in flight must be waited out, never raced: for the whole
+    // quit window #client still points at the dying client, and "reusing"
+    // it would resolve this call successfully moments before 'end' nulls
+    // the client out from under the caller — connected, with nothing behind
+    // it. Waiting lets the fresh cycle below start from a clean slate.
+    if (this.#disconnectPromise) {
+      await this.#disconnectPromise
+    }
+
+    // At 'close', a flap and a give-up are indistinguishable — the driver
+    // emits close→reconnecting or close→end in the SAME synchronous stack,
+    // so a supervisor reconnecting from a 'close' handler would decide with
+    // incomplete information. One deferral later the status has already
+    // become 'reconnecting' (reuse: the driver owns the retry) or 'end'
+    // (build fresh), and the ambiguity is gone.
+    if (this.#client?.status === 'close') {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
     if (this.#client) {
-      this.logger.debug?.('Redis client already exists. Reusing existing connection.')
-      return
+      // 'end' normally releases the client, but a caller can reach here in
+      // the same tick the driver gave up, before the handler ran. A client
+      // in that state can never carry a command again — reusing it would be
+      // the same "connected with nothing behind it" lie as above.
+      if (this.#client.status === 'end') {
+        this.#client.removeAllListeners()
+        this.#client = null
+      } else {
+        this.logger.debug?.('Redis client already exists. Reusing existing connection.')
+        return
+      }
     }
 
     // Only the attempt that is still current may clear the slot: disconnect()
@@ -123,8 +152,24 @@ class ConnectionManager {
 
   // Final and idempotent: quit() makes the driver emit 'end', which releases
   // the client (see #establishConnection) without ever scheduling a
-  // reconnection. A later connect() starts a brand-new cycle.
+  // reconnection. A later connect() starts a brand-new cycle — and one that
+  // arrives DURING this teardown waits for it (see connect()), which is what
+  // makes that promise true rather than aspirational.
   async disconnect () {
+    if (this.#disconnectPromise) {
+      return this.#disconnectPromise
+    }
+
+    const teardown = this.#teardown().finally(() => {
+      this.#disconnectPromise = null
+    })
+
+    this.#disconnectPromise = teardown
+
+    return teardown
+  }
+
+  async #teardown () {
     const client = this.#client
 
     // An attempt still in flight is abandoned here: its client is the one

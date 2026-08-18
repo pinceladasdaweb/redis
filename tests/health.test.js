@@ -11,17 +11,20 @@ const createChecker = ({ client, clock = createManualClock(), ...options } = {})
   return Object.assign(checker, { clock })
 }
 
+// Faithful to ioredis: ping() returns a promise. `silent` models a wedged
+// server — a promise that never settles, which is exactly the case the
+// probe's timeout (and stop()) exist for.
 const pingingClient = (reply, { fail = false, silent = false } = {}) => {
   const client = {
     status: 'ready',
     pings: 0,
-    ping (callback) {
+    ping () {
       client.pings++
 
-      if (silent) return
-      if (fail) return callback(new Error(reply))
+      if (silent) return new Promise(() => {})
+      if (fail) return Promise.reject(new Error(reply))
 
-      callback(null, reply)
+      return Promise.resolve(reply)
     }
   }
 
@@ -111,10 +114,10 @@ describe('health checker', () => {
     const client = {
       status: 'ready',
       pings: 0,
-      ping (callback) {
+      ping () {
         client.pings++
 
-        return failing ? callback(new Error('connection lost')) : callback(null, 'PONG')
+        return failing ? Promise.reject(new Error('connection lost')) : Promise.resolve('PONG')
       }
     }
     const checker = createChecker({ client, interval: 60000 })

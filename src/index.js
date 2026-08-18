@@ -5,6 +5,7 @@ import RedisConfig from './connection/config.js'
 import RedisClientError from './utils/errors.js'
 import HealthChecker from './connection/health.js'
 import ScriptRegistry from './scripting/scripts.js'
+import withDeadline from './utils/deadline.js'
 import SubscriptionManager from './messaging/pubsub.js'
 import ConnectionManager from './connection/manager.js'
 import Logger, { createLogger } from './utils/logger.js'
@@ -36,6 +37,10 @@ const KEY_EVENT_CLASSES = {
 // concurrency spike from leaving sockets parked forever.
 const MAX_IDLE_BLOCKING_CONNECTIONS = 4
 
+// How long the keyspace CONFIG probe may wait for an answer. Providers that
+// restrict CONFIG usually error immediately; this bounds the ones that hang.
+const CONFIG_PROBE_DEADLINE_MS = 2000
+
 // Thin facade: wires the collaborators together through a small context
 // (logger, config, emit) and exposes the command surface. Mutable state is
 // always reached through getters — never captured references.
@@ -44,6 +49,12 @@ class RedisClient extends EventEmitter {
   #dedicated = new Set()
   // Connections a blocking read finished with, ready for the next one.
   #idleBlocking = []
+  // Raised for the whole of disconnect(). The sequence below is async (each
+  // quit carries a deadline), and without this flag work arriving DURING the
+  // teardown would still pass assertReady — quit() does not flip the driver's
+  // status synchronously — and create connections AFTER their reapers ran:
+  // sockets nobody cancels, parked blocking reads that keep the process alive.
+  #closing = false
 
   constructor (options = {}) {
     super()
@@ -103,6 +114,12 @@ class RedisClient extends EventEmitter {
       connection: this.connection,
       logger: this.logger
     })
+
+    // The pool holds duplicate()s of the CURRENT client. When that cycle ends
+    // — quit or the driver giving up — those duplicates would otherwise keep
+    // their own infinite retry loops alive, invisible to the facade (their
+    // errors only reach logger.debug). The cycle's end is the pool's end.
+    this.on('end', () => this.#releaseDedicatedConnections())
   }
 
   get client () {
@@ -114,14 +131,44 @@ class RedisClient extends EventEmitter {
   }
 
   async connect () {
+    this.#closing = false
+
     return this.connection.connect()
   }
 
   async disconnect () {
-    await this.subscriptions.close()
-    this.#releaseDedicatedConnections()
+    this.#closing = true
 
-    return this.connection.disconnect()
+    try {
+      await this.subscriptions.close()
+      this.#releaseDedicatedConnections()
+      await this.connection.disconnect()
+    } finally {
+      // An in-flight health probe holds a deliberately ref'd timer (it is
+      // awaited); on a wedged server nothing would ever settle it, and the
+      // loop would stay open for up to healthCheckTimeout after this method
+      // resolved. Cancelling is the shutdown's job, not the probe's.
+      this.health.stop()
+      // Anything that slipped past the flag before it was raised has already
+      // been reaped above; this second sweep is the safety net for the one
+      // interleaving the flag cannot see — a lease that read #closing as
+      // false and was still awaiting assertReady when disconnect() started.
+      this.#releaseDedicatedConnections()
+    }
+  }
+
+  // Resource-creating paths check this before building anything: rejecting
+  // with the same code assertReady uses keeps "we are shutting down" and
+  // "the server is gone" indistinguishable to callers, which is exactly how
+  // a consumer loop wants to treat them.
+  #assertNotClosing (operation) {
+    if (this.#closing) {
+      throw new RedisClientError(
+        `disconnect() is in progress. Cannot execute '${operation}'.`,
+        operation,
+        'REDIS_UNAVAILABLE'
+      )
+    }
   }
 
   // A blocking read parked on a dedicated connection would otherwise outlive
@@ -152,6 +199,8 @@ class RedisClient extends EventEmitter {
   }
 
   async #withDedicatedConnection (operation, fn, { reuse = false } = {}) {
+    this.#assertNotClosing(operation)
+
     const client = this.connection.assertReady(operation)
     const held = { client: this.#lease(client, reuse), cancelled: false, reuse }
 
@@ -433,12 +482,18 @@ class RedisClient extends EventEmitter {
         return produceAndStore()
       })
     } catch (err) {
-      if (err?.code !== 'LOCK_NOT_ACQUIRED') {
+      // Only THIS cache entry's lock failing to be acquired means "fall
+      // back". The code alone cannot say which lock threw: a producer that
+      // uses withLock internally surfaces the same LOCK_NOT_ACQUIRED, and
+      // treating it as ours would rerun the producer unprotected — doubling
+      // its side effects precisely under the contention that made the inner
+      // lock fail. The error carries the lock's name for exactly this check.
+      if (err?.code !== 'LOCK_NOT_ACQUIRED' || err?.lockName !== `cache:${key}`) {
         throw err
       }
 
-      // A cache call must not surface lock errors. Waiters land here after
-      // waiting out their whole retry budget, so the winner has probably
+      // A cache call must not surface its own lock errors. Waiters land here
+      // after waiting out their whole retry budget, so the winner has probably
       // filled the cache by now — re-read, and only produce unprotected as
       // the last resort (availability beats perfect stampede protection).
       this.logger.debug?.(`Cache lock for '${key}' not acquired within the retry budget — falling back.`)
@@ -732,6 +787,8 @@ class RedisClient extends EventEmitter {
   }
 
   async subscribe (channel, handler) {
+    this.#assertNotClosing('subscribe')
+
     return this.subscriptions.subscribe(channel, handler)
   }
 
@@ -740,6 +797,8 @@ class RedisClient extends EventEmitter {
   }
 
   async psubscribe (pattern, handler) {
+    this.#assertNotClosing('psubscribe')
+
     return this.subscriptions.psubscribe(pattern, handler)
   }
 
@@ -757,13 +816,22 @@ class RedisClient extends EventEmitter {
   // CONFIG has no key to route on, so a cluster has to be asked node by node —
   // and every master must answer, because each one is configured on its own and
   // each one emits only its own slots' events.
+  //
+  // The probe is deadlined because its whole purpose is graceful degradation
+  // on managed providers that restrict CONFIG. A provider that HANGS on it
+  // instead of erroring would otherwise park this await forever — defeating
+  // the very fallback in #assertKeyspaceNotifications that was written for
+  // that class of provider.
   async #keyspaceFlagsByNode () {
     const client = this.connection.assertReady('keyspaceNotifications')
     const isCluster = typeof client.nodes === 'function'
     const targets = isCluster ? client.nodes('master') : [client]
 
     return Promise.all(targets.map(async (target) => {
-      const [, flags] = await target.config('GET', 'notify-keyspace-events')
+      const [, flags] = await withDeadline(
+        target.config('GET', 'notify-keyspace-events'),
+        { clock: this.clock, ms: CONFIG_PROBE_DEADLINE_MS, operation: 'keyspaceNotifications' }
+      )
 
       return {
         node: isCluster ? `${target.options.host}:${target.options.port}` : null,
@@ -776,6 +844,8 @@ class RedisClient extends EventEmitter {
   // a subscription to a silent channel looks exactly like one that works.
   // Probing turns that silence into an error that says what to enable.
   async subscribeToKeyEvents (event, handler, options = {}) {
+    this.#assertNotClosing('subscribeToKeyEvents')
+
     await this.#assertKeyspaceNotifications(event)
 
     const db = options.db ?? this.redisConfig.db
@@ -806,7 +876,15 @@ class RedisClient extends EventEmitter {
       const missing = []
 
       if (!flags.includes('E')) missing.push('E')
-      if (required && !flags.includes('A') && !flags.includes(required)) missing.push(required)
+
+      // 'A' is NOT "everything": redis.conf defines it as g$lshzxetd, which
+      // deliberately excludes 'n' (new-key) and 'm' (key-miss). Accepting 'A'
+      // for those would wave through the canonical "AKE" config and hand the
+      // caller a subscription that never speaks — the exact silence this
+      // probe exists to turn into an error.
+      const coveredByAlias = flags.includes('A') && !'nm'.includes(required)
+
+      if (required && !coveredByAlias && !flags.includes(required)) missing.push(required)
 
       if (missing.length > 0) {
         const where = node ? ` on cluster node ${node}` : ''

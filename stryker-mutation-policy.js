@@ -162,13 +162,73 @@ export const strykerPlugins = [
 //
 // --- Message text the matcher above deliberately does not reach -------------
 //
-// src/connection/manager.js:166, src/messaging/pubsub.js:275   `operation: 'quit'`
-//   This is the `operation` field of withDeadline's options object, and its
-//   only use is interpolation into the timeout Error's message. It is message
-//   text, but it reaches the message through a property rather than as a call
-//   argument, and widening the matcher to "any property named operation" would
-//   start swallowing the RedisClientError `operation` — which IS contract.
-//   Narrow matcher, two documented survivors: the right trade.
+// src/connection/manager.js, src/messaging/pubsub.js   `operation: 'quit'`
+//   The `operation` handed to withDeadline — which since 17/08 becomes the
+//   structured `operation` of an OPERATION_TIMEOUT RedisClientError. At THESE
+//   two call sites that error never reaches a consumer: manager logs its
+//   message and forces the socket closed; pubsub's release swallows it into a
+//   disconnect(). Where the timeout DOES surface (the keyspace CONFIG probe),
+//   the operation IS asserted and its mutant killed. Widening the matcher to
+//   "any property named operation" would swallow the contract field
+//   everywhere, so these two stay as documented survivors.
+//
+// --- Added with the shutdown-lifecycle fixes (17/08/2026) -------------------
+//
+// The blocking-pool trio — index.js #lease `if (reuse)`, #return's
+// `status === 'ready'` and `length < MAX` — is a FAKE LIMITATION, not an
+// equivalence: the wire recorder's duplicate() returns the same object, so a
+// pooled and a fresh connection are indistinguishable at the unit level. The
+// behavior itself is pinned end-to-end by the integration test 'consecutive
+// blocking reads reuse one connection', which counts real sockets via CLIENT
+// LIST. Killing these at unit level needs a recorder that mints distinct
+// duplicates — noted as the next faithful-fake upgrade, not papered over.
+//
+// `logger.debug?.()` call sites the recorder cannot drive (index.js dedicated
+// 'error' listener — the recorder's on() is a no-op; the cache-fallback debug;
+// scanner's skip line; manager's reuse line): the guard itself is proven by
+// 'a logger without debug() is not a crash' on representative sites; these
+// residual ones fire only inside paths a faithful driver fake cannot reach.
+//
+// index.js `...(typeof lock === 'object' ? lock : {})` -> `true` branch:
+// spreading a boolean is a JS no-op, so for `lock: true` the mutant IS the
+// original; the object path is pinned by the options-merge test. Spec
+// equivalence (§5.4's "spec de JS" class).
+//
+// index.js #getOrSet catch: the two `err?.` optional chains (an error caught
+// from an await is never nullish here — only Errors are thrown on that path)
+// and the `code !== …` operand-to-false variant, which would misroute only an
+// error that carries lockName `cache:<key>` WITHOUT the LOCK_NOT_ACQUIRED
+// code — unconstructible: LockManager is the only writer of lockName and
+// always pairs it with that code.
+//
+// zadd's isMemberMap guard chain (index.js): each surviving mutant shifts
+// WHICH guard rejects an input the contract never admits (an object plus
+// trailing args, a null single argument) — the downstream throw or the
+// driver's own error repairs it. Repair-downstream class.
+//
+// pubsub.js `if (handler)` pair (subscribe/subscribeEverywhere): the ->true
+// variant stores `undefined` as a handler, and #dispatch drops falsy handlers
+// on delivery — set-then-ignore, a no-op. Same class for #restore's no-op
+// halves (restoring an identical previous, deleting an absent key).
+//
+// pubsub.js #watchTopology identity guard ->false / empty-block: without the
+// early return the watcher detaches and re-attaches on the SAME client —
+// idempotent (listener count unchanged, same handler). Repaired by the
+// re-arm being idempotent.
+//
+// pubsub.js resync-tick `assertReady('subscribe')` string: the operation name
+// of a probe whose failure the tick swallows by design — unobservable.
+//
+// pubsub.js close() `if (#nodeResync)` ->true and lock.js `if (watchdog)`
+// ->true: clearing a null timer handle is a no-op in both the real clock and
+// the manual one. Guard-of-noop class.
+//
+// manager.js 'reconnecting' log template (three mutants) and lock.js's
+// "after ${retries + 1} attempt(s)" (two): message text whose template
+// interpolates something mutable, which the matcher above deliberately
+// refuses to ignore (§5.3 trap — swallowing the node would swallow killable
+// siblings). Killable only by asserting log text, which this library declares
+// non-contract. Same class: index.js's ` on cluster node ${node}` ternary arm.
 //
 // ---------------------------------------------------------------------------
 // Everything else still surviving is an open debt. Run
@@ -181,3 +241,11 @@ export const strykerPlugins = [
 // the notify-keyspace-events class map, the cluster option split, an injected
 // logger without debug(), and a fake that had been answering nodes('master')
 // for any role at all.
+//
+// After the shutdown-lifecycle fixes (17/08/2026): the new code initially
+// left 17 net-new survivors; a dedicated pass killed the killable ones with
+// 20 targeted tests — including three found only by reading the INSTRUMENTED
+// file (§5.5: the report blamed xread's ternary at one line while the live
+// mutant sat on xreadgroup's, and two wantsRange operands survived because
+// the partial-range cases covered every PAIR but no single field alone). The
+// remainder is documented above, each with its proof.

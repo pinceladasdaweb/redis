@@ -104,6 +104,8 @@ describe('subscription manager', () => {
     const { manager, subscriber, logs } = createManager()
 
     await manager.psubscribe('logs.*', () => {})
+    // Probed: a give-up emits close before end, in one stack.
+    subscriber.emit('close')
     subscriber.emit('end')
 
     assert.equal(logs.filter(([level]) => level === 'warn').length, 1)
@@ -286,6 +288,7 @@ describe('subscription manager', () => {
     const { manager, subscriber, logs, duplicates } = createManager()
 
     await manager.subscribe('news', () => {})
+    subscriber.emit('close')
     subscriber.emit('end')
 
     assert.equal(logs.filter(([level]) => level === 'warn').length, 1)
@@ -359,8 +362,12 @@ describe('cluster keyspace-event fan-out', () => {
       throw new Error('a cluster must never be duplicated for node-local events')
     }
 
+    // `current` is swappable so a test can model the reconnect cycle that
+    // replaces the Cluster instance out from under the collaborators.
+    const connection = { current: cluster, assertReady: () => connection.current }
+
     const manager = new SubscriptionManager({
-      connection: { assertReady: () => cluster },
+      connection,
       logger: {
         info () {},
         debug () {},
@@ -371,7 +378,7 @@ describe('cluster keyspace-event fan-out', () => {
       emit: (...args) => events.push(args)
     })
 
-    return { manager, masters, cluster, clock, events, logs, addMaster: (port) => masters.push(makeMaster(port)) }
+    return { manager, masters, cluster, connection, clock, events, logs, addMaster: (port) => masters.push(makeMaster(port)) }
   }
 
   test('every master gets its own subscriber', async () => {
@@ -429,6 +436,7 @@ describe('cluster keyspace-event fan-out', () => {
 
     await manager.subscribeEverywhere(KEY_EVENT, () => {})
 
+    masters[1].subscriber.emit('close')
     masters[1].subscriber.emit('end')
 
     assert.match(logs.at(-1)[1], /node 127\.0\.0\.1:7002 ended permanently/)
@@ -516,6 +524,307 @@ describe('cluster keyspace-event fan-out', () => {
     assert.deepEqual(events.at(-1), ['connectionError', 'socket reset with no Error wrapper'])
   })
 
+  // Review finding: a partial fan-out failure used to leave two of three
+  // shards delivering to a handler the caller believes was never installed,
+  // and the failed shard permanently silent. The call is atomic now.
+  test('a partial fan-out failure rolls everything back and can be retried', async () => {
+    const { manager, masters } = createClusterManager()
+    const before = []
+    const after = []
+
+    await manager.subscribeEverywhere(KEY_EVENT, (m) => before.push(m))
+
+    // Node 7002 refuses the next subscribe.
+    let refuse = true
+    const failing = masters[1].duplicate
+    masters[1].duplicate = () => {
+      const subscriber = failing.call(masters[1])
+      const real = subscriber.subscribe
+      subscriber.subscribe = async (channel) => {
+        if (refuse) throw new Error('CLUSTERDOWN The cluster is down')
+        return real.call(subscriber, channel)
+      }
+      return subscriber
+    }
+
+    // Force a fresh subscriber on 7002 so the failing subscribe is reached.
+    await manager.close()
+
+    // The undo on a succeeded shard is best effort: even if IT fails too,
+    // the original error is what surfaces.
+    const undoRefused = masters[0]
+    const originalDuplicate = undoRefused.duplicate
+    undoRefused.duplicate = () => {
+      const subscriber = originalDuplicate.call(undoRefused)
+      const realUnsubscribe = subscriber.unsubscribe
+      subscriber.unsubscribe = async (ch) => {
+        await realUnsubscribe.call(subscriber, ch)
+        throw new Error('connection already gone')
+      }
+      return subscriber
+    }
+
+    await assert.rejects(
+      manager.subscribeEverywhere(KEY_EVENT, (m) => after.push(m)),
+      /CLUSTERDOWN/,
+      'one refusing master must fail the whole call'
+    )
+
+    // The masters that DID subscribe were told to undo it...
+    assert.deepEqual(
+      masters[0].subscriber.calls.at(-1),
+      ['unsubscribe', KEY_EVENT],
+      'a succeeded shard must not keep delivering to a rolled-back handler'
+    )
+
+    // ...and the one that REFUSED gets no undo — there is nothing to undo,
+    // and an unsubscribe against it would mask which shard actually failed.
+    assert.equal(
+      masters[1].subscriber.calls.some((c) => c[0] === 'unsubscribe'),
+      false,
+      'the failed shard must not receive an undo'
+    )
+
+    // ...and the rolled-back handler receives nothing.
+    masters[0].subscriber.emit('message', KEY_EVENT, 'ghost')
+    await tick()
+    assert.deepEqual(after, [], 'the failed call must not leave its handler behind')
+
+    // A retry of the whole call succeeds once the shard recovers.
+    refuse = false
+    await manager.subscribeEverywhere(KEY_EVENT, (m) => after.push(m))
+    masters[1].subscriber.emit('message', KEY_EVENT, 'recovered')
+    await tick()
+    assert.deepEqual(after, ['recovered'])
+  })
+
+  // Review finding: the '+node' watcher was keyed on presence, not on client
+  // identity — after a reconnect cycle it stayed bound to the dead cluster
+  // and resharding lost shards silently forever.
+  test('the topology watcher follows the live client across a reconnect cycle', async () => {
+    const { manager, cluster, connection } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    assert.equal(cluster.listenerCount('+node'), 1)
+
+    // The driver gave up; a reconnect builds a brand-new Cluster instance.
+    const clusterB = new EventEmitter()
+    const newMaster = { options: { host: '127.0.0.1', port: 8001 } }
+    newMaster.duplicate = () => {
+      newMaster.subscriber = createSubscriber()
+      return newMaster.subscriber
+    }
+    clusterB.nodes = (role) => (role === 'master' ? [newMaster] : [])
+    connection.current = clusterB
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    assert.equal(cluster.listenerCount('+node'), 0, 'the dead client must be released')
+    assert.equal(clusterB.listenerCount('+node'), 1, 'the live client must be watched')
+    assert.deepEqual(newMaster.subscriber.calls, [['subscribe', KEY_EVENT]])
+
+    // Old masters keep whatever they had; the point is the NEW topology works.
+    clusterB.emit('+node')
+    await tick()
+    assert.equal(clusterB.listenerCount('+node'), 1, 'no duplicate watchers')
+  })
+
+  // Review finding: a replica promoted to master never fires '+node' (the
+  // driver only emits it for a host:port new to the pool), so the event alone
+  // cannot keep the fan-out complete. The periodic resync is the guarantee.
+  test('the periodic resync subscribes promoted masters and releases departed ones', async () => {
+    const { manager, masters, clock, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    // A promotion: new master appears with NO '+node' event...
+    addMaster(7004)
+    // ...and a departure: 7003 is no longer a master. Its release is best
+    // effort — even a socket that refuses its own teardown must not explode.
+    const departed = masters.splice(2, 1)[0]
+    const departedQuit = departed.subscriber.quit
+    departed.subscriber.quit = async () => {
+      await departedQuit()
+      throw new Error('teardown refused')
+    }
+    departed.subscriber.disconnect = () => { throw new Error('socket gone') }
+
+    await clock.advance(10000)
+    await tick()
+
+    assert.deepEqual(
+      masters.at(-1).subscriber.calls,
+      [['subscribe', KEY_EVENT]],
+      'the promoted master must be subscribed without any event'
+    )
+    assert.deepEqual(
+      departed.subscriber.calls.at(-1),
+      ['quit'],
+      'the departed master\'s subscriber must be released, not left retrying forever'
+    )
+  })
+
+  // The resync tick asks the CONNECTION for the live client — never the
+  // watcher, whose captured client is exactly what a reconnect makes stale.
+  // Between cycles there is no client at all, and the tick must simply wait.
+  test('the resync tick follows the connection through a full reconnect cycle', async () => {
+    const { manager, cluster, connection, clock } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    // Mid-cycle: no client. The tick must be a silent no-op.
+    connection.current = null
+    connection.assertReady = () => { throw Object.assign(new Error('down'), { code: 'REDIS_UNAVAILABLE' }) }
+    await clock.advance(10000)
+    await tick()
+
+    // Reconnected as a brand-new cluster: the NEXT tick alone must re-arm the
+    // watcher and subscribe the new topology, with no subscribe call needed.
+    const clusterB = new EventEmitter()
+    const master = { options: { host: '127.0.0.1', port: 9001 } }
+    master.duplicate = () => {
+      master.subscriber = createSubscriber()
+      return master.subscriber
+    }
+    clusterB.nodes = (role) => (role === 'master' ? [master] : [])
+    connection.assertReady = () => clusterB
+
+    await clock.advance(10000)
+    await tick()
+
+    assert.equal(cluster.listenerCount('+node'), 0, 'the dead client is released by the tick itself')
+    assert.equal(clusterB.listenerCount('+node'), 1, 'the live client is watched')
+    assert.deepEqual(master.subscriber.calls, [['subscribe', KEY_EVENT]], 'the new topology is subscribed')
+  })
+
+  // A standalone client between the fan-out and the tick (e.g. the facade was
+  // reconfigured): the tick must not treat it as a cluster.
+  test('the resync tick ignores a client with no nodes()', async () => {
+    const { manager, connection, clock, logs } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    connection.assertReady = () => ({ duplicate: () => createSubscriber() })
+    await clock.advance(10000)
+    await tick()
+
+    assert.deepEqual(logs.filter(([level]) => level === 'error'), [], 'no resync against a standalone client')
+  })
+
+  test('a resync with no registered channels does no work', async () => {
+    const { manager, masters, cluster, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.unsubscribe(KEY_EVENT)
+
+    for (const node of masters) {
+      node.subscriber.calls.length = 0
+    }
+
+    // A master joining while nothing is registered must not even get a
+    // connection opened toward it.
+    addMaster(7004)
+    cluster.emit('+node')
+    await tick()
+
+    for (const node of masters.slice(0, 3)) {
+      assert.deepEqual(node.subscriber.calls, [], 'no channels means nothing to reconcile')
+    }
+
+    assert.equal(masters.at(-1).subscriber, undefined, 'and no subscriber is created for the newcomer')
+  })
+
+  // The rollback must deregister ONLY what the failed call added: a channel
+  // that was already registered before it stays registered, or a later
+  // resync would silently stop covering it.
+  test('a failed RE-subscribe keeps the channel registered for the resync', async () => {
+    const { manager, masters, cluster, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    // The re-subscribe fails on one master...
+    masters[1].subscriber.subscribe = async () => { throw new Error('CLUSTERDOWN') }
+    await assert.rejects(manager.subscribeEverywhere(KEY_EVENT, () => {}), /CLUSTERDOWN/)
+
+    // ...but the channel was registered BEFORE the failed call, so a new
+    // master must still be subscribed to it by the watcher.
+    addMaster(7004)
+    cluster.emit('+node')
+    await tick()
+
+    assert.deepEqual(masters.at(-1).subscriber.calls, [['subscribe', KEY_EVENT]],
+      'the channel must survive the failed re-subscribe')
+  })
+
+  // The mirror of keeps-registered: a channel whose FIRST fan-out failed was
+  // never established, so the rollback must deregister it — or the watcher
+  // would subscribe new masters to a channel the caller believes failed.
+  test('a failed first fan-out deregisters the channel from the watcher', async () => {
+    const { manager, masters, cluster, addMaster } = createClusterManager()
+
+    masters[1].duplicate = () => {
+      const subscriber = createSubscriber()
+      subscriber.subscribe = async () => { throw new Error('CLUSTERDOWN') }
+      masters[1].subscriber = subscriber
+      return subscriber
+    }
+
+    await assert.rejects(manager.subscribeEverywhere(KEY_EVENT, () => {}), /CLUSTERDOWN/)
+
+    addMaster(7004)
+    cluster.emit('+node')
+    await tick()
+
+    assert.equal(
+      masters.at(-1).subscriber,
+      undefined,
+      'a channel that never established must not spread to new masters'
+    )
+  })
+
+  test('the fan-out reports the last master count, and unsubscribe likewise', async () => {
+    const { manager, masters } = createClusterManager()
+
+    // Distinct per-node replies: only the LAST one may be reported, the same
+    // convention the driver uses for variadic subscribes.
+    masters.forEach((node, index) => {
+      const original = node.duplicate
+      node.duplicate = () => {
+        const subscriber = original.call(node)
+        subscriber.subscribe = async (ch) => { subscriber.calls.push(['subscribe', ch]); return index + 1 }
+        subscriber.unsubscribe = async (ch) => { subscriber.calls.push(['unsubscribe', ch]); return (index + 1) * 10 }
+        return subscriber
+      }
+    })
+
+    assert.equal(await manager.subscribeEverywhere(KEY_EVENT, () => {}), 3)
+    assert.equal(await manager.unsubscribe(KEY_EVENT), 30)
+  })
+
+  test('only one resync clock exists, however many cycles the watcher survives', async () => {
+    const { manager, clock, connection } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    const after = clock.pending()
+
+    // A reconnect cycle re-arms the watcher on a new client...
+    const clusterB = new EventEmitter()
+    clusterB.nodes = () => []
+    connection.current = clusterB
+    await manager.subscribeEverywhere(KEY_EVENT, () => {}).catch(() => {})
+
+    assert.equal(clock.pending(), after, 're-arming must not stack a second interval')
+  })
+
+  test('close stops the resync clock', async () => {
+    const { manager, clock } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.close()
+
+    assert.equal(clock.pending(), 0, 'no timer may survive close()')
+  })
+
   test('close releases every per-node subscriber', async () => {
     const { manager, masters } = createClusterManager()
 
@@ -526,6 +835,22 @@ describe('cluster keyspace-event fan-out', () => {
       assert.deepEqual(node.subscriber.calls.at(-1), ['quit'], `master ${node.options.port} must be released`)
       assert.equal(node.subscriber.listenerCount('message'), 0)
     }
+  })
+
+  test('the fan-out names its operation at the readiness gate', async () => {
+    const { manager, connection } = createClusterManager()
+    const asked = []
+
+    const real = connection.assertReady.bind(connection)
+    connection.assertReady = (operation) => {
+      asked.push(operation)
+      return real(operation)
+    }
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    assert.deepEqual([...new Set(asked)], ['subscribe'],
+      'a REDIS_UNAVAILABLE from this path must name the operation a caller recognizes')
   })
 
   test('outside a cluster it stays a single subscription', async () => {

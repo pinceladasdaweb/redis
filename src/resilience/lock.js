@@ -84,11 +84,19 @@ class LockManager {
       }
     }
 
-    throw new RedisClientError(
+    const failure = new RedisClientError(
       `Could not acquire lock '${name}' after ${retries + 1} attempt(s).`,
       'acquireLock',
       'LOCK_NOT_ACQUIRED'
     )
+
+    // Which lock refused, as structure: `code` and `operation` are the same
+    // for every lock, and the name must never have to be parsed out of the
+    // message — a caller holding locks inside a producer needs to tell its
+    // own failure from the cache's (see #getOrSet).
+    failure.lockName = name
+
+    throw failure
   }
 
   async withLock (name, options, fn) {

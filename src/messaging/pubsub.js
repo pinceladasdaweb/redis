@@ -3,6 +3,12 @@ import withDeadline from '../utils/deadline.js'
 // Nothing on the shutdown path may block forever — see utils/deadline.js.
 const SHUTDOWN_DEADLINE_MS = 2000
 
+// How often the keyspace-event fan-out reconciles its subscribers with the
+// cluster's current masters. The '+node' event is the fast path; this is the
+// guarantee (promotions never fire '+node'). Each tick is a local map
+// comparison — no network unless the topology actually drifted.
+const TOPOLOGY_RESYNC_MS = 10000
+
 // Pub/Sub manager. A connection in subscriber mode cannot execute regular
 // commands, so subscriptions live on a dedicated connection created lazily
 // from the main one. Re-subscribing after a reconnection is handled by the
@@ -17,6 +23,7 @@ class SubscriptionManager {
   #nodeSubscribers = new Map()
   #nodeChannels = new Set()
   #nodeWatcher = null
+  #nodeResync = null
 
   constructor ({ connection, logger, clock, emit }) {
     this.connection = connection
@@ -113,12 +120,22 @@ class SubscriptionManager {
   // attaches to a single sampled node. Subscribing the normal way would deliver
   // one shard's events and look exactly like a subscription that works, so
   // these channels get one subscriber per master instead.
+  //
+  // The call is atomic to the caller: if any master refuses, every mutation is
+  // rolled back — the previous handler restored, the channel deregistered, the
+  // masters that DID subscribe unsubscribed — and the error rethrown. Without
+  // that, a partial failure left two of three shards delivering events to a
+  // handler the caller believes was never installed, and the third permanently
+  // silent. A failed call can simply be retried whole.
   async subscribeEverywhere (channel, handler) {
     const client = this.connection.assertReady('subscribe')
 
     if (typeof client.nodes !== 'function') {
       return this.subscribe(channel, handler)
     }
+
+    const previous = this.#channelHandlers.get(channel)
+    const wasRegistered = this.#nodeChannels.has(channel)
 
     if (handler) {
       this.#channelHandlers.set(channel, handler)
@@ -127,11 +144,34 @@ class SubscriptionManager {
     this.#nodeChannels.add(channel)
     this.#watchTopology(client)
 
-    const counts = await Promise.all(
-      client.nodes('master').map((node) => this.#subscribeNode(node, [channel]))
+    const masters = client.nodes('master')
+    const outcomes = await Promise.allSettled(
+      masters.map((node) => this.#subscribeNode(node, [channel]))
     )
 
-    return counts.at(-1) ?? 0
+    const failed = outcomes.find((outcome) => outcome.status === 'rejected')
+
+    if (failed) {
+      this.#restore(this.#channelHandlers, channel, previous, handler)
+
+      if (!wasRegistered) {
+        this.#nodeChannels.delete(channel)
+      }
+
+      // The masters that answered are subscribed to a channel whose handler
+      // is being taken back — undo them, best effort (a node that refuses
+      // the undo will simply dispatch to no handler, which is inert).
+      for (const [index, outcome] of outcomes.entries()) {
+        if (outcome.status !== 'fulfilled') continue
+
+        const subscriber = this.#nodeSubscribers.get(this.#nodeKey(masters[index]))
+        subscriber?.unsubscribe(channel).catch(() => {})
+      }
+
+      throw failed.reason
+    }
+
+    return outcomes.at(-1)?.value ?? 0
   }
 
   #nodeKey (node) {
@@ -167,25 +207,84 @@ class SubscriptionManager {
 
   // Resharding adds masters after the fan-out: without this, a new shard's
   // events would be missing for the rest of the process's life.
+  //
+  // Two ways the '+node' event alone proved insufficient, both measured
+  // against the driver: the listener dies with its client (a reconnect cycle
+  // builds a brand-new Cluster instance, so the watcher must follow the LIVE
+  // client, not the first one it saw), and a replica PROMOTED to master never
+  // fires '+node' at all — ioredis only emits it for a host:port that is new
+  // to the pool; promotions go through onRoleChange, silently. So the event
+  // is the fast path, and a slow periodic resync is the guarantee: it
+  // subscribes masters that appeared without an event and releases
+  // subscribers whose node is no longer a master.
   #watchTopology (client) {
-    if (this.#nodeWatcher) {
+    if (this.#nodeWatcher?.client === client) {
       return
     }
 
-    const handler = () => {
-      for (const node of client.nodes('master')) {
-        if (this.#nodeChannels.size === 0 || this.#nodeSubscribers.has(this.#nodeKey(node))) {
-          continue
-        }
-
-        this.#subscribeNode(node, [...this.#nodeChannels]).catch((err) => {
-          this.logger.error(`Could not extend keyspace-event subscriptions to cluster node ${this.#nodeKey(node)}: ${err.message}`)
-        })
-      }
+    // A previous cycle's watcher points at a dead client: detach and re-arm.
+    if (this.#nodeWatcher) {
+      this.#nodeWatcher.client.removeListener('+node', this.#nodeWatcher.handler)
     }
+
+    const handler = () => this.#resyncTopology(client)
 
     client.on('+node', handler)
     this.#nodeWatcher = { client, handler }
+
+    if (!this.#nodeResync) {
+      // Fire-and-forget by design, so unref is correct here (nothing awaits
+      // it): the resync must never be what keeps the process alive.
+      //
+      // The tick asks the CONNECTION for the live client — never the watcher,
+      // whose captured client is exactly what a reconnect cycle makes stale.
+      this.#nodeResync = this.clock.setInterval(() => {
+        let current
+
+        try {
+          current = this.connection.assertReady('subscribe')
+        } catch {
+          return // between cycles; the next tick will see the new client
+        }
+
+        if (typeof current.nodes !== 'function') {
+          return
+        }
+
+        this.#watchTopology(current)
+        this.#resyncTopology(current)
+      }, TOPOLOGY_RESYNC_MS)
+
+      this.#nodeResync.unref?.()
+    }
+  }
+
+  #resyncTopology (client) {
+    if (this.#nodeChannels.size === 0) {
+      return
+    }
+
+    const masters = new Map(client.nodes('master').map((node) => [this.#nodeKey(node), node]))
+
+    // Masters without a subscriber: new shards, or replicas promoted without
+    // a '+node'. Either way their events are being lost right now.
+    for (const [key, node] of masters) {
+      if (this.#nodeSubscribers.has(key)) continue
+
+      this.#subscribeNode(node, [...this.#nodeChannels]).catch((err) => {
+        this.logger.error(`Could not extend keyspace-event subscriptions to cluster node ${key}: ${err.message}`)
+      })
+    }
+
+    // Subscribers whose node left the master set: departed or demoted nodes
+    // whose connection would otherwise retry forever, invisibly.
+    for (const [key, subscriber] of this.#nodeSubscribers) {
+      if (masters.has(key)) continue
+
+      this.#nodeSubscribers.delete(key)
+      this.#release(subscriber).catch(() => {})
+      this.logger.info(`Keyspace-event subscriber for ${key} released: the node is no longer a master.`)
+    }
   }
 
   async unsubscribe (channel) {
@@ -256,6 +355,11 @@ class SubscriptionManager {
     if (this.#nodeWatcher) {
       this.#nodeWatcher.client.removeListener('+node', this.#nodeWatcher.handler)
       this.#nodeWatcher = null
+    }
+
+    if (this.#nodeResync) {
+      this.clock.clearInterval(this.#nodeResync)
+      this.#nodeResync = null
     }
 
     await Promise.all(closing.map((subscriber) => this.#release(subscriber)))

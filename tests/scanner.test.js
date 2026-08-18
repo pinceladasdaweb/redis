@@ -195,6 +195,33 @@ describe('keyspace scanner', () => {
 
     assert.equal(await deletePattern({ client, logger: quietLogger, pattern: '*' }), 0)
     assert.deepEqual(state.unlinked, [], 'an empty batch must not issue UNLINK')
+    assert.deepEqual(state.patterns, ['*'], 'no keyPrefix means the raw pattern, not a mangled one')
+  })
+
+  // Review finding: the per-key skip used to swallow EVERY error class, but
+  // only WRONGTYPE (a non-string key) is documented and safe to skip. A MOVED
+  // during a slot migration — which these node-level pipelines never follow —
+  // was silently dropped, and the walk resolved with a truncated result that
+  // looked complete.
+  test('getAllStream skips WRONGTYPE only; any other per-key error is fatal', async () => {
+    const wrongtype = createClient({
+      batches: [['app:a', 'app:b']],
+      pipelineResults: [[[new Error('WRONGTYPE Operation against a key holding the wrong kind of value'), null], [null, '2']]]
+    })
+
+    const data = await scanKeyspace({ client: wrongtype.client, keyPrefix: 'app:', logger: quietLogger, pattern: '*' })
+    assert.deepEqual(data, [{ b: '2' }], 'a non-string key is skipped, as documented')
+
+    const moved = createClient({
+      batches: [['app:a', 'app:b']],
+      pipelineResults: [[[new Error('MOVED 3999 127.0.0.1:7002'), null], [null, '2']]]
+    })
+
+    await assert.rejects(
+      scanKeyspace({ client: moved.client, keyPrefix: 'app:', logger: quietLogger, pattern: '*' }),
+      /MOVED/,
+      'a truncated result that looks complete is worse than a failure'
+    )
   })
 
   // A pipeline resolves even when one of its commands failed, reporting the

@@ -42,12 +42,18 @@ export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' |
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'OPERATION_TIMEOUT' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
   operation: string
   code: RedisClientErrorCode | string
+  /**
+   * On `LOCK_NOT_ACQUIRED` only: which lock refused. `code` and `operation`
+   * are the same for every lock, so this is how a caller holding locks inside
+   * a `getOrSet` producer tells its own failure from the cache's.
+   */
+  lockName?: string
   constructor (message: string, operation: string, code?: string)
 }
 
@@ -161,8 +167,10 @@ export interface CacheAsideOptions {
   /**
    * Stampede protection: true (defaults: ttl 10s auto-extended, 100 retries
    * of 50ms+jitter) or LockOptions to tune. Concurrent misses collapse into
-   * one producer call. Lock errors never surface from cache calls: an
+   * one producer call. The cache's OWN lock errors never surface: an
    * exhausted retry budget falls back to re-read, then unprotected produce.
+   * A LOCK_NOT_ACQUIRED thrown by a lock the producer holds is the
+   * producer's error and propagates (told apart via `lockName`).
    */
   lock?: boolean | LockOptions
 }
