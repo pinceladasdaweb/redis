@@ -52,6 +52,17 @@ class HealthChecker {
     return client && client.status === 'ready' ? client : null
   }
 
+  // Cancels an in-flight probe: clears its timer and settles it as unhealthy.
+  // Shutdown needs this — the probe's timer is deliberately ref'd (it is
+  // awaited, and an unref'd awaited timer never fires on an idle loop), so a
+  // PING that will never be answered would otherwise hold the process open
+  // for up to `timeout` after disconnect() resolved.
+  stop () {
+    this.#cancelInFlight?.()
+  }
+
+  #cancelInFlight = null
+
   async #performCheck () {
     const client = this.#readyClient()
 
@@ -60,18 +71,27 @@ class HealthChecker {
     }
 
     try {
-      const pong = await this.#timeoutOperation(
-        (callback) => {
-          client.ping((err, result) => {
-            if (err) {
-              callback(err)
-            } else {
-              callback(null, result)
-            }
-          })
-        },
-        this.timeout
-      )
+      const pong = await new Promise((resolve, reject) => {
+        // Deliberately not unref'd: the caller awaits this promise, and an
+        // unref'd timer never fires once the event loop has nothing else
+        // scheduled — the probe would hang instead of timing out. It is
+        // cleared as soon as the reply lands (or stop() runs), so it holds
+        // nothing open past its answer.
+        const timeoutId = this.clock.setTimeout(() => {
+          this.#cancelInFlight = null
+          reject(new Error('Operation timed out'))
+        }, this.timeout)
+
+        const settle = (fn) => (value) => {
+          this.clock.clearTimeout(timeoutId)
+          this.#cancelInFlight = null
+          fn(value)
+        }
+
+        this.#cancelInFlight = settle(resolve).bind(null, null)
+
+        client.ping().then(settle(resolve), settle(reject))
+      })
 
       return pong === 'PONG'
     } catch (error) {
@@ -79,28 +99,6 @@ class HealthChecker {
 
       return false
     }
-  }
-
-  #timeoutOperation (operation, ms) {
-    return new Promise((resolve, reject) => {
-      // Deliberately not unref'd: the caller awaits this promise, and an
-      // unref'd timer never fires once the event loop has nothing else
-      // scheduled — the probe would hang instead of timing out. It is
-      // cleared as soon as the reply lands, so it holds nothing open.
-      const timeoutId = this.clock.setTimeout(() => {
-        reject(new Error('Operation timed out'))
-      }, ms)
-
-      operation((err, result) => {
-        this.clock.clearTimeout(timeoutId)
-
-        if (err) {
-          reject(err)
-        } else {
-          resolve(result)
-        }
-      })
-    })
   }
 }
 

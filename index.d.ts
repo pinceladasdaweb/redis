@@ -42,12 +42,18 @@ export interface RedisClientOptions extends Omit<RedisOptions, 'retryStrategy' |
   logger?: Logger
 }
 
-export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'REDIS_CLIENT_ERROR'
+export type RedisClientErrorCode = 'REDIS_UNAVAILABLE' | 'UNSUPPORTED_OPERATION' | 'LOCK_NOT_ACQUIRED' | 'INVALID_ARGUMENT' | 'INVALID_OPTION' | 'KEYSPACE_NOTIFICATIONS_DISABLED' | 'OPERATION_TIMEOUT' | 'REDIS_CLIENT_ERROR'
 
 export declare class RedisClientError extends Error {
   name: 'RedisClientError'
   operation: string
   code: RedisClientErrorCode | string
+  /**
+   * On `LOCK_NOT_ACQUIRED` only: which lock refused. `code` and `operation`
+   * are the same for every lock, so this is how a caller holding locks inside
+   * a `getOrSet` producer tells its own failure from the cache's.
+   */
+  lockName?: string
   constructor (message: string, operation: string, code?: string)
 }
 

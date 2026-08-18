@@ -49,12 +49,21 @@ const scanKeyspace = async ({ client, keyPrefix = '', logger, pattern = '*' }) =
       // reported the keys, so they never cross a slot boundary.
       const results = await node.pipeline(properties.map((property) => ['get', property])).exec()
 
-      results.forEach(([err, value], index) => {
+      for (const [index, [err, value]] of results.entries()) {
         const property = properties[index]
 
         if (err) {
-          logger.debug?.(`getAllStream skipped key '${property}': ${err.message}`)
-          return
+          // The one error this walk may absorb: GET on a non-string key. The
+          // README documents that skip. Anything else — MOVED/ASK mid-reshard
+          // (these node-level pipelines never follow redirections), LOADING,
+          // CLUSTERDOWN — means the result would be silently incomplete, and
+          // a truncated answer that looks complete is worse than a failure.
+          if (String(err.message).startsWith('WRONGTYPE')) {
+            logger.debug?.(`getAllStream skipped non-string key '${property}'`)
+            continue
+          }
+
+          throw err
         }
 
         // SCAN may return a key more than once; null means the key expired
@@ -63,7 +72,7 @@ const scanKeyspace = async ({ client, keyPrefix = '', logger, pattern = '*' }) =
           seen.add(property)
           data.push({ [property]: value })
         }
-      })
+      }
     }).catch((err) => {
       logger.error(`Error in getAllStream: ${err.message}`)
 

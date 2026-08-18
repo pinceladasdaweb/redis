@@ -35,7 +35,12 @@ const createClient = ({ store = new Map(), lockBehavior = 'grant' } = {}) => {
       lockCalls.push([name, options])
 
       if (lockBehavior === 'denied') {
-        throw new RedisClientError(`Could not acquire lock '${name}'.`, 'acquireLock', 'LOCK_NOT_ACQUIRED')
+        // Faithful to LockManager: the failure names its lock, and the
+        // facade's fallback only fires for the cache's own.
+        const failure = new RedisClientError(`Could not acquire lock '${name}'.`, 'acquireLock', 'LOCK_NOT_ACQUIRED')
+        failure.lockName = name
+
+        throw failure
       }
 
       if (lockBehavior === 'broken') {
@@ -172,6 +177,30 @@ describe('cache-aside', () => {
     assert.equal(calls, 1, 'an empty cache inside the lock must still produce')
     assert.deepEqual(value, { produced: true })
     assert.deepEqual(writes, [['k', 60, '{"produced":true}']])
+  })
+
+  // Review finding: the fallback used to match on code alone, and a producer
+  // that uses locks internally surfaces the same LOCK_NOT_ACQUIRED — the
+  // facade misread it as its own cache lock failing, released the real cache
+  // lock, and reran the producer UNPROTECTED under the very contention that
+  // made the inner lock fail.
+  test("a producer's own lock failure propagates instead of rerunning the producer", async () => {
+    const { redis } = createClient()
+    let calls = 0
+
+    const innerFailure = new RedisClientError("Could not acquire lock 'render:report'.", 'acquireLock', 'LOCK_NOT_ACQUIRED')
+    innerFailure.lockName = 'render:report'
+
+    await assert.rejects(
+      redis.getOrSetJson('report', 60, async () => {
+        calls++
+        throw innerFailure
+      }, { lock: true }),
+      (err) => err.lockName === 'render:report',
+      'the inner failure must reach the caller untranslated'
+    )
+
+    assert.equal(calls, 1, 'the producer must never be rerun on a foreign lock failure')
   })
 
   test('an exhausted lock budget re-reads what the winner cached', async () => {
