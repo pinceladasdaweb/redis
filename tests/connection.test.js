@@ -469,6 +469,7 @@ describe('connection manager', () => {
 
     assert.equal(created.length, 2, 'an ended client is never "reused"')
     assert.equal(manager.client, created[1])
+    assert.equal(created[0].listenerCount('end'), 0, 'the corpse must be released, not just replaced')
   })
 
   test('reconnecting is reported even when the driver omits the delay', async () => {

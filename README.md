@@ -129,7 +129,7 @@ What changes once keys live on different nodes:
 - **Multi-key commands need one slot.** `mget`, `mset`, `del` with several keys, `multi()` batches — all of them fail with `CROSSSLOT` unless the keys hash together. Force that with a hash tag: `{user:1}:name` and `{user:1}:role` share a slot, so a command can span them.
 - **`getAllStream` and `deleteByPattern` walk every master** and merge the results, because a cluster has no keyspace-wide `SCAN`. Deletion issues one `UNLINK` per key for the same slot reason.
 - **Database 0 only** — asking for another one is rejected at construction rather than silently reading from the wrong place.
-- **Keyspace events are node-local.** Unlike `publish`, which the cluster bus spreads everywhere, each node emits keyspace notifications for its own slots and never forwards them. `subscribeToKeyEvents` therefore opens one subscriber per master (and follows resharding), and its probe requires *every* master to be configured — one silent shard is one third of your expirations gone.
+- **Keyspace events are node-local.** Unlike `publish`, which the cluster bus spreads everywhere, each node emits keyspace notifications for its own slots and never forwards them. `subscribeToKeyEvents` therefore opens one subscriber per master and keeps the set reconciled with the live topology — resharding is followed by event, and promotions (which the driver announces to no one) by a periodic resync that also releases subscribers of departed masters. Its probe requires *every* master to be configured — one silent shard is one third of your expirations gone. Mind the alias: `A` in `notify-keyspace-events` deliberately excludes the `n` (new-key) and `m` (key-miss) classes, and the probe knows it — the canonical `"AKE"` is not enough for `subscribeToKeyEvents('new', …)`.
 - Everything single-key is unchanged: locks (the Lua scripts declare their key, so they route), cache-aside, counters, sorted sets, streams.
 
 The cluster suite runs against three real masters:
@@ -238,12 +238,13 @@ All library errors are `RedisClientError` instances carrying `operation` and a s
 
 | Code | Meaning |
 | --- | --- |
-| `REDIS_UNAVAILABLE` | The command was rejected because the connection is not ready. Nothing was sent |
+| `REDIS_UNAVAILABLE` | The command was rejected because the connection is not ready — or `disconnect()` is in progress. Nothing was sent |
 | `UNSUPPORTED_OPERATION` | The method cannot work safely on the shared connection (`watch`/`unwatch`) |
-| `LOCK_NOT_ACQUIRED` | `acquireLock`/`withLock` could not obtain the lock within the configured retries |
+| `LOCK_NOT_ACQUIRED` | `acquireLock`/`withLock` could not obtain the lock within the configured retries. Carries `lockName`, so a caller holding locks inside a `getOrSet` producer can tell whose failure it is |
 | `INVALID_ARGUMENT` | A required argument is missing or malformed (e.g. `xtrim` without a count) |
 | `INVALID_OPTION` | A constructor option is malformed or is one the library manages |
 | `KEYSPACE_NOTIFICATIONS_DISABLED` | The server is not configured to emit the requested key event |
+| `OPERATION_TIMEOUT` | A deadlined internal call (the keyspace `CONFIG` probe, shutdown `QUIT`s) got no answer in time |
 | `REDIS_CLIENT_ERROR` | Generic library error |
 
 ```javascript
@@ -545,7 +546,7 @@ const entries = await redis.xreadgroup('workers', 'worker-1', { count: 10, block
 
 ## Keyspace scan
 
-`getAllStream(pattern)` returns `[{ key: value }, ...]` for every **string** key matching the pattern *within your `keyPrefix`* (raw `SCAN` ignores ioredis prefixes; this method compensates). Non-string keys are skipped, reads are pipelined per SCAN batch, and returned keys come unprefixed:
+`getAllStream(pattern)` returns `[{ key: value }, ...]` for every **string** key matching the pattern *within your `keyPrefix`* (raw `SCAN` ignores ioredis prefixes; this method compensates). Non-string keys are skipped — and *only* those: any other per-key failure (a `MOVED` during a cluster reshard, say) fails the walk loudly, because a truncated result that looks complete is worse than an error. Reads are pipelined per SCAN batch, and returned keys come unprefixed:
 
 ```javascript
 const redis = new RedisClient({ host, port, keyPrefix: 'myapp:' })
@@ -577,6 +578,8 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 - Values are sent as-is: no implicit JSON serialization anywhere (`mset` included). Use the `*Json` helpers.
 - `sort()`'s `by` and `get` patterns are sent verbatim: unlike keys, the driver never rewrites them, so include your `keyPrefix` yourself when using them.
 - `getJson` returns `null` for missing keys and throws `SyntaxError` on non-JSON payloads.
+- `getOrSet`/`getOrSetJson` never surface **their own** lock's errors — an exhausted budget falls back to re-read, then unprotected produce. A `LOCK_NOT_ACQUIRED` thrown by a lock the *producer* holds is the producer's error and propagates like any other (the `lockName` field is how they are told apart).
+- A command issued while `disconnect()` is running rejects with `REDIS_UNAVAILABLE`, same as a dead connection: shutdown refuses to create new connections it would have to hunt down.
 - A command issued while disconnected rejects with `REDIS_UNAVAILABLE` — it is **not** queued (the tiny race window that slips into the driver's offline queue is resent on reconnection; bound it with `commandTimeout` if needed).
 - `xpending()` answers two different questions in two different shapes: the group summary with no options, the pending entries with `start`, `end` and `count`. A partial range rejects with `INVALID_ARGUMENT` instead of silently answering the other one.
 - Blocking reads (`xread`/`xreadgroup` with `block`) run on a dedicated connection so they never stall the shared one, and that connection is **pooled** between reads — a consumer loop does not pay a handshake per iteration. `disconnect()` closes the pool along with everything else.

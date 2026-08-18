@@ -167,8 +167,10 @@ export interface CacheAsideOptions {
   /**
    * Stampede protection: true (defaults: ttl 10s auto-extended, 100 retries
    * of 50ms+jitter) or LockOptions to tune. Concurrent misses collapse into
-   * one producer call. Lock errors never surface from cache calls: an
+   * one producer call. The cache's OWN lock errors never surface: an
    * exhausted retry budget falls back to re-read, then unprotected produce.
+   * A LOCK_NOT_ACQUIRED thrown by a lock the producer holds is the
+   * producer's error and propagates (told apart via `lockName`).
    */
   lock?: boolean | LockOptions
 }

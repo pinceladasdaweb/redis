@@ -195,6 +195,7 @@ describe('keyspace scanner', () => {
 
     assert.equal(await deletePattern({ client, logger: quietLogger, pattern: '*' }), 0)
     assert.deepEqual(state.unlinked, [], 'an empty batch must not issue UNLINK')
+    assert.deepEqual(state.patterns, ['*'], 'no keyPrefix means the raw pattern, not a mangled one')
   })
 
   // Review finding: the per-key skip used to swallow EVERY error class, but

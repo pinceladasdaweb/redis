@@ -179,6 +179,18 @@ describe('cache-aside', () => {
     assert.deepEqual(writes, [['k', 60, '{"produced":true}']])
   })
 
+  test('lock options given as an object reach the lock manager merged over the defaults', async () => {
+    const { redis, lockCalls } = createClient()
+
+    await redis.getOrSetJson('k', 60, () => ({ ok: true }), { lock: { ttl: 5000, retries: 2 } })
+
+    const [name, options] = lockCalls[0]
+    assert.equal(name, 'cache:k')
+    assert.equal(options.ttl, 5000, 'caller ttl wins')
+    assert.equal(options.retries, 2, 'caller retries win')
+    assert.equal(options.autoExtend, true, 'defaults the caller did not touch survive')
+  })
+
   // Review finding: the fallback used to match on code alone, and a producer
   // that uses locks internally surfaces the same LOCK_NOT_ACQUIRED — the
   // facade misread it as its own cache lock failing, released the real cache
