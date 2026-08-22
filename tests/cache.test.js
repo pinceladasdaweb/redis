@@ -97,14 +97,21 @@ describe('cache-aside', () => {
     const { redis } = createClient()
 
     await assert.rejects(redis.getOrSet('k', 60, 'nope'), { code: 'INVALID_ARGUMENT', operation: 'getOrSet' })
-    await assert.rejects(redis.getOrSetJson('k', 60, null), { code: 'INVALID_ARGUMENT', operation: 'getOrSet' })
+    await assert.rejects(redis.getOrSetJson('k', 60, null), { code: 'INVALID_ARGUMENT', operation: 'getOrSetJson' })
   })
 
+  // Review finding: the shared implementation hardcoded 'getOrSet', so every
+  // getOrSetJson rejection reported an operation the caller never invoked —
+  // and `operation` is the field this library tells consumers to branch on
+  // instead of parsing messages. The two entry points must name themselves,
+  // on every check, not just the one that happens to live in the encoder.
   test('rejections name the operation that failed', async () => {
     const { redis } = createClient()
 
     await assert.rejects(redis.getOrSet('k', 0, () => 'x'), { operation: 'getOrSet' })
     await assert.rejects(redis.getOrSet('k', 60, () => ({})), { operation: 'getOrSet' })
+    await assert.rejects(redis.getOrSetJson('k', 0, () => ({})), { operation: 'getOrSetJson' })
+    await assert.rejects(redis.getOrSetJson('k', 60, 'nope'), { operation: 'getOrSetJson' })
     await assert.rejects(redis.getOrSetJson('k', 60, () => undefined), { operation: 'getOrSetJson' })
     await assert.rejects(redis.deleteByPattern(''), { operation: 'deleteByPattern' })
   })

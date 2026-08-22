@@ -331,8 +331,21 @@ export declare class RedisClient extends EventEmitter {
   psubscribe (pattern: string, handler?: PubSubHandler): Promise<unknown>
   punsubscribe (pattern: string): Promise<unknown>
 
-  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  /**
+   * The server's current `notify-keyspace-events` flags (empty when disabled).
+   *
+   * In a cluster every master is configured on its own, so this answers with
+   * the flags they ALL agree on — and an empty string the moment they differ,
+   * with a warning naming the readings. Sampling one master would report a
+   * healthy value while another shard sits silent. Use
+   * `keyspaceNotificationsByNode()` for the per-master breakdown.
+   */
   keyspaceNotifications (): Promise<string>
+  /**
+   * The `notify-keyspace-events` flags of every master. `node` is the
+   * `host:port` of the master that answered, and `null` outside a cluster.
+   */
+  keyspaceNotificationsByNode (): Promise<Array<{ node: string | null, flags: string }>>
   /**
    * Subscribes to `__keyevent@<db>__:<event>` after checking the server is
    * configured to emit it — otherwise a silent channel would be

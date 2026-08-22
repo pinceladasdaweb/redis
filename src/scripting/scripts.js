@@ -92,7 +92,7 @@ class ScriptRegistry {
       )
     }
 
-    const client = this.#client(name)
+    const client = this.#client()
 
     try {
       return await client[DRIVER_NAMESPACE + name](...keys, ...args)
@@ -108,8 +108,12 @@ class ScriptRegistry {
     return [...this.#definitions.keys()]
   }
 
-  #client (operation) {
-    const client = this.connection.assertReady(operation)
+  // The operation is the METHOD, never the script name: the other two errors
+  // this method can raise already say 'runScript', and a consumer branching on
+  // `operation` must not see the same call surface under one name when the
+  // arguments are wrong and another when the connection is down.
+  #client () {
+    const client = this.connection.assertReady('runScript')
 
     if (this.#installed.client !== client) {
       this.#installed = { client, names: new Set() }

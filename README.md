@@ -122,14 +122,14 @@ const redis = new RedisClient({
 })
 ```
 
-Only startup nodes are needed — the rest of the cluster is discovered. Node-level options (`password`, `tls`, `connectTimeout`, `keyPrefix`…) and cluster-level ones (`maxRedirections`, `scaleReads`, `slotsRefreshTimeout`…) are sorted for you; the retry backoff you configure applies to both a single node and the cluster.
+Only startup nodes are needed — the rest of the cluster is discovered. Node-level options (`password`, `tls`, `connectTimeout`, `keyPrefix`…) and cluster-level ones (`maxRedirections`, `scaleReads`, `slotsRefreshTimeout`, `useSRVRecords`, `shardedSubscribers`…) are sorted for you; the retry backoff you configure applies to the cluster client, to each node connection and to the subscribers built from them (see [Reconnection](#reconnection)). The split is checked against ioredis's own `ClusterOptions` by a test, because an option filed on the wrong side is not an error — it is silently ignored.
 
 What changes once keys live on different nodes:
 
 - **Multi-key commands need one slot.** `mget`, `mset`, `del` with several keys, `multi()` batches — all of them fail with `CROSSSLOT` unless the keys hash together. Force that with a hash tag: `{user:1}:name` and `{user:1}:role` share a slot, so a command can span them.
 - **`getAllStream` and `deleteByPattern` walk every master** and merge the results, because a cluster has no keyspace-wide `SCAN`. Deletion issues one `UNLINK` per key for the same slot reason.
 - **Database 0 only** — asking for another one is rejected at construction rather than silently reading from the wrong place.
-- **Keyspace events are node-local.** Unlike `publish`, which the cluster bus spreads everywhere, each node emits keyspace notifications for its own slots and never forwards them. `subscribeToKeyEvents` therefore opens one subscriber per master and keeps the set reconciled with the live topology — resharding is followed by event, and promotions (which the driver announces to no one) by a periodic resync that also releases subscribers of departed masters. Its probe requires *every* master to be configured — one silent shard is one third of your expirations gone. Mind the alias: `A` in `notify-keyspace-events` deliberately excludes the `n` (new-key) and `m` (key-miss) classes, and the probe knows it — the canonical `"AKE"` is not enough for `subscribeToKeyEvents('new', …)`.
+- **Keyspace events are node-local.** Unlike `publish`, which the cluster bus spreads everywhere, each node emits keyspace notifications for its own slots and never forwards them. `subscribeToKeyEvents` therefore opens one subscriber per master and keeps the set reconciled with the live topology — resharding is followed by event, and promotions (which the driver announces to no one) by a periodic resync that also releases subscribers of departed masters. The reconciliation is per **channel**, not per node: a master whose subscriber had to be rebuilt, or that refused one `SUBSCRIBE` while it was `LOADING`, is caught up on exactly what it is missing. Unsubscribing the last of these channels releases the per-node connections and the topology watch. Its probe requires *every* master to be configured — one silent shard is one third of your expirations gone. Mind the alias: `A` in `notify-keyspace-events` deliberately excludes the `n` (new-key) and `m` (key-miss) classes, and the probe knows it — the canonical `"AKE"` is not enough for `subscribeToKeyEvents('new', …)`.
 - Everything single-key is unchanged: locks (the Lua scripts declare their key, so they route), cache-aside, counters, sorted sets, streams.
 
 The cluster suite runs against three real masters:
@@ -167,6 +167,8 @@ Failover is handled by ioredis: on `READONLY` replies the client reconnects to t
 
 Reconnection is handled entirely by the ioredis driver — there is exactly one reconnection loop. When the attempts are exhausted the client emits `end` and releases its resources; a later `connect()` starts a fresh cycle.
 
+In a cluster the same backoff governs **three** things: the Cluster client, each node connection, and the subscriber connections built from them. ioredis leaves per-node reconnection off by default (a closed node connection is never retried; the pool waits for a `MOVED` to rebuild it), which would quietly exempt exactly the sockets this library owns — a keyspace-event subscriber is a `duplicate()` of a node connection, so one blip used to take that shard's events down for good. Nodes that genuinely leave the cluster are still disconnected by the driver's own pool reset, so nothing retries against an address that is gone.
+
 ### Health check
 
 | Option | Type | Default | Description |
@@ -191,14 +193,22 @@ Reconnection is handled entirely by the ioredis driver — there is exactly one 
 | `enableOfflineQueue` | `boolean` | `true` | Queue commands issued while the connection is down. Set `false` to make the driver reject them instead of holding them until it recovers |
 | `logger` | `object` | built-in | See [Logging](#logging) |
 
-`retryStrategy` and `reconnectOnError` are managed by this library and cannot be overridden — reconnection is the driver's job *through those hooks*, and replacing them would silently disable the documented retry policy. Use `maxRetryAttempts`, `baseRetryDelay` and `maxRetryDelay` instead.
+A few options are this library's to set and are refused with `INVALID_OPTION` rather than silently disabling something:
+
+| Option | Why |
+| --- | --- |
+| `retryStrategy`, `reconnectOnError`, `clusterRetryStrategy`, `clusterNodeRetryStrategy` | Reconnection is the driver's job *through those hooks*; replacing them disables the documented retry policy. Use `maxRetryAttempts`, `baseRetryDelay` and `maxRetryDelay` |
+| `replyMapping` | This library parses replies in their RESP2-compatible shape (`CONFIG GET` as a flat array, `WITHSCORES` as alternating member/score). ioredis 6 speaks RESP3 and keeps that shape through its default mapping; the `'resp3'` mapping changes it underneath |
+| `redisOptions` | Built here from the flat option list in cluster mode (see [Cluster](#cluster)) — pass node options at the top level |
 
 Malformed options fail at construction rather than at the first command under load:
 
 ```javascript
 new RedisClient({ healthCheckTimeout: 'soon' })
-// RedisClientError: healthCheckTimeout must be a non-negative number (got "soon"). [INVALID_OPTION]
+// RedisClientError: healthCheckTimeout must be a finite non-negative number (got "soon"). [INVALID_OPTION]
 ```
+
+`Infinity` is only accepted for `maxRetryAttempts`, where it means "never give up". Everywhere else it is a delay or a timeout that ends up in a timer, and Node clamps an out-of-range delay to **1ms** — so `commandTimeout: Infinity` written for "no timeout" would fail every command after a millisecond. Omit the option to leave it unbounded.
 
 ### TLS and managed providers
 
@@ -387,6 +397,8 @@ await redis.subscribeToKeyEvents('expired', (key) => {
 
 Read the current flags with `keyspaceNotifications()`. Managed providers often block `CONFIG`; when the probe cannot run, the subscription proceeds with a warning rather than being refused.
 
+In a **cluster** every master is configured on its own and emits only its own slots' events, so `keyspaceNotifications()` answers with the flags every master agrees on — and an empty string the moment they differ, logging which node reported what. Sampling one master would report a healthy value while another shard sits silent, which is the failure the probe exists to catch. `keyspaceNotificationsByNode()` gives the per-master breakdown as `[{ node, flags }]` (`node` is `null` outside a cluster).
+
 Each channel/pattern holds **one handler** — subscribing again replaces it (last one wins). Use the `message`/`pmessage` events when you need fan-out to multiple listeners. If the subscriber connection permanently gives up (finite `maxRetryAttempts` exhausted), a warning is logged and the next `subscribe()` starts a fresh connection — resubscribe to restore delivery.
 
 ## Distributed locking
@@ -565,7 +577,7 @@ await redis.getAllStream('user:*') // [{ 'user:1': '...' }, { 'user:2': '...' }]
 **Sorted sets**: `zadd`, `zscore`, `zincrby`, `zcard`, `zcount`, `zrank`, `zrevrank`, `zrem`, `zrange`, `zrevrange`, `zrangebyscore`, `zremrangebyrank`, `zremrangebyscore`, `zpopmin`, `zpopmax` — see [Sorted sets](#sorted-sets-and-rankings)
 **Keys**: `del`, `exists`, `type`, `rename`, `renamenx`, `persist`, `expire`, `ttl`, `sort`
 **Transactions**: `multi()` (`watch`/`unwatch` reject — see above)
-**Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `subscribeToKeyEvents`, `keyspaceNotifications`
+**Pub/Sub**: `publish`, `publishJson`, `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `subscribeToKeyEvents`, `keyspaceNotifications`, `keyspaceNotificationsByNode`
 **Locking**: `acquireLock`, `withLock`
 **Lua**: `defineScript`, `runScript` — see [Lua scripts](#lua-scripts)
 **Streams**: see [Streams](#streams)

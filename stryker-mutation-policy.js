@@ -145,8 +145,22 @@ export const strykerPlugins = [
 //
 // --- Repaired downstream ----------------------------------------------------
 //
+// src/connection/config.js   `this.maxRetryAttempts !== Infinity` in retryStrategy
+//   `times > Infinity` is false for every number, so the guard can never
+//   change the verdict — with it or without it, an Infinity limit never gives
+//   up and a finite one gives up at the same attempt. Spec-of-JS equivalence
+//   (§5.4), kept because it states the intent the arithmetic only implies.
+//
+// src/connection/config.js   `typeof value !== 'number'` in #assertValid
+//   Fully subsumed by the `!Number.isFinite(value)` that follows it: isFinite
+//   is false for every non-number there is, so no input reaches the second
+//   operand with the first one mattering. Kept as a statement of intent —
+//   "this option is a number" reads better than a negated isFinite — and
+//   documented rather than deleted (§5.4, defense-in-depth pair).
+//
 // src/connection/manager.js:93,111,182   `if (this.#client === client)`
 // src/messaging/pubsub.js:81,152         `if (this.#subscriber === subscriber)`
+// src/messaging/pubsub.js                `if (#nodeSubscribers.get(key) === entry)`
 //   Ownership fences. Removing one only matters when TWO generations of a
 //   connection are alive at the same instant and the older one settles last;
 //   in every other ordering the assignment it guards is idempotent. Killing
@@ -229,6 +243,53 @@ export const strykerPlugins = [
 // refuses to ignore (§5.3 trap — swallowing the node would swallow killable
 // siblings). Killable only by asserting log text, which this library declares
 // non-contract. Same class: index.js's ` on cluster node ${node}` ternary arm.
+//
+// --- Added with the third full-source review (22/08/2026) ------------------
+//
+// manager.js #connectCycle's SECOND `if (this.#disconnectPromise)` — the one
+// inside the 'close' branch, re-checking after the one-turn deferral. Forced
+// to `true` it awaits a nullish promise, which is a single microtask yield in
+// a branch that has already yielded through setImmediate: nothing can be
+// scheduled between the two that was not already scheduled before them. Its
+// two siblings (the first #disconnectPromise check and the 'close' test) are
+// NOT equivalent and are killed by 'a disconnect() issued in the same tick as
+// connect() still tears it down' — an extra suspension point before
+// #establishConnection hands that disconnect a null client, and the connect
+// that resumes afterwards builds one nobody closes. The difference is that
+// those two sit on the path a fresh connect takes; this one does not.
+//
+// pubsub.js #resyncTopology's `if (this.#nodeChannels.size === 0) return` and
+// the `if (missing.length === 0) continue` inside its master loop are now a
+// defense-in-depth PAIR (§5.4), and each makes the other's mutant survive.
+// Before the review the loop asked "does this node have a subscriber?", so
+// with no registered channels and the early return gone it would have BUILT a
+// subscriber per master carrying nothing — killable, and killed. The loop now
+// asks what each node is missing, which is [] when nothing is registered, so
+// removing the early return leaves a pass over the masters that subscribes
+// nothing and a release pass over an empty map. The early return survives as
+// an optimization; the correctness lives in the per-channel reconciliation.
+//
+// index.js `#keyspaceFlagsByNode('subscribeToKeyEvents')` — the operation of
+// the probe inside #assertKeyspaceNotifications, whose rejection that method
+// swallows into a warning by design (managed providers block CONFIG). Same
+// class as the `operation: 'quit'` pair above: where this operation DOES reach
+// a consumer — keyspaceNotifications() and keyspaceNotificationsByNode() — it
+// is asserted and its mutants are killed.
+//
+// index.js's "Masters disagree on notify-keyspace-events" warning: message
+// text whose template interpolates a readings.map(...).join(...), which the
+// matcher above deliberately refuses to ignore (§5.3 trap — swallowing the
+// node would swallow the killable call inside it). The DECISION it reports on
+// is asserted; the sentence is not, per this library's own declaration that
+// log text is never contract.
+//
+// config.js's RETRY_IS_OURS constant is reached by the matcher only when the
+// literal sits directly in the error's argument 0; hoisted into a named const
+// shared by four reserved options, it escapes the ignore. It is killed by test
+// instead — the refusal has to name maxRetryAttempts/baseRetryDelay/
+// maxRetryDelay or it is a dead end for whoever hit it — so it is NOT a
+// survivor. Noted here because the next shared message constant will look like
+// one until someone asserts it.
 //
 // ---------------------------------------------------------------------------
 // Everything else still surviving is an open debt. Run

@@ -19,7 +19,10 @@ class SubscriptionManager {
   #channelHandlers = new Map()
   #patternHandlers = new Map()
   // Cluster only: one subscriber per master, for channels that are published
-  // node-locally (keyspace events). Keyed by the node's address.
+  // node-locally (keyspace events). Keyed by the node's address, and each
+  // entry carries the channels that node has ACTUALLY confirmed — presence of
+  // a subscriber is not the same as being subscribed to everything, and the
+  // resync below reconciles against this set rather than against the map.
   #nodeSubscribers = new Map()
   #nodeChannels = new Set()
   #nodeWatcher = null
@@ -145,8 +148,18 @@ class SubscriptionManager {
     this.#watchTopology(client)
 
     const masters = client.nodes('master')
+    // This channel always reaches the wire — a re-subscribe has to fail when a
+    // shard cannot take it, which is the atomicity this method promises — and
+    // it is followed by whatever else the node is missing. Without the catch-up
+    // a node whose subscriber had to be rebuilt (its previous one ended for
+    // good) came back carrying only the newest channel and silently dropped
+    // every event registered before it, with the resync seeing a subscriber in
+    // place and never noticing.
     const outcomes = await Promise.allSettled(
-      masters.map((node) => this.#subscribeNode(node, [channel]))
+      masters.map((node) => this.#subscribeNode(node, [
+        channel,
+        ...this.#missingChannels(node).filter((other) => other !== channel)
+      ]))
     )
 
     const failed = outcomes.find((outcome) => outcome.status === 'rejected')
@@ -158,20 +171,34 @@ class SubscriptionManager {
         this.#nodeChannels.delete(channel)
       }
 
-      // The masters that answered are subscribed to a channel whose handler
-      // is being taken back — undo them, best effort (a node that refuses
-      // the undo will simply dispatch to no handler, which is inert).
-      for (const [index, outcome] of outcomes.entries()) {
-        if (outcome.status !== 'fulfilled') continue
+      // Every master holding this channel gives it back — best effort (a node
+      // that refuses the undo will simply dispatch to no handler, which is
+      // inert). Only THIS channel is undone: anything else a node caught up on
+      // above was already registered and is not this call's to withdraw.
+      //
+      // The question is what the node TOOK, never whether its promise
+      // fulfilled. With the catch-up above a node can subscribe this channel
+      // and then fail on an older one — its outcome lands in `rejected` while
+      // it is holding precisely what has to come back off.
+      for (const node of masters) {
+        const entry = this.#nodeSubscribers.get(this.#nodeKey(node))
 
-        const subscriber = this.#nodeSubscribers.get(this.#nodeKey(masters[index]))
-        subscriber?.unsubscribe(channel).catch(() => {})
+        if (!entry?.channels.delete(channel)) continue
+
+        entry.subscriber.unsubscribe(channel).catch(() => {})
       }
 
       throw failed.reason
     }
 
     return outcomes.at(-1)?.value ?? 0
+  }
+
+  // What this node still owes, against the channels registered for fan-out.
+  #missingChannels (node) {
+    const entry = this.#nodeSubscribers.get(this.#nodeKey(node))
+
+    return [...this.#nodeChannels].filter((channel) => !entry?.channels.has(channel))
   }
 
   #nodeKey (node) {
@@ -182,14 +209,15 @@ class SubscriptionManager {
 
   async #subscribeNode (node, channels) {
     const key = this.#nodeKey(node)
-    let subscriber = this.#nodeSubscribers.get(key)
+    let entry = this.#nodeSubscribers.get(key)
 
-    if (!subscriber) {
-      subscriber = node.duplicate()
-      this.#nodeSubscribers.set(key, subscriber)
+    if (!entry) {
+      const subscriber = node.duplicate()
+      entry = { subscriber, channels: new Set() }
+      this.#nodeSubscribers.set(key, entry)
 
       this.#wireSubscriber(subscriber, () => {
-        if (this.#nodeSubscribers.get(key) === subscriber) {
+        if (this.#nodeSubscribers.get(key) === entry) {
           this.#nodeSubscribers.delete(key)
           this.logger.warn(`Keyspace-event subscriber for cluster node ${key} ended permanently: that shard's events were lost.`)
         }
@@ -198,8 +226,14 @@ class SubscriptionManager {
 
     let count = 0
 
+    // Recorded one at a time, right after the node confirms it. A failure
+    // partway through leaves the entry describing exactly what IS subscribed,
+    // so the next resync asks for the remainder instead of assuming the node
+    // is done — which is how a transient LOADING or CLUSTERDOWN used to cost a
+    // shard one channel for the lifetime of the process.
     for (const channel of channels) {
-      count = await subscriber.subscribe(channel)
+      count = await entry.subscriber.subscribe(channel)
+      entry.channels.add(channel)
     }
 
     return count
@@ -266,23 +300,28 @@ class SubscriptionManager {
 
     const masters = new Map(client.nodes('master').map((node) => [this.#nodeKey(node), node]))
 
-    // Masters without a subscriber: new shards, or replicas promoted without
-    // a '+node'. Either way their events are being lost right now.
+    // Every master is reconciled against the channels it has confirmed, not
+    // against whether it has a subscriber at all: new shards and replicas
+    // promoted without a '+node' have none, and a node that lost a SUBSCRIBE
+    // partway through has one that is incomplete. Both are losing events right
+    // now, and only the second one looks healthy from the outside.
     for (const [key, node] of masters) {
-      if (this.#nodeSubscribers.has(key)) continue
+      const missing = this.#missingChannels(node)
 
-      this.#subscribeNode(node, [...this.#nodeChannels]).catch((err) => {
+      if (missing.length === 0) continue
+
+      this.#subscribeNode(node, missing).catch((err) => {
         this.logger.error(`Could not extend keyspace-event subscriptions to cluster node ${key}: ${err.message}`)
       })
     }
 
     // Subscribers whose node left the master set: departed or demoted nodes
     // whose connection would otherwise retry forever, invisibly.
-    for (const [key, subscriber] of this.#nodeSubscribers) {
+    for (const [key, entry] of this.#nodeSubscribers) {
       if (masters.has(key)) continue
 
       this.#nodeSubscribers.delete(key)
-      this.#release(subscriber).catch(() => {})
+      this.#release(entry.subscriber).catch(() => {})
       this.logger.info(`Keyspace-event subscriber for ${key} released: the node is no longer a master.`)
     }
   }
@@ -292,14 +331,47 @@ class SubscriptionManager {
     this.#nodeChannels.delete(channel)
 
     const counts = await Promise.all(
-      [...this.#nodeSubscribers.values()].map((subscriber) => subscriber.unsubscribe(channel))
+      [...this.#nodeSubscribers.values()].map((entry) => {
+        entry.channels.delete(channel)
+
+        return entry.subscriber.unsubscribe(channel)
+      })
     )
+
+    // The per-node connections, the '+node' watcher and the resync tick exist
+    // only to serve node-local channels. With the last one gone nothing would
+    // ever release them again — #resyncTopology returns early on an empty set,
+    // so they used to idle, one connection per master, until disconnect().
+    if (this.#nodeChannels.size === 0) {
+      await Promise.all(this.#stopNodeFanOut().map((subscriber) => this.#release(subscriber)))
+    }
 
     if (this.#subscriber) {
       return this.#subscriber.unsubscribe(channel)
     }
 
     return counts.at(-1) ?? 0
+  }
+
+  // Tears down the cluster fan-out machinery and hands back the subscribers it
+  // dropped, so the caller decides how to close them.
+  #stopNodeFanOut () {
+    const dropped = [...this.#nodeSubscribers.values()].map((entry) => entry.subscriber)
+
+    this.#nodeSubscribers.clear()
+    this.#nodeChannels.clear()
+
+    if (this.#nodeWatcher) {
+      this.#nodeWatcher.client.removeListener('+node', this.#nodeWatcher.handler)
+      this.#nodeWatcher = null
+    }
+
+    if (this.#nodeResync) {
+      this.clock.clearInterval(this.#nodeResync)
+      this.#nodeResync = null
+    }
+
+    return dropped
   }
 
   async psubscribe (pattern, handler) {
@@ -344,23 +416,11 @@ class SubscriptionManager {
   // Called from the facade's disconnect(): every subscriber connection has its
   // own lifecycle and must be released explicitly.
   async close () {
-    const closing = [this.#subscriber, ...this.#nodeSubscribers.values()].filter(Boolean)
+    const closing = [this.#subscriber, ...this.#stopNodeFanOut()].filter(Boolean)
 
     this.#subscriber = null
-    this.#nodeSubscribers.clear()
-    this.#nodeChannels.clear()
     this.#channelHandlers.clear()
     this.#patternHandlers.clear()
-
-    if (this.#nodeWatcher) {
-      this.#nodeWatcher.client.removeListener('+node', this.#nodeWatcher.handler)
-      this.#nodeWatcher = null
-    }
-
-    if (this.#nodeResync) {
-      this.clock.clearInterval(this.#nodeResync)
-      this.#nodeResync = null
-    }
 
     await Promise.all(closing.map((subscriber) => this.#release(subscriber)))
   }

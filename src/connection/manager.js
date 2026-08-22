@@ -38,6 +38,28 @@ class ConnectionManager {
       return this.#connectPromise
     }
 
+    // The slot is claimed SYNCHRONOUSLY, before #connectCycle can reach its
+    // first await. The cycle waits — for a teardown, for the 'close'
+    // ambiguity — and any caller that arrived during one of those waits used
+    // to sail past the check above and out through the "reusing" branch
+    // below, resolving while the connection was still being built. The guard
+    // is only a mutex if it is set before the very first suspension point.
+    //
+    // Only the attempt that is still current may clear the slot: disconnect()
+    // drops it on purpose, and a settling older attempt must not wipe the
+    // brand-new one that replaced it.
+    const attempt = this.#connectCycle().finally(() => {
+      if (this.#connectPromise === attempt) {
+        this.#connectPromise = null
+      }
+    })
+
+    this.#connectPromise = attempt
+
+    return attempt
+  }
+
+  async #connectCycle () {
     // A teardown in flight must be waited out, never raced: for the whole
     // quit window #client still points at the dying client, and "reusing"
     // it would resolve this call successfully moments before 'end' nulls
@@ -55,6 +77,12 @@ class ConnectionManager {
     // (build fresh), and the ambiguity is gone.
     if (this.#client?.status === 'close') {
       await new Promise((resolve) => setImmediate(resolve))
+
+      // A disconnect() that started during that deferral owns the client now,
+      // and the promise above is the same one this method already honours.
+      if (this.#disconnectPromise) {
+        await this.#disconnectPromise
+      }
     }
 
     if (this.#client) {
@@ -71,18 +99,7 @@ class ConnectionManager {
       }
     }
 
-    // Only the attempt that is still current may clear the slot: disconnect()
-    // drops it on purpose, and a settling older attempt must not wipe the
-    // brand-new one that replaced it.
-    const attempt = this.#establishConnection().finally(() => {
-      if (this.#connectPromise === attempt) {
-        this.#connectPromise = null
-      }
-    })
-
-    this.#connectPromise = attempt
-
-    return attempt
+    return this.#establishConnection()
   }
 
   async #establishConnection () {

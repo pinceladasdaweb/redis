@@ -386,6 +386,7 @@ class RedisClient extends EventEmitter {
   // library's own lock and re-read (dogpile/stampede protection).
   async getOrSet (key, ttlSeconds, producer, options = {}) {
     return this.#getOrSet(key, ttlSeconds, producer, options, {
+      operation: 'getOrSet',
       encode: (value) => {
         if (typeof value !== 'string' && typeof value !== 'number') {
           throw new RedisClientError(
@@ -403,6 +404,7 @@ class RedisClient extends EventEmitter {
 
   async getOrSetJson (key, ttlSeconds, producer, options = {}) {
     return this.#getOrSet(key, ttlSeconds, producer, options, {
+      operation: 'getOrSetJson',
       encode: (value) => {
         const encoded = JSON.stringify(value)
 
@@ -423,19 +425,23 @@ class RedisClient extends EventEmitter {
     })
   }
 
-  async #getOrSet (key, ttlSeconds, producer, { lock } = {}, { encode, decode }) {
+  // `operation` is the method the caller actually named. It travels down here
+  // because `operation` is contract — a consumer routing errors by it must
+  // match its own call site, and a getOrSetJson rejection reporting 'getOrSet'
+  // matches nothing it ever wrote.
+  async #getOrSet (key, ttlSeconds, producer, { lock } = {}, { operation, encode, decode }) {
     if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
       throw new RedisClientError(
-        `getOrSet requires a positive integer ttl in seconds (got ${ttlSeconds}).`,
-        'getOrSet',
+        `${operation} requires a positive integer ttl in seconds (got ${ttlSeconds}).`,
+        operation,
         'INVALID_ARGUMENT'
       )
     }
 
     if (typeof producer !== 'function') {
       throw new RedisClientError(
-        'getOrSet requires a producer function.',
-        'getOrSet',
+        `${operation} requires a producer function.`,
+        operation,
         'INVALID_ARGUMENT'
       )
     }
@@ -806,11 +812,40 @@ class RedisClient extends EventEmitter {
     return this.subscriptions.punsubscribe(pattern)
   }
 
-  /** The server's current `notify-keyspace-events` flags (empty when disabled). */
+  /**
+   * The server's current `notify-keyspace-events` flags (empty when disabled).
+   *
+   * In a cluster every master is configured on its own, so this answers with
+   * the flags they ALL agree on — and an empty string the moment they differ,
+   * with a warning naming the readings. Sampling the first master would report
+   * "AKE" while another shard sits silent, which is precisely the failure
+   * subscribeToKeyEvents refuses to let through; the operational check that
+   * exists to catch it must not be the one that hides it.
+   *
+   * Use keyspaceNotificationsByNode() for the per-master breakdown.
+   */
   async keyspaceNotifications () {
-    const [first] = await this.#keyspaceFlagsByNode()
+    const readings = await this.#keyspaceFlagsByNode('keyspaceNotifications')
+    // Mid-failover a cluster can report no masters at all: no reading is the
+    // same answer as no notifications, and the default keeps the comparison
+    // below from having to care which case it is.
+    const [first = { flags: '' }] = readings
 
-    return first?.flags ?? ''
+    if (readings.some((reading) => reading.flags !== first.flags)) {
+      this.logger.warn(`Masters disagree on notify-keyspace-events: ${readings.map(({ node, flags }) => `${node} "${flags}"`).join(', ')}. Reporting none.`)
+
+      return ''
+    }
+
+    return first.flags
+  }
+
+  /**
+   * The `notify-keyspace-events` flags of every master, as
+   * `[{ node, flags }]` — `node` is null outside a cluster.
+   */
+  async keyspaceNotificationsByNode () {
+    return this.#keyspaceFlagsByNode('keyspaceNotificationsByNode')
   }
 
   // CONFIG has no key to route on, so a cluster has to be asked node by node —
@@ -822,15 +857,15 @@ class RedisClient extends EventEmitter {
   // instead of erroring would otherwise park this await forever — defeating
   // the very fallback in #assertKeyspaceNotifications that was written for
   // that class of provider.
-  async #keyspaceFlagsByNode () {
-    const client = this.connection.assertReady('keyspaceNotifications')
+  async #keyspaceFlagsByNode (operation) {
+    const client = this.connection.assertReady(operation)
     const isCluster = typeof client.nodes === 'function'
     const targets = isCluster ? client.nodes('master') : [client]
 
     return Promise.all(targets.map(async (target) => {
       const [, flags] = await withDeadline(
         target.config('GET', 'notify-keyspace-events'),
-        { clock: this.clock, ms: CONFIG_PROBE_DEADLINE_MS, operation: 'keyspaceNotifications' }
+        { clock: this.clock, ms: CONFIG_PROBE_DEADLINE_MS, operation }
       )
 
       return {
@@ -859,7 +894,7 @@ class RedisClient extends EventEmitter {
     let readings
 
     try {
-      readings = await this.#keyspaceFlagsByNode()
+      readings = await this.#keyspaceFlagsByNode('subscribeToKeyEvents')
     } catch (err) {
       // Managed providers commonly block CONFIG. Refusing to subscribe would
       // be worse than subscribing without the guarantee.

@@ -171,7 +171,7 @@ describe('wire contract', () => {
       'getJson', 'setJson', 'setexJson', 'getOrSet', 'getOrSetJson', 'deleteByPattern',
       'getAllStream', 'hset', 'hmset', 'mset', 'spop', 'sort', 'multi', 'watch', 'unwatch',
       'zadd', 'zscore', 'zincrby', 'zrange', 'zrevrange', 'zrangebyscore', 'zpopmin', 'zpopmax',
-      'xautoclaim', 'keyspaceNotifications', 'subscribeToKeyEvents',
+      'xautoclaim', 'keyspaceNotifications', 'keyspaceNotificationsByNode', 'subscribeToKeyEvents',
       'xread', 'xreadgroup', 'xgroup', 'xtrim', 'publishJson',
       'subscribe', 'unsubscribe', 'psubscribe', 'punsubscribe', 'acquireLock', 'withLock',
       'defineScript', 'runScript'
@@ -943,6 +943,58 @@ describe('wire contract', () => {
     }, 'the weakest node decides the verdict')
 
     assert.deepEqual(asked, [7001, 7002, 7003], 'every master must be asked')
+  })
+
+  // Review finding: the operational check contradicted its own sibling. The
+  // subscribe path treats one misconfigured master as a failure — because that
+  // shard goes silent — while keyspaceNotifications() destructured the FIRST
+  // reading and reported it as "the" answer. An operator checking readiness got
+  // "AKE" back from a healthy master while another shard emitted nothing: the
+  // check that exists to catch the silence was hiding it.
+  test('keyspaceNotifications answers for the whole cluster, not the first master', async () => {
+    const warnings = []
+    const { redis, fake } = createClient()
+
+    redis.logger = { ...quietLogger, warn: (message) => warnings.push(message) }
+
+    const master = (port, flags) => ({
+      options: { host: '127.0.0.1', port },
+      config: async () => ['notify-keyspace-events', flags]
+    })
+
+    fake.nodes = () => [master(7001, 'AKE'), master(7002, 'AKE'), master(7003, '')]
+
+    assert.equal(await redis.keyspaceNotifications(), '', 'one silent shard must not be reported as configured')
+    assert.match(warnings.at(-1), /Masters disagree.*127\.0\.0\.1:7003 ""/)
+
+    // The per-node breakdown is what says WHICH one, without parsing a log.
+    assert.deepEqual(await redis.keyspaceNotificationsByNode(), [
+      { node: '127.0.0.1:7001', flags: 'AKE' },
+      { node: '127.0.0.1:7002', flags: 'AKE' },
+      { node: '127.0.0.1:7003', flags: '' }
+    ])
+
+    // Agreement is the ordinary case and reads exactly as before.
+    fake.nodes = () => [master(7001, 'AKE'), master(7002, 'AKE')]
+    assert.equal(await redis.keyspaceNotifications(), 'AKE')
+    assert.deepEqual(warnings.length, 1, 'agreement warns about nothing')
+  })
+
+  test('keyspaceNotificationsByNode names itself at the readiness gate', async () => {
+    const redis = new RedisClient({ logger: quietLogger })
+
+    await assert.rejects(redis.keyspaceNotificationsByNode(), {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'keyspaceNotificationsByNode'
+    })
+  })
+
+  test('outside a cluster the per-node reading is a single nameless entry', async () => {
+    const { redis, fake } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', 'gxE']
+
+    assert.deepEqual(await redis.keyspaceNotificationsByNode(), [{ node: null, flags: 'gxE' }])
   })
 
   test('an unreadable config downgrades to a warning instead of blocking', async () => {
