@@ -427,8 +427,47 @@ describe('cluster keyspace-event fan-out', () => {
     await manager.unsubscribe(KEY_EVENT)
 
     for (const node of masters) {
-      assert.deepEqual(node.subscriber.calls.at(-1), ['unsubscribe', KEY_EVENT])
+      assert.ok(
+        node.subscriber.calls.some((call) => call[0] === 'unsubscribe' && call[1] === KEY_EVENT),
+        `master ${node.options.port} must be told to unsubscribe`
+      )
     }
+  })
+
+  // Review finding: these connections, the '+node' watcher and the resync tick
+  // exist only to serve node-local channels, and nothing released them when
+  // the last one went away — #resyncTopology returns early on an empty set. An
+  // app that used keyspace events for a maintenance window kept one idle
+  // connection per master for the rest of the process.
+  test('unsubscribing the last node channel releases the whole fan-out', async () => {
+    const { manager, masters, cluster, clock, addMaster } = createClusterManager()
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.subscribeEverywhere('__keyevent@0__:evicted', () => {})
+
+    await manager.unsubscribe(KEY_EVENT)
+
+    assert.equal(cluster.listenerCount('+node'), 1, 'a channel is still registered — the watcher stays')
+    for (const node of masters) {
+      assert.equal(node.subscriber.calls.some((call) => call[0] === 'quit'), false)
+    }
+
+    await manager.unsubscribe('__keyevent@0__:evicted')
+
+    for (const node of masters) {
+      assert.ok(node.subscriber.calls.some((call) => call[0] === 'quit'), 'the per-node connection must be closed')
+    }
+
+    assert.equal(cluster.listenerCount('+node'), 0, 'and the topology watch detached')
+
+    // The resync tick is gone too: a new master must not resurrect a fan-out
+    // that has no channels left to carry.
+    addMaster(7004)
+    cluster.emit('+node')
+    await clock.advance(10000)
+    await tick()
+
+    assert.equal(masters.at(-1).subscriber, undefined)
   })
 
   test('a node subscriber that dies for good is released and reported', async () => {
@@ -446,6 +485,91 @@ describe('cluster keyspace-event fan-out', () => {
     await manager.subscribeEverywhere(KEY_EVENT, () => {})
 
     assert.notEqual(masters[1].subscriber.listenerCount('message'), 0, 'a fresh subscriber replaces it')
+  })
+
+  // Review finding: the fan-out subscribed a node to the channel being added
+  // and nothing else. When the call had to REBUILD a node's subscriber, it
+  // came back carrying only the newest channel — and the resync, which asked
+  // "does this node have a subscriber?" rather than "is it subscribed to
+  // everything?", skipped it forever after. One shard, silently short one
+  // channel, for the life of the process.
+  test('a rebuilt node subscriber catches up on every registered channel', async () => {
+    const { manager, masters } = createClusterManager()
+    const OTHER = '__keyevent@0__:evicted'
+    const expired = []
+    const evicted = []
+
+    await manager.subscribeEverywhere(KEY_EVENT, (message) => expired.push(message))
+
+    // 7002's subscriber gives up for good, so the slot is empty again...
+    masters[1].subscriber.emit('end')
+
+    // ...and a DIFFERENT channel is what rebuilds it.
+    await manager.subscribeEverywhere(OTHER, (message) => evicted.push(message))
+
+    assert.deepEqual(
+      masters[1].subscriber.calls.map(([, channel]) => channel).sort(),
+      [OTHER, KEY_EVENT].sort(),
+      'the rebuilt subscriber must carry what was registered before it, not only the newest channel'
+    )
+    assert.equal(masters[0].subscriber.calls.length, 2, 'a healthy master just takes the new channel')
+
+    // The point of all of it: that shard still delivers both.
+    masters[1].subscriber.emit('message', KEY_EVENT, 'from 7002')
+    masters[1].subscriber.emit('message', OTHER, 'also from 7002')
+    await tick()
+
+    assert.deepEqual(expired, ['from 7002'])
+    assert.deepEqual(evicted, ['also from 7002'])
+  })
+
+  // The other half of the same defect: a node that answered SUBSCRIBE for one
+  // channel and refused the next was left registered as if it were complete.
+  test('the resync finishes a node subscribe that failed partway', async () => {
+    const { manager, masters, cluster, clock, logs, addMaster } = createClusterManager()
+    const OTHER = '__keyevent@0__:evicted'
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+    await manager.subscribeEverywhere(OTHER, () => {})
+
+    // A master joins while it is still LOADING, and refuses the second channel.
+    addMaster(7004)
+    const joining = masters.at(-1)
+    const build = joining.duplicate
+    let loading = true
+
+    joining.duplicate = () => {
+      const subscriber = build.call(joining)
+      const real = subscriber.subscribe
+
+      subscriber.subscribe = async (channel) => {
+        if (loading && channel === OTHER) throw new Error('LOADING Redis is loading the dataset in memory')
+
+        return real.call(subscriber, channel)
+      }
+
+      return subscriber
+    }
+
+    cluster.emit('+node')
+    await tick()
+
+    assert.deepEqual(
+      joining.subscriber.calls,
+      [['subscribe', KEY_EVENT]],
+      'the first channel lands, the second is refused — and the node looks healthy from the map'
+    )
+    assert.match(logs.at(-1)[1], /cluster node 127\.0\.0\.1:7004.*LOADING/)
+
+    loading = false
+    await clock.advance(10000)
+    await tick()
+
+    assert.deepEqual(
+      joining.subscriber.calls,
+      [['subscribe', KEY_EVENT], ['subscribe', OTHER]],
+      'the resync must retry the channel the node never confirmed, and only that one'
+    )
   })
 
   test('a node that refuses the subscription is reported, not swallowed silently', async () => {
@@ -732,6 +856,81 @@ describe('cluster keyspace-event fan-out', () => {
     }
 
     assert.equal(masters.at(-1).subscriber, undefined, 'and no subscriber is created for the newcomer')
+  })
+
+  // Found by the mutation gate, in the catch-up fix itself: the rollback used
+  // to skip every master whose promise rejected. Once a node can be asked for
+  // more than one channel, it can take the NEW one and fail on an older one —
+  // rejected, while holding exactly what the rollback exists to withdraw. What
+  // the node took is the question; whether its promise settled is not.
+  test('a shard that took the channel and then failed is still undone', async () => {
+    const { manager, masters } = createClusterManager()
+    const OTHER = '__keyevent@0__:evicted'
+
+    await manager.subscribeEverywhere(KEY_EVENT, () => {})
+
+    // 7002 loses its subscriber, so the next call has to rebuild it and catch
+    // it up on KEY_EVENT — and that catch-up is what fails.
+    masters[1].subscriber.emit('end')
+
+    const build = masters[1].duplicate
+    masters[1].duplicate = () => {
+      const subscriber = build.call(masters[1])
+      const real = subscriber.subscribe
+
+      subscriber.subscribe = async (channel) => {
+        if (channel === KEY_EVENT) throw new Error('CLUSTERDOWN The cluster is down')
+
+        return real.call(subscriber, channel)
+      }
+
+      return subscriber
+    }
+
+    await assert.rejects(manager.subscribeEverywhere(OTHER, () => {}), /CLUSTERDOWN/)
+
+    assert.deepEqual(
+      masters[1].subscriber.calls,
+      [['subscribe', OTHER], ['unsubscribe', OTHER]],
+      'the shard took the new channel, so the rollback must take it back'
+    )
+  })
+
+  // The undo runs after an await, and a shard's connection can die inside it:
+  // the node answered SUBSCRIBE, then ended for good and dropped out of the
+  // registry before the rollback came looking for it. There is nothing left to
+  // undo there, and reaching into the missing entry would turn a partial
+  // failure into a crash.
+  test('the rollback tolerates a shard whose connection died in the meantime', async () => {
+    const { manager, masters } = createClusterManager()
+
+    masters[2].duplicate = () => {
+      const subscriber = createSubscriber()
+
+      subscriber.subscribe = async () => {
+        // 7001 answered, then lost its connection for good before the undo.
+        masters[0].subscriber.emit('end')
+
+        throw new Error('CLUSTERDOWN The cluster is down')
+      }
+
+      masters[2].subscriber = subscriber
+
+      return subscriber
+    }
+
+    await assert.rejects(manager.subscribeEverywhere(KEY_EVENT, () => {}), /CLUSTERDOWN/)
+
+    assert.equal(
+      masters[0].subscriber.calls.some((call) => call[0] === 'unsubscribe'),
+      false,
+      'a shard that is already gone has nothing to undo'
+    )
+    assert.deepEqual(
+      masters[1].subscriber.calls.at(-1),
+      ['unsubscribe', KEY_EVENT],
+      'the shard that is still alive is undone as usual'
+    )
   })
 
   // The rollback must deregister ONLY what the failed call added: a channel

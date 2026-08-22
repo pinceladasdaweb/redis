@@ -384,6 +384,143 @@ describe('connection manager', () => {
     assert.equal(manager.isConnected, true)
   })
 
+  // Review finding: the mutex was checked BEFORE the two waits above (a
+  // teardown in flight, the 'close' ambiguity deferral), so a caller that
+  // arrived during one of them sailed past it and out through the "reusing an
+  // existing client" branch — resolving while the connection was still being
+  // built. A guard is only a mutex if it is claimed before the first
+  // suspension point, which is why the whole cycle now lives behind it.
+  test('concurrent connects during a teardown all wait for the live client', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+
+    created[0].quit = () => {
+      created[0].calls.push('quit')
+
+      return new Promise(() => {})
+    }
+
+    // The replacement takes a real handshake: with an instant one the second
+    // caller resumes to find a client that is ALREADY ready, and the window
+    // this test exists for never opens.
+    const slow = createDriverClient()
+    slow.connect = async () => {
+      slow.calls.push('connect')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      slow.status = 'ready'
+      slow.emit('ready')
+    }
+    manager.redisConfig = { createRedisClient: () => { created.push(slow); return slow } }
+
+    const teardown = manager.disconnect()
+    const first = manager.connect()
+    const second = manager.connect()
+
+    await clock.advance(2000)
+    await teardown
+    await second
+
+    assert.equal(manager.isConnected, true, 'awaiting the SECOND connect() must mean the connection is usable')
+    assert.equal(created.length, 2, 'and both callers share one fresh cycle')
+
+    await first
+    assert.equal(manager.client, slow)
+  })
+
+  // Same hole, reached through the other wait: the one-turn deferral that
+  // resolves the close→reconnecting / close→end ambiguity. The deferral ends
+  // on 'end' here, so the cycle builds a fresh client — and that is precisely
+  // the window in which a second caller used to find a half-built one and
+  // report success on it.
+  test('concurrent connects from a closed socket all wait for the live client', async () => {
+    const { manager, created } = createManager()
+
+    await manager.connect()
+
+    // The driver gives up one turn later, exactly as the deferral expects.
+    created[0].status = 'close'
+    created[0].emit('close')
+    setImmediate(() => { created[0].status = 'end' })
+
+    // A handshake slow enough that "already exists" is reachable while the
+    // replacement is still connecting.
+    const slow = createDriverClient()
+    slow.connect = async () => {
+      slow.calls.push('connect')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      slow.status = 'ready'
+      slow.emit('ready')
+    }
+    manager.redisConfig = { createRedisClient: () => { created.push(slow); return slow } }
+
+    const first = manager.connect()
+    const second = manager.connect()
+
+    await second
+    assert.equal(manager.isConnected, true, 'the second caller must not resolve on a half-built client')
+    assert.equal(manager.client, slow)
+    assert.equal(created.length, 2, 'and must not have built a second replacement')
+
+    await first
+  })
+
+  // The client is assigned SYNCHRONOUSLY inside connect(), and that is what
+  // lets a disconnect() issued in the same tick find something to tear down.
+  // Any extra suspension point before #establishConnection — an await on a
+  // teardown that is not in flight, a deferral taken when the socket is not
+  // closed — hands that disconnect() a null client, which it reports as
+  // nothing to do, while the connect that resumes afterwards builds a client
+  // nobody will ever close.
+  test('a disconnect() issued in the same tick as connect() still tears it down', async () => {
+    const { manager, created } = createManager()
+
+    const connecting = manager.connect()
+    const teardown = manager.disconnect()
+
+    await Promise.all([connecting, teardown])
+
+    assert.equal(created.length, 1, 'exactly one client is built')
+    assert.ok(created[0].calls.includes('quit'), 'and the teardown must have reached it')
+    assert.equal(manager.client, null, 'no client may outlive the disconnect that raced it')
+    assert.equal(manager.isConnected, false)
+  })
+
+  // The deferral is a real suspension point, so a disconnect() can land inside
+  // it — a supervisor reconnecting from 'close' while the application is
+  // shutting down. Coming back to find the client mid-quit would be the same
+  // "connected with nothing behind it" lie the deferral exists to avoid.
+  test('a disconnect() that lands during the close deferral is waited out', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+
+    created[0].status = 'close'
+    created[0].emit('close')
+    created[0].quit = () => {
+      created[0].calls.push('quit')
+
+      return new Promise(() => {})
+    }
+
+    const reconnect = manager.connect()
+    const teardown = manager.disconnect()
+
+    let reconnected = false
+    reconnect.then(() => { reconnected = true })
+
+    await clock.advance(1999)
+    assert.equal(reconnected, false, 'the reconnect must wait out the teardown it collided with')
+    assert.equal(created.length, 1, 'and must not build against a client that is being quit')
+
+    await clock.advance(1)
+    await teardown
+    await reconnect
+
+    assert.equal(created.length, 2, 'a fresh cycle starts once the teardown finished')
+    assert.equal(manager.isConnected, true)
+  })
+
   test('disconnect() is joined, never doubled, while a teardown is in flight', async () => {
     const { manager, created, clock } = createManager()
 

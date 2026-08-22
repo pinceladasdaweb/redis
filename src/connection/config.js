@@ -13,15 +13,35 @@ const LIBRARY_OPTIONS = new Set([
   'healthCheckTimeout'
 ])
 
-// Options the library sets on purpose and will not let a caller replace:
-// reconnection belongs to the driver *through these hooks*, and swapping them
-// out would silently disable the retry policy this library documents.
-const RESERVED_OPTIONS = new Set(['retryStrategy', 'reconnectOnError', 'clusterRetryStrategy'])
+// Options the library will not let a caller replace, each with the reason —
+// every one of them is something this library's own correctness rests on, and
+// overriding it fails silently rather than loudly.
+const RETRY_IS_OURS = 'reconnection belongs to this library — use maxRetryAttempts, baseRetryDelay and maxRetryDelay instead'
+const RESERVED_OPTIONS = new Map([
+  ['retryStrategy', RETRY_IS_OURS],
+  ['reconnectOnError', RETRY_IS_OURS],
+  ['clusterRetryStrategy', RETRY_IS_OURS],
+  ['clusterNodeRetryStrategy', RETRY_IS_OURS],
+  // The facade parses replies positionally in their RESP2-compatible shape:
+  // CONFIG GET as a flat array, WITHSCORES as alternating member/score. Under
+  // ioredis 6 that shape survives RESP3 only because the default reply mapping
+  // flattens maps and doubles; asking for the 'resp3' mapping turns CONFIG GET
+  // into an object and breaks keyspaceNotifications() from underneath.
+  ['replyMapping', "this library parses replies in their RESP2-compatible shape, which the 'resp3' mapping changes underneath it"],
+  // Built here from the flat option list (see the cluster split below). A
+  // caller-supplied one would be filed as a node-level option and end up
+  // nested inside the real one, where nothing ever reads it.
+  ['redisOptions', 'this library builds it from the cluster option split — pass node options at the top level']
+])
 
 // In cluster mode ioredis splits its options in two: these belong to the
 // cluster itself, everything else describes each node and travels under
 // `redisOptions`. Getting the split wrong means an option is silently
 // ignored — exactly the failure this library just removed for standalone.
+//
+// The list is checked against ioredis's own ClusterOptions by a test, because
+// a dependency major can add a cluster-level option without ever mentioning
+// this library — and the symptom is silence, not an error.
 const CLUSTER_LEVEL_OPTIONS = new Set([
   'nodes',
   'dnsLookup',
@@ -37,7 +57,13 @@ const CLUSTER_LEVEL_OPTIONS = new Set([
   'slotsRefreshInterval',
   'natMap',
   'enableAutoPipelining',
-  'lazyConnect'
+  'autoPipeliningIgnoredCommands',
+  'lazyConnect',
+  'useSRVRecords',
+  'resolveSrv',
+  'shardedSubscribers',
+  'scripts',
+  'himportFieldsets'
 ])
 
 // Numbers that must be finite and non-negative if given at all. A typo here
@@ -51,6 +77,14 @@ const NON_NEGATIVE_NUMBERS = [
   'commandTimeout',
   'connectTimeout'
 ]
+
+// Infinity means "never give up" for an attempt COUNT and nothing sane for
+// anything else: every other name above is a delay or a timeout that ends up
+// in a timer, and Node clamps an out-of-range delay to 1ms. Waving Infinity
+// through for those turns "no limit" into the tightest limit there is —
+// commandTimeout: Infinity failing every command after 1ms, maxRetryDelay:
+// Infinity reconnecting in a hot loop.
+const ALLOWS_INFINITY = new Set(['maxRetryAttempts'])
 
 class RedisConfig {
   constructor (options = {}) {
@@ -97,12 +131,32 @@ class RedisConfig {
       for (const [key, value] of Object.entries(settings)) {
         if (key === 'nodes') continue
 
+        // Not under redisOptions: ioredis's ConnectionPool sets retryStrategy
+        // on every node connection ITSELF (from clusterNodeRetryStrategy)
+        // before merging redisOptions in, and lodash `defaults` never
+        // overwrites a key that is already present — so a retryStrategy filed
+        // here is shadowed on every path. ioredis's own type Omits it from
+        // redisOptions for exactly that reason. It travels below, as the
+        // option the driver actually reads.
+        if (key === 'retryStrategy') continue
+
         ;(CLUSTER_LEVEL_OPTIONS.has(key) ? clusterLevel : nodeLevel)[key] = value
       }
 
       this.configOptions = {
         ...clusterLevel,
         clusterRetryStrategy: this.retryStrategy.bind(this),
+        // Per-NODE reconnection, which ioredis leaves off by default: a closed
+        // node connection is not retried at all, and the pool waits for a
+        // MOVED to rebuild it. That default quietly un-applies the retry
+        // policy this library documents, and it bites hardest where the
+        // library owns the socket — a keyspace-event subscriber is a
+        // duplicate() of a node connection, so it inherited `retryStrategy:
+        // null` and one blip took that shard's events down for good ("ended
+        // permanently") instead of reconnecting. Nodes that genuinely leave
+        // the cluster are disconnected by the pool's own reset(), so this
+        // never becomes a retry loop against an address that is gone.
+        clusterNodeRetryStrategy: this.retryStrategy.bind(this),
         redisOptions: nodeLevel
       }
     } else {
@@ -124,23 +178,30 @@ class RedisConfig {
     for (const name of NON_NEGATIVE_NUMBERS) {
       const value = options[name]
 
-      if (value === undefined || value === Infinity) {
+      if (value === undefined || (value === Infinity && ALLOWS_INFINITY.has(name))) {
         continue
       }
 
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        // JSON.stringify renders Infinity and NaN alike as "null", which is
+        // the one thing the reader must not be told here.
+        const shown = typeof value === 'number' ? String(value) : JSON.stringify(value)
+        const trap = value === Infinity
+          ? ' — Infinity reaches a timer, where Node clamps it to 1ms; omit the option to leave it unbounded'
+          : ''
+
         throw new RedisClientError(
-          `${name} must be a non-negative number (got ${JSON.stringify(value)}).`,
+          `${name} must be a finite non-negative number (got ${shown})${trap}.`,
           'constructor',
           'INVALID_OPTION'
         )
       }
     }
 
-    for (const name of RESERVED_OPTIONS) {
+    for (const [name, reason] of RESERVED_OPTIONS) {
       if (options[name] !== undefined) {
         throw new RedisClientError(
-          `${name} is managed by this library and cannot be overridden. Use maxRetryAttempts, baseRetryDelay and maxRetryDelay instead.`,
+          `${name} is managed by this library and cannot be overridden: ${reason}.`,
           'constructor',
           'INVALID_OPTION'
         )

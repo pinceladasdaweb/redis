@@ -180,6 +180,29 @@ describe('script registry', () => {
     }
   })
 
+  // Review finding: the readiness gate was handed the SCRIPT NAME as its
+  // operation, so the same call surface reported 'runScript' when the
+  // arguments were wrong and 'fencedSet' when the connection was down. A
+  // consumer branching on `operation` — which this library documents as the
+  // alternative to parsing messages — matched one and missed the other.
+  test('a connection failure names the method, not the script', async () => {
+    const registry = new ScriptRegistry({
+      connection: {
+        assertReady: (operation) => {
+          throw Object.assign(new Error('down'), { code: 'REDIS_UNAVAILABLE', operation })
+        }
+      },
+      logger: quietLogger
+    })
+
+    registry.define('fencedSet', { lua: LUA, numberOfKeys: 1 })
+
+    await assert.rejects(registry.run('fencedSet', ['k'], ['v']), {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'runScript'
+    })
+  })
+
   test('a malformed definition is refused at registration, not at first use', () => {
     const { registry } = createRegistry()
 

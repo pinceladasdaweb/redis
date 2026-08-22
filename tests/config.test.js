@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { describe, test } from 'node:test'
 import RedisConfig from '../src/connection/config.js'
 
@@ -75,11 +76,14 @@ describe('redis config', () => {
     assert.equal(typeof options.retryStrategy, 'function')
     assert.equal(typeof options.reconnectOnError, 'function')
 
-    for (const hook of ['retryStrategy', 'reconnectOnError']) {
+    for (const hook of ['retryStrategy', 'reconnectOnError', 'clusterRetryStrategy', 'clusterNodeRetryStrategy']) {
       assert.throws(() => new RedisConfig({ logger: quietLogger, [hook]: () => 1 }), {
         name: 'RedisClientError',
         code: 'INVALID_OPTION',
-        operation: 'constructor'
+        operation: 'constructor',
+        // The refusal has to say what to use instead, or it is a dead end for
+        // whoever hit it.
+        message: /maxRetryAttempts, baseRetryDelay and maxRetryDelay/
       }, `overriding ${hook} would silently disable the documented retry policy`)
     }
   })
@@ -91,7 +95,11 @@ describe('redis config', () => {
       ['baseRetryDelay', NaN],
       ['maxRetryDelay', null],
       ['commandTimeout', -5],
-      ['connectTimeout', '3000']
+      ['connectTimeout', '3000'],
+      // The one option that ACCEPTS Infinity still has to reject everything
+      // else: its exemption is for that value, not from validation.
+      ['maxRetryAttempts', -1],
+      ['maxRetryAttempts', 'many']
     ]) {
       assert.throws(() => new RedisConfig({ logger: quietLogger, [name]: value }), {
         code: 'INVALID_OPTION',
@@ -99,9 +107,69 @@ describe('redis config', () => {
       }, `${name}: ${JSON.stringify(value)} must not reach the driver`)
     }
 
+    // The value has to be readable in the message: JSON.stringify renders
+    // Infinity and NaN alike as "null", so numbers are shown with String()
+    // and everything else quoted as itself.
+    assert.throws(() => new RedisConfig({ logger: quietLogger, healthCheckTimeout: 'soon' }), {
+      message: /got "soon"\)\.$/
+    }, 'a non-number must be quoted, so "soon" is not read as a variable name')
+
+    assert.throws(() => new RedisConfig({ logger: quietLogger, healthCheckTimeout: NaN }), {
+      message: /got NaN\)\.$/
+    }, 'NaN must be named, never rendered as null')
+
     // Infinity is meaningful for the attempt limit, and zero is legitimate.
     assert.doesNotThrow(() => new RedisConfig({ logger: quietLogger, maxRetryAttempts: Infinity }))
     assert.doesNotThrow(() => new RedisConfig({ logger: quietLogger, maxRetryAttempts: 0, healthCheckInterval: 0 }))
+  })
+
+  // Review finding: Infinity used to be waved through for ALL of them, and it
+  // only means anything for an attempt COUNT. Every other name is a delay or a
+  // timeout that ends up in a timer, where Node clamps an out-of-range value to
+  // 1ms — so `commandTimeout: Infinity` written for "no timeout" failed every
+  // command after 1ms, and `maxRetryDelay: Infinity` reconnected in a hot loop.
+  // The tightest possible limit is not a defensible reading of "no limit".
+  test('Infinity is only meaningful for the attempt limit', () => {
+    for (const name of ['baseRetryDelay', 'maxRetryDelay', 'healthCheckInterval', 'healthCheckTimeout', 'commandTimeout', 'connectTimeout']) {
+      assert.throws(() => new RedisConfig({ logger: quietLogger, [name]: Infinity }), {
+        code: 'INVALID_OPTION',
+        operation: 'constructor',
+        // JSON.stringify renders Infinity as "null", which is the one thing
+        // the reader must not be told here.
+        message: /got Infinity.*clamps it to 1ms/
+      }, `${name}: Infinity must not reach a timer`)
+    }
+
+    // ...and that explanation belongs ONLY to Infinity. On an ordinary typo it
+    // would send the reader chasing a timer that has nothing to do with it.
+    assert.throws(() => new RedisConfig({ logger: quietLogger, commandTimeout: -5 }), {
+      message: /^commandTimeout must be a finite non-negative number \(got -5\)\.$/
+    })
+
+    assert.doesNotThrow(() => new RedisConfig({ logger: quietLogger, maxRetryAttempts: Infinity }))
+  })
+
+  // Review finding: this library parses replies positionally in their
+  // RESP2-compatible shape — CONFIG GET as a flat array, WITHSCORES as
+  // alternating member/score. Under ioredis 6 that shape survives RESP3 only
+  // because the default reply mapping flattens maps and doubles, so asking for
+  // the 'resp3' mapping turns CONFIG GET into an object and breaks
+  // keyspaceNotifications() from underneath, with no error pointing at why.
+  test('options this library parses against cannot be swapped out', () => {
+    assert.throws(() => new RedisConfig({ logger: quietLogger, replyMapping: 'resp3' }), {
+      code: 'INVALID_OPTION',
+      operation: 'constructor',
+      message: /RESP2-compatible shape/
+    })
+
+    // And redisOptions is built here from the cluster split: a caller-supplied
+    // one is filed as a node-level option and ends up nested inside the real
+    // one, where nothing ever reads it.
+    assert.throws(() => new RedisConfig({ logger: quietLogger, nodes: [{ host: 'n1', port: 7001 }], redisOptions: { password: 'x' } }), {
+      code: 'INVALID_OPTION',
+      operation: 'constructor',
+      message: /cluster option split/
+    })
   })
 
   test('sentinel mode demands the master group name', () => {
@@ -125,6 +193,28 @@ describe('redis config', () => {
     assert.equal(options.autoResubscribe, true, 'pub/sub recovery depends on this')
     assert.equal(options.autoResendUnfulfilledCommands, true)
     assert.equal(options.lazyConnect, true)
+  })
+
+  // An option handed over as an explicit `undefined` — the shape every
+  // `{ lazyConnect: opts.lazyConnect }` produces when the caller did not set it
+  // — must not overwrite the default with nothing. Spreading it would leave
+  // `lazyConnect: undefined`, which ioredis then reads as its OWN default
+  // (false), quietly opening a socket at construction.
+  test('an option passed as undefined leaves the default standing', () => {
+    const options = new RedisConfig({
+      logger: quietLogger,
+      lazyConnect: undefined,
+      enableReadyCheck: undefined,
+      maxRetriesPerRequest: undefined,
+      autoResubscribe: undefined,
+      host: undefined
+    }).getOptions()
+
+    assert.equal(options.lazyConnect, true)
+    assert.equal(options.enableReadyCheck, true)
+    assert.equal(options.maxRetriesPerRequest, null)
+    assert.equal(options.autoResubscribe, true)
+    assert.equal('host' in options, false, 'and an undefined passthrough never reaches the driver at all')
   })
 
   test('every driver default can be turned off', () => {
@@ -249,7 +339,7 @@ describe('redis config', () => {
     assert.equal(options.redisOptions.keyPrefix, 'app:')
     assert.equal(options.redisOptions.connectTimeout, 250)
     assert.equal(options.redisOptions.maxRetriesPerRequest, null)
-    assert.equal(typeof options.redisOptions.retryStrategy, 'function')
+    assert.equal(typeof options.redisOptions.reconnectOnError, 'function')
 
     // And neither level may carry the other's options, or the one that
     // landed in the wrong place is dropped without a word.
@@ -259,6 +349,50 @@ describe('redis config', () => {
 
     // The backoff a cluster uses is the one this library documents.
     assert.equal(options.clusterRetryStrategy(1), 20, 'exponential backoff, same as a single node')
+  })
+
+  // Review finding: the documented backoff reached the Cluster object and
+  // nothing else. ioredis's ConnectionPool sets `retryStrategy` on every node
+  // connection itself — from `clusterNodeRetryStrategy`, which defaults to
+  // `null` — and merges redisOptions in with lodash `defaults`, which never
+  // overwrites a key already present. So the retryStrategy this library filed
+  // under redisOptions was shadowed on every path, and cluster node
+  // connections did not reconnect at all. Probed against a live three-master
+  // cluster (22/08/2026): `nodes('master')[0].options.retryStrategy` was
+  // `null`, and so was `duplicate().options.retryStrategy` — which is what a
+  // keyspace-event subscriber is built from.
+  test('the documented backoff reaches the node connections, not just the cluster', () => {
+    const options = new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      maxRetryAttempts: Infinity,
+      baseRetryDelay: 10,
+      maxRetryDelay: 100
+    }).getOptions()
+
+    assert.equal(typeof options.clusterNodeRetryStrategy, 'function', 'per-node reconnection must be configured')
+    assert.equal(options.clusterNodeRetryStrategy(1), 20, 'and use the same backoff as everything else')
+
+    // And it is NOT left under redisOptions, where ioredis's own type omits it
+    // and its ConnectionPool shadows it — carrying it there says the policy
+    // applies when it does not.
+    assert.equal(
+      'retryStrategy' in options.redisOptions,
+      false,
+      'a shadowed option under redisOptions is a claim the driver never honours'
+    )
+  })
+
+  test('maxRetryAttempts: 0 disables node reconnection too', () => {
+    const options = new RedisConfig({
+      logger: quietLogger,
+      nodes: [{ host: 'n1', port: 7001 }],
+      maxRetryAttempts: 0,
+      baseRetryDelay: 10,
+      maxRetryDelay: 100
+    }).getOptions()
+
+    assert.equal(options.clusterNodeRetryStrategy(1), null, 'the attempt limit governs every connection this library opens')
   })
 
   // Every name in the split is load-bearing. ioredis reads cluster-level
@@ -316,6 +450,53 @@ describe('redis config', () => {
     // `nodes` is a constructor argument, never an option on either side.
     assert.equal('nodes' in options, false)
     assert.equal('nodes' in options.redisOptions, false)
+  })
+
+  // Review finding: the split is a hand-kept list against a dependency that
+  // grows its own, and ioredis 6 had already added useSRVRecords, resolveSrv,
+  // shardedSubscribers and autoPipeliningIgnoredCommands without this list
+  // hearing about it. Filed under redisOptions they are not an error — they are
+  // silence, the same failure this library removed once for `tls`. So the list
+  // is checked against ioredis's OWN declaration, and the next dependency major
+  // that adds a cluster-level option fails here instead of in production.
+  test('the cluster split covers every option ioredis reads at cluster level', async () => {
+    const source = await readFile(new URL('../node_modules/ioredis/built/cluster/ClusterOptions.d.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('export interface ClusterOptions')
+
+    assert.notEqual(start, -1, 'ioredis must still declare ClusterOptions where this test looks')
+
+    // Its own declarations only — the interface ends at the first unindented
+    // closing brace, so the types that follow it are not swept in.
+    const body = source.slice(start, source.indexOf('\n}', start))
+    const declared = [...body.matchAll(/^ {4}(\w+)\??:/gm)].map(([, name]) => name)
+
+    assert.ok(declared.length > 15, `the parse must find the options, not a handful (${declared.length})`)
+
+    // The ones this library owns rather than forwards: it BUILDS redisOptions
+    // from the split, and both retry strategies are the documented backoff.
+    const owned = new Set(['redisOptions', 'clusterRetryStrategy', 'clusterNodeRetryStrategy'])
+
+    for (const name of declared) {
+      if (owned.has(name)) {
+        assert.throws(() => new RedisConfig({ logger: quietLogger, nodes: [{ host: 'n1', port: 7001 }], [name]: 'anything' }), {
+          code: 'INVALID_OPTION'
+        }, `${name} is this library's to set, and overriding it must be refused`)
+
+        continue
+      }
+
+      const options = new RedisConfig({
+        logger: quietLogger,
+        nodes: [{ host: 'n1', port: 7001 }],
+        [name]: 'sentinel',
+        maxRetryAttempts: Infinity,
+        baseRetryDelay: 10,
+        maxRetryDelay: 100
+      }).getOptions()
+
+      assert.equal(options[name], 'sentinel', `ioredis reads ${name} at cluster level — it must land there`)
+      assert.equal(name in options.redisOptions, false, `${name} under redisOptions is silently ignored`)
+    }
   })
 
   test('the cluster keeps database 0 and rejects anything else', () => {

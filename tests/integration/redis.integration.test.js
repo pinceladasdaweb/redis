@@ -1357,6 +1357,37 @@ describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER
   const createClusterClient = (options = {}) =>
     new RedisClient({ nodes: CLUSTER_NODES, keyPrefix: 'ct:', logger: quietLogger, ...options })
 
+  // Review finding: the documented backoff reached the Cluster object and
+  // stopped there. ioredis's ConnectionPool sets `retryStrategy` on each node
+  // connection from `clusterNodeRetryStrategy` (default `null`) BEFORE merging
+  // redisOptions, and lodash `defaults` never overwrites — so the strategy
+  // filed under redisOptions was shadowed and node connections never
+  // reconnected. This asserts it against the real pool, because the shadowing
+  // happens inside the driver and no unit fake can honestly model it. The
+  // duplicate() matters as much as the node: that is what a keyspace-event
+  // subscriber is built from, and it inherited the dead policy too.
+  test('the retry policy reaches the real node connections and their duplicates', { timeout: 30000 }, async () => {
+    const client = createClusterClient({ maxRetryAttempts: Infinity, baseRetryDelay: 10, maxRetryDelay: 100 })
+    await client.connect()
+
+    const [master] = client.client.nodes('master')
+    const subscriberShaped = master.duplicate()
+
+    try {
+      assert.equal(typeof master.options.retryStrategy, 'function', 'a node connection that never retries is a shard that never comes back')
+      assert.equal(master.options.retryStrategy(1), 20, 'and it must be the backoff this library documents')
+
+      assert.equal(
+        typeof subscriberShaped.options.retryStrategy,
+        'function',
+        'keyspace-event subscribers are duplicates of a node connection and inherit its policy'
+      )
+    } finally {
+      subscriberShaped.disconnect()
+      await client.disconnect()
+    }
+  })
+
   test('follows redirections for keys spread across the masters', { timeout: 30000 }, async () => {
     const client = createClusterClient()
     await client.connect()
