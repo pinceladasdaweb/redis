@@ -25,6 +25,24 @@ else
 end
 `
 
+// A ttl reaches SET…PX and PEXPIRE as-is, and the server is strict about it:
+// a non-integer is "ERR value is not an integer", zero is "ERR invalid expire
+// time" — raw ReplyErrors with no code and no operation, unlike every other
+// malformed argument in this library. And zero is worse on PEXPIRE, where it
+// is NOT an error: it deletes the key and returns 1, so extend(0) reported a
+// lock as renewed at the instant it was gone.
+const assertTtl = (ttl, operation) => {
+  if (!Number.isInteger(ttl) || ttl <= 0) {
+    throw new RedisClientError(
+      `${operation} requires a positive integer ttl in milliseconds (got ${ttl}).`,
+      operation,
+      'INVALID_ARGUMENT'
+    )
+  }
+
+  return ttl
+}
+
 class LockManager {
   constructor ({ connection, logger, clock }) {
     this.connection = connection
@@ -46,12 +64,19 @@ class LockManager {
   }
 
   async acquire (name, options = {}) {
-    const ttl = options.ttl ?? 30000
+    const ttl = assertTtl(options.ttl ?? 30000, 'acquireLock')
     const retries = options.retries ?? 0
     const retryDelay = options.retryDelay ?? 100
     // Random extra delay per attempt: under contention, fixed delays make
-    // every waiter retry in lockstep; jitter spreads them out.
+    // every waiter retry in lockstep; jitter spreads them out. Below 1ms of
+    // jitter Math.floor makes it a constant 0 — say so instead of silently
+    // retrying in lockstep after all.
     const retryJitter = options.retryJitter ?? 0
+
+    if (retryJitter > 0 && retryJitter < 1) {
+      this.logger.warn(`Lock '${name}': retryJitter ${retryJitter}ms rounds down to no jitter at all.`)
+    }
+
     const key = `lock:${name}`
     const token = randomUUID()
 
@@ -62,10 +87,17 @@ class LockManager {
       if (result === 'OK') {
         this.logger.debug?.(`Lock '${name}' acquired (ttl ${ttl}ms)`)
 
-        return {
+        // Once released, a reply to an EXTEND that was already in flight lands
+        // on a key that is gone (0) or, worse, on a contender's lock (the Lua
+        // compare refuses that: also 0). The watchdog reads this so it knows
+        // a 0 after release is expected, not a lock lost mid-hold.
+        const lock = {
           name,
           token,
+          released: false,
           release: async () => {
+            lock.released = true
+
             const released = Number(await this.#client('releaseLock').releaseLock(key, token)) === 1
 
             if (!released) {
@@ -74,9 +106,14 @@ class LockManager {
 
             return released
           },
-          extend: async (ttlMs = ttl) =>
-            Number(await this.#client('extendLock').extendLock(key, token, ttlMs)) === 1
+          extend: async (ttlMs = ttl) => {
+            assertTtl(ttlMs, 'extendLock')
+
+            return Number(await this.#client('extendLock').extendLock(key, token, ttlMs)) === 1
+          }
         }
+
+        return lock
       }
 
       if (attempt < retries) {
@@ -105,6 +142,13 @@ class LockManager {
       options = {}
     }
 
+    // An explicit `undefined` — the shape every `{ ttl: cfg.lockTtl }`-style
+    // caller produces when the section is absent — skipped the overload
+    // above, acquired the lock, and then threw on `options.autoExtend` OUTSIDE
+    // the try/finally below: fn never ran, release never ran, and the lock
+    // stayed held for its whole ttl.
+    options ??= {}
+
     const lock = await this.acquire(name, options)
     let watchdog = null
 
@@ -120,12 +164,17 @@ class LockManager {
         try {
           const extended = await lock.extend(ttl)
 
-          if (!extended) {
+          // A tick that was already awaiting EXTEND when fn finished lands
+          // after release(): the 0 it gets back is the lock being gone on
+          // purpose, not lost.
+          if (!extended && !lock.released) {
             this.clock.clearInterval(watchdog)
             this.logger.warn(`Lock '${name}' could not be extended — it was lost (expired or taken over).`)
           }
         } catch (err) {
-          this.logger.warn(`Failed to extend lock '${name}': ${err.message}`)
+          if (!lock.released) {
+            this.logger.warn(`Failed to extend lock '${name}': ${err.message}`)
+          }
         }
       }, interval)
 

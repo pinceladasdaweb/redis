@@ -127,21 +127,26 @@ export const strykerPlugins = [
 //
 // A survivor NOT on this list is an open debt, not an accepted cost.
 //
-// --- Truly equivalent -------------------------------------------------------
+// Entries name FUNCTIONS and expressions, never line numbers: the numbers in
+// earlier versions of this ledger had all drifted within two releases, so it
+// described files that no longer existed.
 //
-// src/utils/clock.js:22   `handle.unref?.()` -> `handle.unref()`
-//   The optional call can never be needed HERE: this is the real clock, whose
-//   setTimeout always returns a Node Timeout, which always has unref(). The
-//   guard exists for the seam's sake — a ManualClock hands back a bare handle
-//   — but a ManualClock brings its own sleep() and never reaches this line.
-//   Killing it would mean testing the real clock with a fake timer, which is
-//   a contradiction.
+// --- Retired (22/08/2026) ---------------------------------------------------
 //
-// src/connection/config.js:26   `'nodes'` inside CLUSTER_LEVEL_OPTIONS
-//   Dead weight covered by a second defense: the split loop already does
-//   `if (key === 'nodes') continue` before consulting the set. Defense-in-depth
-//   PAIR (playbook §5.4) — each member makes the other's mutant survive.
-//   Documented rather than deleted: "nunca remover defesa por dedução".
+// clock.js `handle.unref?.()` — the unref is gone (4th review: a retry sleeping
+// while the connection ended let the process exit mid-await), so there is no
+// mutant left to accept.
+//
+// config.js `'nodes'` in CLUSTER_LEVEL_OPTIONS — removed. The set is parity-
+// checked against ioredis's ClusterOptions, which does not declare `nodes`
+// (a constructor argument); the `continue` in the split loop is the operative
+// defense and stays. This is a deliberate exception to "never remove a
+// defense by deduction": the deduction here is a TEST, not a reading.
+//
+// index.js #getOrSet catch `err?.code` / `err?.lockName` — the proof was
+// WRONG ("only Errors are thrown on that path": the path includes the
+// caller's producer, which can `throw undefined`). Killed by test — 'a
+// producer that throws a non-Error under lock surfaces that very value'.
 //
 // --- Repaired downstream ----------------------------------------------------
 //
@@ -158,9 +163,10 @@ export const strykerPlugins = [
 //   "this option is a number" reads better than a negated isFinite — and
 //   documented rather than deleted (§5.4, defense-in-depth pair).
 //
-// src/connection/manager.js:93,111,182   `if (this.#client === client)`
-// src/messaging/pubsub.js:81,152         `if (this.#subscriber === subscriber)`
-// src/messaging/pubsub.js                `if (#nodeSubscribers.get(key) === entry)`
+// manager.js #releaseClient `if (this.#client === client)` (the four copies of
+//   this fence collapsed into one in the 4th review)
+// pubsub.js #ensureSubscriber's `if (this.#subscriber === subscriber)`
+// pubsub.js #subscribeNode's `if (#nodeSubscribers.get(key) === entry)`
 //   Ownership fences. Removing one only matters when TWO generations of a
 //   connection are alive at the same instant and the older one settles last;
 //   in every other ordering the assignment it guards is idempotent. Killing
@@ -168,7 +174,7 @@ export const strykerPlugins = [
 //   installed — worth writing the day this file grows a third generation, not
 //   before.
 //
-// src/connection/manager.js:49   `if (this.#connectPromise === attempt)`
+// manager.js connect()'s `if (this.#connectPromise === attempt)`
 //   Same shape, and the closest to killable: tests/connection.test.js already
 //   drives connect → disconnect → connect. It survives because the abandoned
 //   attempt settles AFTER the replacement finished, so clearing the slot twice
@@ -208,12 +214,11 @@ export const strykerPlugins = [
 // original; the object path is pinned by the options-merge test. Spec
 // equivalence (§5.4's "spec de JS" class).
 //
-// index.js #getOrSet catch: the two `err?.` optional chains (an error caught
-// from an await is never nullish here — only Errors are thrown on that path)
-// and the `code !== …` operand-to-false variant, which would misroute only an
-// error that carries lockName `cache:<key>` WITHOUT the LOCK_NOT_ACQUIRED
-// code — unconstructible: LockManager is the only writer of lockName and
-// always pairs it with that code.
+// index.js #getOrSet catch: the `code !== …` operand-to-false variant, which
+// would misroute only an error that carries lockName `cache:<key>` WITHOUT the
+// LOCK_NOT_ACQUIRED code — unconstructible: LockManager is the only writer of
+// lockName and always pairs it with that code. (The two `err?.` chains that
+// used to sit in this entry are killed by test now — see "Retired" above.)
 //
 // zadd's isMemberMap guard chain (index.js): each surviving mutant shifts
 // WHICH guard rejects an input the contract never admits (an object plus
@@ -258,16 +263,12 @@ export const strykerPlugins = [
 // that resumes afterwards builds one nobody closes. The difference is that
 // those two sit on the path a fresh connect takes; this one does not.
 //
-// pubsub.js #resyncTopology's `if (this.#nodeChannels.size === 0) return` and
-// the `if (missing.length === 0) continue` inside its master loop are now a
-// defense-in-depth PAIR (§5.4), and each makes the other's mutant survive.
-// Before the review the loop asked "does this node have a subscriber?", so
-// with no registered channels and the early return gone it would have BUILT a
-// subscriber per master carrying nothing — killable, and killed. The loop now
-// asks what each node is missing, which is [] when nothing is registered, so
-// removing the early return leaves a pass over the masters that subscribes
-// nothing and a release pass over an empty map. The early return survives as
-// an optimization; the correctness lives in the per-channel reconciliation.
+// pubsub.js #resyncTopology's `if (missing.length === 0) continue`: forced to
+// false it calls #subscribeNode(node, []) on a node that already has an entry,
+// which subscribes nothing — a no-op. (Its former pair, the empty-set early
+// return at the top of the method, was removed in the 4th review: the watcher
+// and the tick that reach this method are torn down with the last channel, so
+// the guard had no path left.)
 //
 // index.js `#keyspaceFlagsByNode('subscribeToKeyEvents')` — the operation of
 // the probe inside #assertKeyspaceNotifications, whose rejection that method
@@ -290,6 +291,69 @@ export const strykerPlugins = [
 // maxRetryDelay or it is a dead end for whoever hit it — so it is NOT a
 // survivor. Noted here because the next shared message constant will look like
 // one until someone asserts it.
+//
+// --- Added with the fourth full-source review (04/09/2026) -------------------
+//
+// health.js `if (this.#cancelInFlight === cancel)` — the two copies (inside
+//   settle and inside the timeout callback), four mutants. Ownership fence of
+//   the same family as the manager/pubsub ones above: it only matters when a
+//   NEWER probe has already replaced the slot by the time the older one
+//   settles — the newest probe is the one that must keep its cancel. Every
+//   single-probe ordering makes the assignment idempotent.
+// health.js the probe's `return false` / `{}` on the timed-out path: the
+//   caller only reads truthiness and the timeout route is asserted by result,
+//   not by the literal.
+//
+// manager.js `#intent = 'disconnect'` initial value and `beginShutdown()`'s
+//   assignment: the intent is compared to the ONE literal `'connect'`, so any
+//   other string is the same "not connecting" state. Killing it needs a third
+//   intent that does not exist.
+// manager.js `#closing = false` in connect(): connect() also resets the flag
+//   through disconnect()'s own completion in every reachable ordering; the
+//   explicit reset states the last-word rule where a reader looks for it.
+// manager.js #settled's `{ detach(); resolve() }` on 'ready': detach removes
+//   the very listener that is running plus its 'end' twin; with the block
+//   emptied the promise is settled by client.connect() instead, and the stray
+//   'end' listener is then removed by #releaseClient. Repair-downstream; the
+//   listener-count assertions pin the version that matters (a failed connect).
+//
+// pubsub.js the `operation = 'unsubscribe'` default parameter, and index.js's
+//   matching `'unsubscribe'` literal: the facade always passes the operation
+//   explicitly, so the default is documentation for direct callers (tests).
+// pubsub.js `last?.` in unsubscribe's count fold, `.filter(Boolean)` in
+//   #releaseAll, `?.()` in #release: each guards a shape (no fulfilled node, a
+//   node without a subscriber, a subscriber never wired) that the surrounding
+//   code has already excluded — defense-in-depth trio, kept as such.
+//
+// index.js the `#shutdown` guard in connect() (`if (this.#shutdown) await`):
+//   with the await removed, connect() runs into a facade whose connection
+//   manager is itself serialising the same shutdown — the manager's own
+//   #disconnectPromise wait repairs the ordering. The manager is the one gate;
+//   the facade's await is a courtesy that keeps the facade's 'end' ahead of the
+//   new 'ready'. Pinned at the manager level by 'facade shutdown ordering'.
+// index.js `#assertKeyspaceNotifications`'s message template pieces: text.
+//
+// logger.js the two `'info'` defaults (thresholdFor's fallback and the thunk):
+//   the unit test injects the level; the env default is pinned by the smoke
+//   test on the built package, which Stryker does not run.
+//
+// scanner.js `if (settled) return` in finish, `if (!settled) stream.resume()`,
+// lock.js `if (!lock.released)` around the extend-failure warning: these three
+//   were reported as survivors by the coverage-analysis run and CONFIRMED with
+//   `--coverageAnalysis off` (04/09) — so they were real, not mis-attributed —
+//   and were then killed by test: the scan fake counts destroy() calls and
+//   flags a resume() after destroy(); the lock test rejects the straddling
+//   EXTEND after release() and expects silence.
+//
+// pubsub.js #watchTopology's `if (#nodeWatcher?.client === client) return`:
+//   ownership fence of the family above — without it the same watcher is
+//   detached and re-armed on the same client, which is idempotent.
+// pubsub.js the resync tick's `catch { return }` emptied: `current` stays
+//   undefined and the `isCluster(current)` check right below returns for it.
+//   Repair-downstream.
+// pubsub.js #restore's `if (previous)` ->true: sets the key to `undefined`
+//   instead of deleting it, and #dispatch drops falsy handlers — the same
+//   equivalence as the `if (handler)` pair.
 //
 // ---------------------------------------------------------------------------
 // Everything else still surviving is an open debt. Run

@@ -78,17 +78,31 @@ class HealthChecker {
         // cleared as soon as the reply lands (or stop() runs), so it holds
         // nothing open past its answer.
         const timeoutId = this.clock.setTimeout(() => {
-          this.#cancelInFlight = null
+          if (this.#cancelInFlight === cancel) {
+            this.#cancelInFlight = null
+          }
+
           reject(new Error('Operation timed out'))
         }, this.timeout)
 
+        // Only THIS probe's canceller is cleared. A PING that answers late —
+        // after its own timeout already settled the probe — used to null the
+        // field unconditionally, wiping the canceller a NEWER probe had just
+        // installed; stop() then did nothing and that probe's ref'd timer
+        // outlived disconnect(), the exact hang stop() exists to prevent.
         const settle = (fn) => (value) => {
           this.clock.clearTimeout(timeoutId)
-          this.#cancelInFlight = null
+
+          if (this.#cancelInFlight === cancel) {
+            this.#cancelInFlight = null
+          }
+
           fn(value)
         }
 
-        this.#cancelInFlight = settle(resolve).bind(null, null)
+        const cancel = settle(resolve).bind(null, null)
+
+        this.#cancelInFlight = cancel
 
         client.ping().then(settle(resolve), settle(reject))
       })

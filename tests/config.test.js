@@ -351,17 +351,19 @@ describe('redis config', () => {
     assert.equal(options.clusterRetryStrategy(1), 20, 'exponential backoff, same as a single node')
   })
 
-  // Review finding: the documented backoff reached the Cluster object and
-  // nothing else. ioredis's ConnectionPool sets `retryStrategy` on every node
-  // connection itself — from `clusterNodeRetryStrategy`, which defaults to
-  // `null` — and merges redisOptions in with lodash `defaults`, which never
-  // overwrites a key already present. So the retryStrategy this library filed
-  // under redisOptions was shadowed on every path, and cluster node
-  // connections did not reconnect at all. Probed against a live three-master
-  // cluster (22/08/2026): `nodes('master')[0].options.retryStrategy` was
-  // `null`, and so was `duplicate().options.retryStrategy` — which is what a
-  // keyspace-event subscriber is built from.
-  test('the documented backoff reaches the node connections, not just the cluster', () => {
+  // Review finding (4th round), and the reversal of the 3rd round's fix. The
+  // 3rd round set `clusterNodeRetryStrategy` to the library's backoff so that
+  // per-node keyspace subscribers (duplicates of node connections) would
+  // reconnect. Probed against two fake masters with one shut down: with ANY
+  // retry policy on the pool's nodes, the dead master's connection sat in
+  // 'reconnecting' forever, no '-node' ever fired (the pool notices a lost node
+  // only when its connection ENDS), no CONNECTION_CLOSED was raised, no slots
+  // refresh ran (there is no periodic one by default), the Cluster stayed
+  // 'ready', and every command to that shard hung in its offline queue. With
+  // the driver default the same command was re-routed in ~1ms. A failover had
+  // become a permanent hang. The pool keeps the driver default; the subscribers
+  // get their reconnection as a duplicate() override the pool never sees.
+  test('cluster node connections keep the driver\'s no-reconnect default', () => {
     const options = new RedisConfig({
       logger: quietLogger,
       nodes: [{ host: 'n1', port: 7001 }],
@@ -370,12 +372,16 @@ describe('redis config', () => {
       maxRetryDelay: 100
     }).getOptions()
 
-    assert.equal(typeof options.clusterNodeRetryStrategy, 'function', 'per-node reconnection must be configured')
-    assert.equal(options.clusterNodeRetryStrategy(1), 20, 'and use the same backoff as everything else')
+    assert.equal(
+      'clusterNodeRetryStrategy' in options,
+      false,
+      'a retry policy on pool nodes defeats the driver\'s failover detection'
+    )
+    assert.equal(typeof options.clusterRetryStrategy, 'function', 'the CLUSTER-level backoff is still ours')
 
-    // And it is NOT left under redisOptions, where ioredis's own type omits it
-    // and its ConnectionPool shadows it — carrying it there says the policy
-    // applies when it does not.
+    // And retryStrategy is NOT left under redisOptions, where ioredis's own
+    // type omits it and its ConnectionPool shadows it — carrying it there says
+    // the policy applies when it does not.
     assert.equal(
       'retryStrategy' in options.redisOptions,
       false,
@@ -383,16 +389,12 @@ describe('redis config', () => {
     )
   })
 
-  test('maxRetryAttempts: 0 disables node reconnection too', () => {
-    const options = new RedisConfig({
+  test('clusterNodeRetryStrategy stays reserved so nobody turns the hang on by hand', () => {
+    assert.throws(() => new RedisConfig({
       logger: quietLogger,
       nodes: [{ host: 'n1', port: 7001 }],
-      maxRetryAttempts: 0,
-      baseRetryDelay: 10,
-      maxRetryDelay: 100
-    }).getOptions()
-
-    assert.equal(options.clusterNodeRetryStrategy(1), null, 'the attempt limit governs every connection this library opens')
+      clusterNodeRetryStrategy: () => 50
+    }), { code: 'INVALID_OPTION', operation: 'constructor' })
   })
 
   // Every name in the split is load-bearing. ioredis reads cluster-level
@@ -555,5 +557,26 @@ describe('redis config', () => {
     assert.equal(standalone instanceof Redis.Cluster, false)
     assert.match(announced.at(-1), /client with host: 127\.0\.0\.1/)
     standalone.disconnect()
+  })
+})
+
+// Fourth full-source review (22/08/2026).
+describe('redis config — review findings', () => {
+  // On a connection meant for a replica, READONLY is the correct answer to a
+  // write, not a failover; reconnecting landed on a replica again, resent,
+  // and looped forever on a hook the caller could not opt out of.
+  test('READONLY is not a failover on a connection meant for a replica', () => {
+    const readonlyError = new Error("READONLY You can't write against a read only replica.")
+
+    assert.equal(new RedisConfig({ logger: quietLogger }).reconnectOnError(readonlyError), 2, 'on a master connection it IS a failover')
+    assert.equal(new RedisConfig({ logger: quietLogger, sentinels: [{ host: 's', port: 26379 }], name: 'm', role: 'slave' }).reconnectOnError(readonlyError), false)
+    assert.equal(new RedisConfig({ logger: quietLogger, readOnly: true }).reconnectOnError(readonlyError), false)
+  })
+
+  test('stringNumbers is reserved: this library sums the integers Redis returns', () => {
+    assert.throws(() => new RedisConfig({ logger: quietLogger, stringNumbers: true }), {
+      code: 'INVALID_OPTION',
+      message: /sums and compares the integers/
+    })
   })
 })

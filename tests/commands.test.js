@@ -21,6 +21,24 @@ const capture = () => {
     return null
   }
 
+  // The cache-aside path no longer goes through the public wrappers — it
+  // gates once under its OWN operation and issues GET/SETEX directly — so it
+  // needs a ready connection whose driver records into the same log.
+  const fake = {
+    status: 'ready',
+    get: async (...args) => { calls.push(['get', ...args]); return null },
+    setex: async (...args) => { calls.push(['setex', ...args]); return 'OK' }
+  }
+  client.connection = {
+    client: fake,
+    isConnected: true,
+    closing: false,
+    assertReady: () => fake,
+    beginShutdown () {},
+    connect: async () => {},
+    disconnect: async () => {}
+  }
+
   return { client, calls }
 }
 

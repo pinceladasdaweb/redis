@@ -31,7 +31,11 @@ const RESERVED_OPTIONS = new Map([
   // Built here from the flat option list (see the cluster split below). A
   // caller-supplied one would be filed as a node-level option and end up
   // nested inside the real one, where nothing ever reads it.
-  ['redisOptions', 'this library builds it from the cluster option split — pass node options at the top level']
+  ['redisOptions', 'this library builds it from the cluster option split — pass node options at the top level'],
+  // Every integer reply becomes a string: deleteByPattern's running total
+  // would concatenate ("011…") and every counter-returning wrapper would
+  // hand back text.
+  ['stringNumbers', 'this library sums and compares the integers Redis returns']
 ])
 
 // In cluster mode ioredis splits its options in two: these belong to the
@@ -43,7 +47,6 @@ const RESERVED_OPTIONS = new Map([
 // a dependency major can add a cluster-level option without ever mentioning
 // this library — and the symptom is silence, not an error.
 const CLUSTER_LEVEL_OPTIONS = new Set([
-  'nodes',
   'dnsLookup',
   'enableOfflineQueue',
   'enableReadyCheck',
@@ -85,6 +88,9 @@ const NON_NEGATIVE_NUMBERS = [
 // commandTimeout: Infinity failing every command after 1ms, maxRetryDelay:
 // Infinity reconnecting in a hot loop.
 const ALLOWS_INFINITY = new Set(['maxRetryAttempts'])
+
+// Timeouts for which 0 is a 0ms timer, not "disabled" (see #assertValid).
+const ZERO_MEANS_INSTANT = new Set(['commandTimeout', 'healthCheckTimeout'])
 
 class RedisConfig {
   constructor (options = {}) {
@@ -129,34 +135,36 @@ class RedisConfig {
       const nodeLevel = {}
 
       for (const [key, value] of Object.entries(settings)) {
+        // Startup nodes are a constructor argument, never an option.
         if (key === 'nodes') continue
 
-        // Not under redisOptions: ioredis's ConnectionPool sets retryStrategy
-        // on every node connection ITSELF (from clusterNodeRetryStrategy)
-        // before merging redisOptions in, and lodash `defaults` never
-        // overwrites a key that is already present — so a retryStrategy filed
-        // here is shadowed on every path. ioredis's own type Omits it from
-        // redisOptions for exactly that reason. It travels below, as the
-        // option the driver actually reads.
+        // Not under redisOptions: ioredis's ConnectionPool stamps every node
+        // connection with its own retryStrategy BEFORE merging redisOptions
+        // in, and lodash `defaults` never overwrites a key already present —
+        // so a retryStrategy filed here is shadowed on every path, and
+        // carrying it would claim a policy the driver never applies. ioredis's
+        // own type Omits it from redisOptions for exactly that reason.
         if (key === 'retryStrategy') continue
 
         ;(CLUSTER_LEVEL_OPTIONS.has(key) ? clusterLevel : nodeLevel)[key] = value
       }
 
+      // Per-node reconnection (clusterNodeRetryStrategy) is deliberately left
+      // at the driver's default of NONE, and the option is reserved so nobody
+      // turns it on by accident. The pool notices a dead master only when its
+      // connection ENDS: that removes the node, rejects what it held with
+      // CONNECTION_CLOSED, and triggers the slots refresh that finds the
+      // promoted replica. Probed against ioredis 6: with a retry policy on the
+      // nodes, a dead master's connection sat in 'reconnecting' forever, no
+      // '-node' ever fired, no refresh ever ran (there is no periodic one by
+      // default), the Cluster stayed 'ready', and every command to that shard
+      // hung in its offline queue — a failover became a permanent hang. The
+      // one place the library wants reconnection on a node-derived socket is
+      // the keyspace-event subscribers, and they get it as a duplicate()
+      // override (see SubscriptionManager), which the pool never sees.
       this.configOptions = {
         ...clusterLevel,
         clusterRetryStrategy: this.retryStrategy.bind(this),
-        // Per-NODE reconnection, which ioredis leaves off by default: a closed
-        // node connection is not retried at all, and the pool waits for a
-        // MOVED to rebuild it. That default quietly un-applies the retry
-        // policy this library documents, and it bites hardest where the
-        // library owns the socket — a keyspace-event subscriber is a
-        // duplicate() of a node connection, so it inherited `retryStrategy:
-        // null` and one blip took that shard's events down for good ("ended
-        // permanently") instead of reconnecting. Nodes that genuinely leave
-        // the cluster are disconnected by the pool's own reset(), so this
-        // never becomes a retry loop against an address that is gone.
-        clusterNodeRetryStrategy: this.retryStrategy.bind(this),
         redisOptions: nodeLevel
       }
     } else {
@@ -167,6 +175,10 @@ class RedisConfig {
     // redisOptions, and the facade should not have to know that.
     this.keyPrefix = options.keyPrefix ?? ''
     this.db = options.db ?? 0
+    // A connection the caller pointed at a replica on purpose (Sentinel
+    // `role: 'slave'`, or the driver's `readOnly`) is SUPPOSED to answer
+    // READONLY to a write; see reconnectOnError.
+    this.readOnly = options.role === 'slave' || options.readOnly === true
 
     this.maxRetryAttempts = options.maxRetryAttempts
     this.baseRetryDelay = options.baseRetryDelay
@@ -192,6 +204,20 @@ class RedisConfig {
 
         throw new RedisClientError(
           `${name} must be a finite non-negative number (got ${shown})${trap}.`,
+          'constructor',
+          'INVALID_OPTION'
+        )
+      }
+
+      // Zero is the other end of the same trap. For a TIMEOUT it is not
+      // "none": ioredis's Command.setTimeout has no `ms > 0` guard, so
+      // commandTimeout: 0 arms a 0ms timer that beats every socket reply and
+      // fails every command, and healthCheckTimeout: 0 does the same to the
+      // PING. (connectTimeout: 0 IS "none" — the driver checks truthiness
+      // there — and 0 is a legitimate interval or delay elsewhere.)
+      if (value === 0 && ZERO_MEANS_INSTANT.has(name)) {
+        throw new RedisClientError(
+          `${name}: 0 is not "no timeout" — it is a 0ms timer that fires before any reply can arrive. Omit the option to leave it unbounded.`,
           'constructor',
           'INVALID_OPTION'
         )
@@ -283,6 +309,15 @@ class RedisConfig {
   // structured check (never match substrings mid-message).
   reconnectOnError (err) {
     if (err.message.startsWith('READONLY')) {
+      // On a connection meant for a replica, READONLY is the correct answer
+      // to a write, not a failover. Reconnecting would land on a replica
+      // again, resend, get READONLY again — an infinite loop whose promise
+      // never settled, and one the caller could not opt out of because this
+      // hook is reserved. Let the error reach them.
+      if (this.readOnly) {
+        return false
+      }
+
       this.logger.warn('READONLY error detected. Reconnecting to the new master and resending the command.')
 
       // 2 = reconnect AND resend the failed command once reconnected.

@@ -184,3 +184,42 @@ describe('health checker', () => {
     assert.equal('isConnected' in client, false)
   })
 })
+
+// Fourth full-source review (22/08/2026).
+describe('health checker — review findings', () => {
+  // A PING that answered late — after its own timeout had already settled the
+  // probe — nulled #cancelInFlight unconditionally, wiping the canceller a
+  // NEWER probe had just installed. stop() then did nothing and that probe's
+  // deliberately ref'd timer outlived disconnect(). The fake never modeled a
+  // reply that arrives after the timeout; now it does.
+  test('a late reply from a timed-out probe cannot disarm the next probe\'s stop()', async () => {
+    const clock = createManualClock()
+    const replies = []
+    const client = {
+      status: 'ready',
+      ping: () => new Promise((resolve) => { replies.push(resolve) })
+    }
+    const checker = createChecker({ client, clock, timeout: 1000, interval: 0 })
+
+    // Probe 1 times out; its PING is still pending.
+    const first = checker.check()
+    await clock.advance(1000)
+    assert.equal(await first, false)
+
+    // Probe 2 is in flight with its own timer armed.
+    const second = checker.check()
+    await flushMicrotasks()
+    assert.equal(clock.pending(), 1, 'probe 2 holds a ref\'d timer')
+
+    // Probe 1's PING finally answers.
+    replies[0]('PONG')
+    await flushMicrotasks()
+
+    // stop() must still cancel probe 2.
+    checker.stop()
+    assert.equal(await second, false, 'probe 2 was cancelled, not left to its timer')
+    assert.equal(clock.pending(), 0, 'and its timer is gone — nothing outlives disconnect()')
+  })
+})
+
+const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve))

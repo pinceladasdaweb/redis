@@ -347,3 +347,131 @@ describe('lock manager', () => {
     await running
   })
 })
+
+// Fourth full-source review (22/08/2026).
+describe('lock manager — review findings', () => {
+  // withLock(name, undefined, fn) skipped the function-overload branch,
+  // ACQUIRED the lock, and then threw on `options.autoExtend` outside the
+  // try/finally — fn never ran, release never ran, the lock stayed held for
+  // its whole ttl.
+  test('withLock with an explicit undefined options still releases the lock', async () => {
+    const { manager, calls } = createManager()
+    let ran = false
+
+    await manager.withLock('job', undefined, async () => { ran = true })
+
+    assert.equal(ran, true, 'fn must run')
+    assert.equal(calls.at(-1)[0], 'releaseLock', 'and the lock must be released')
+  })
+
+  // A ttl reached SET…PX unvalidated: a non-integer or zero surfaced as a raw
+  // ReplyError with no code and no operation, unlike every other malformed
+  // argument in the library.
+  test('acquire refuses a ttl that is not a positive integer', async () => {
+    const { manager, calls } = createManager()
+
+    for (const ttl of [0, -1, 1500.5, '1000', NaN, Infinity]) {
+      await assert.rejects(manager.acquire('job', { ttl }), {
+        code: 'INVALID_ARGUMENT',
+        operation: 'acquireLock'
+      }, `ttl ${ttl} must be refused before it reaches the server`)
+    }
+
+    assert.deepEqual(calls, [], 'nothing reaches the wire')
+  })
+
+  // PEXPIRE with 0 is NOT an error on the server: it deletes the key and
+  // returns 1 — so extend(0) reported the lock as renewed at the instant it
+  // was gone.
+  test('extend refuses a ttl that would delete the key', async () => {
+    const { manager, calls } = createManager()
+    const lock = await manager.acquire('job')
+
+    for (const ttl of [0, -5, 250.5]) {
+      await assert.rejects(lock.extend(ttl), { code: 'INVALID_ARGUMENT', operation: 'extendLock' })
+    }
+
+    assert.equal(calls.some(([name]) => name === 'extendLock'), false, 'no EXTEND reaches the wire')
+  })
+
+  // A watchdog tick already awaiting EXTEND when fn finished lands after
+  // release(): the 0 it gets back is the lock being gone on purpose, and used
+  // to be logged as "lost (expired or taken over)" on every section that
+  // ended within an extend round-trip.
+  test('an extend that straddles the release does not cry wolf', async () => {
+    const clock = createManualClock()
+    const { manager, logs, client } = createManager({ clock })
+
+    // EXTEND answers only when told to, like a real round-trip. Both commands
+    // are defined up front so the manager's lazy install does not overwrite
+    // the controllable one.
+    let answerExtend
+    const lua = 'if redis.call("get", KEYS[1]) == ARGV[1] then return 1 end'
+    client.defineCommand('releaseLock', { numberOfKeys: 1, lua })
+    client.defineCommand('extendLock', { numberOfKeys: 1, lua })
+    client.extendLock = () => new Promise((resolve) => { answerExtend = resolve })
+
+    let finish
+    const section = manager.withLock('job', { ttl: 1000, autoExtend: true }, () => new Promise((resolve) => { finish = resolve }))
+
+    await flush()
+    await clock.advance(500) // the tick fires and its EXTEND is now in flight
+
+    finish()
+    await section // released while the EXTEND is still out
+
+    answerExtend(0) // ...and the late reply says "not held"
+    await flush()
+
+    assert.equal(logs.some((line) => /could not be extended/.test(line)), false, 'a release is not a loss')
+  })
+
+  test('sub-millisecond jitter is reported as no jitter at all', async () => {
+    const { manager, logs } = createManager({ acquireReplies: ['OK'] })
+
+    await manager.acquire('job', { retryJitter: 0.5 })
+
+    assert.match(logs.at(-1), /retryJitter 0\.5ms rounds down to no jitter/)
+  })
+})
+
+describe('lock manager — jitter boundary', () => {
+  test('a jitter of at least one millisecond is real jitter and draws no warning', async () => {
+    for (const retryJitter of [1, 1.5, 50]) {
+      const { manager, logs } = createManager({ acquireReplies: ['OK'] })
+
+      await manager.acquire('job', { retryJitter })
+
+      assert.deepEqual(logs, [], `retryJitter ${retryJitter} must not be flagged`)
+    }
+  })
+})
+
+describe('lock manager — a late extend failure after release', () => {
+  // Same straddle as above, but the late reply is a REJECTION (the connection
+  // went away with the section already over). Nothing was lost: silence.
+  test('an extend that fails after the release is not reported', async () => {
+    const clock = createManualClock()
+    const { manager, logs, client } = createManager({ clock })
+
+    let failExtend
+    const lua = 'if redis.call("get", KEYS[1]) == ARGV[1] then return 1 end'
+    client.defineCommand('releaseLock', { numberOfKeys: 1, lua })
+    client.defineCommand('extendLock', { numberOfKeys: 1, lua })
+    client.extendLock = () => new Promise((_resolve, reject) => { failExtend = reject })
+
+    let finish
+    const section = manager.withLock('job', { ttl: 1000, autoExtend: true }, () => new Promise((resolve) => { finish = resolve }))
+
+    await flush()
+    await clock.advance(500)
+
+    finish()
+    await section
+
+    failExtend(new Error('connection is closed'))
+    await flush()
+
+    assert.deepEqual(logs, [], 'a failure to extend a lock we let go of is not news')
+  })
+})

@@ -1366,22 +1366,23 @@ describe('redis cluster integration', { skip: !RUN_CLUSTER && 'set REDIS_CLUSTER
   // happens inside the driver and no unit fake can honestly model it. The
   // duplicate() matters as much as the node: that is what a keyspace-event
   // subscriber is built from, and it inherited the dead policy too.
-  test('the retry policy reaches the real node connections and their duplicates', { timeout: 30000 }, async () => {
+  test('pool nodes keep the driver\'s no-reconnect default; subscriber duplicates get the library policy', { timeout: 30000 }, async () => {
     const client = createClusterClient({ maxRetryAttempts: Infinity, baseRetryDelay: 10, maxRetryDelay: 100 })
     await client.connect()
 
     const [master] = client.client.nodes('master')
-    const subscriberShaped = master.duplicate()
+    // What SubscriptionManager builds a keyspace-event subscriber from.
+    const subscriberShaped = master.duplicate({ retryStrategy: client.redisConfig.retryStrategy.bind(client.redisConfig) })
 
     try {
-      assert.equal(typeof master.options.retryStrategy, 'function', 'a node connection that never retries is a shard that never comes back')
-      assert.equal(master.options.retryStrategy(1), 20, 'and it must be the backoff this library documents')
+      // Probed (4th review): a retry policy on a pool node keeps a dead master
+      // in 'reconnecting' forever — no '-node', no CONNECTION_CLOSED, no slots
+      // refresh — and every command to that shard hangs. The driver's default
+      // is what makes a failover a re-route instead of a hang.
+      assert.equal(master.options.retryStrategy, null, 'pool nodes must NOT reconnect on their own')
 
-      assert.equal(
-        typeof subscriberShaped.options.retryStrategy,
-        'function',
-        'keyspace-event subscribers are duplicates of a node connection and inherit its policy'
-      )
+      assert.equal(typeof subscriberShaped.options.retryStrategy, 'function', 'a subscriber socket does reconnect')
+      assert.equal(subscriberShaped.options.retryStrategy(1), 20, 'with the backoff this library documents')
     } finally {
       subscriberShaped.disconnect()
       await client.disconnect()

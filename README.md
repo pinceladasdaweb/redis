@@ -167,7 +167,7 @@ Failover is handled by ioredis: on `READONLY` replies the client reconnects to t
 
 Reconnection is handled entirely by the ioredis driver — there is exactly one reconnection loop. When the attempts are exhausted the client emits `end` and releases its resources; a later `connect()` starts a fresh cycle.
 
-In a cluster the same backoff governs **three** things: the Cluster client, each node connection, and the subscriber connections built from them. ioredis leaves per-node reconnection off by default (a closed node connection is never retried; the pool waits for a `MOVED` to rebuild it), which would quietly exempt exactly the sockets this library owns — a keyspace-event subscriber is a `duplicate()` of a node connection, so one blip used to take that shard's events down for good. Nodes that genuinely leave the cluster are still disconnected by the driver's own pool reset, so nothing retries against an address that is gone.
+In a cluster the backoff governs the Cluster client and the keyspace-event subscriber connections — **not** the pool's node connections, which keep the driver's default of never reconnecting on their own. That default is load-bearing: the pool notices a dead master only when its connection *ends*, which is what rejects the commands it held, refreshes the slot map and finds the promoted replica. Probed with a master shut down: with a retry policy on the nodes (as 4.3.0 shipped), the dead master's connection sat in `reconnecting` forever, no refresh ever ran, the Cluster stayed `ready`, and every command to that shard hung — a failover became a permanent hang. With the default the same command was re-routed in about a millisecond. The subscribers, which are not pool members, get the backoff as a `duplicate()` override so a socket blip no longer takes a shard's events down for good.
 
 ### Health check
 
@@ -197,7 +197,9 @@ A few options are this library's to set and are refused with `INVALID_OPTION` ra
 
 | Option | Why |
 | --- | --- |
-| `retryStrategy`, `reconnectOnError`, `clusterRetryStrategy`, `clusterNodeRetryStrategy` | Reconnection is the driver's job *through those hooks*; replacing them disables the documented retry policy. Use `maxRetryAttempts`, `baseRetryDelay` and `maxRetryDelay` |
+| `retryStrategy`, `reconnectOnError`, `clusterRetryStrategy` | Reconnection is the driver's job *through those hooks*; replacing them disables the documented retry policy. Use `maxRetryAttempts`, `baseRetryDelay` and `maxRetryDelay` |
+| `clusterNodeRetryStrategy` | Deliberately left at the driver's default of **none** (see [Reconnection](#reconnection)): a retry policy on pool nodes defeats failover detection and turns a dead master into a permanent hang |
+| `stringNumbers` | This library sums and compares the integers Redis returns (`deleteByPattern`'s count, every counter-returning wrapper); strings would concatenate |
 | `replyMapping` | This library parses replies in their RESP2-compatible shape (`CONFIG GET` as a flat array, `WITHSCORES` as alternating member/score). ioredis 6 speaks RESP3 and keeps that shape through its default mapping; the `'resp3'` mapping changes it underneath |
 | `redisOptions` | Built here from the flat option list in cluster mode (see [Cluster](#cluster)) — pass node options at the top level |
 
@@ -209,6 +211,8 @@ new RedisClient({ healthCheckTimeout: 'soon' })
 ```
 
 `Infinity` is only accepted for `maxRetryAttempts`, where it means "never give up". Everywhere else it is a delay or a timeout that ends up in a timer, and Node clamps an out-of-range delay to **1ms** — so `commandTimeout: Infinity` written for "no timeout" would fail every command after a millisecond. Omit the option to leave it unbounded.
+
+`0` is refused for `commandTimeout` and `healthCheckTimeout` for the same reason from the other side: it is not "none" but a 0ms timer that fires before any reply can arrive (ioredis's command timer has no `> 0` guard). `connectTimeout: 0` **is** disabled in the driver and stays legitimate, as does `0` for the retry delays and the health interval.
 
 ### TLS and managed providers
 
@@ -283,7 +287,7 @@ import pino from 'pino'
 const redis = new RedisClient({ host: '127.0.0.1', port: 6379, logger: pino() })
 ```
 
-Without injection you get a dependency-free leveled console logger (default level `info`, configurable via `LOG_LEVEL`). It is exported for reuse:
+Without injection you get a dependency-free leveled console logger (default level `info`, configurable via `LOG_LEVEL` — read when a line is written, so `dotenv` loaded after the import still counts). Level names are case-insensitive and `silent` turns it off. It is exported for reuse:
 
 ```javascript
 import { createLogger } from '@pinceladasdaweb/redis'
@@ -502,7 +506,7 @@ Popping follows the `spop` convention — without a count you get a single `{ me
 
 All stream commands are available (`xadd`, `xread`, `xreadgroup`, `xgroup`, `xlen`, `xinfo`, `xrange`, `xrevrange`, `xdel`, `xtrim`, `xpending`, `xclaim`). Two behaviors worth knowing:
 
-- **Blocking reads run on a dedicated connection.** `xread`/`xreadgroup` with `block` (including `block: 0`, which blocks forever) never stall other commands.
+- **Blocking reads run on a dedicated connection.** `xread`/`xreadgroup` with `block` (including `block: 0`, which blocks forever) never stall other commands. That connection drops any `commandTimeout` you configured — the driver applies it to blocking commands too, and a "forever" read that fails after five seconds is not forever; the read's own `block` is its bound. The `streams` argument is one array of keys followed by their ids (`['events', '$']`); anything else is refused with `INVALID_ARGUMENT` rather than spread into characters.
 - **`disconnect()` cancels them.** A read still waiting when you shut down rejects with `REDIS_UNAVAILABLE` and its connection is reclaimed, so a consumer loop can exit instead of hanging the process:
 
   ```javascript
@@ -588,12 +592,19 @@ Anything not wrapped is reachable through `redis.client` (the raw ioredis instan
 ## Notes on semantics
 
 - Values are sent as-is: no implicit JSON serialization anywhere (`mset` included). Use the `*Json` helpers.
-- `sort()`'s `by` and `get` patterns are sent verbatim: unlike keys, the driver never rewrites them, so include your `keyPrefix` yourself when using them.
+- `sort()`'s `by`, `get` and `store` patterns are **keys to the driver**: ioredis prefixes them with `keyPrefix` like any other key (`#` excepted). Pass them without the prefix — a previous version of this note said the opposite, and following it produced `BY app:app:weight_*`: every weight 0, an arbitrary order, no error. `get` accepts one pattern or an array of them.
 - `getJson` returns `null` for missing keys and throws `SyntaxError` on non-JSON payloads.
 - `getOrSet`/`getOrSetJson` never surface **their own** lock's errors — an exhausted budget falls back to re-read, then unprotected produce. A `LOCK_NOT_ACQUIRED` thrown by a lock the *producer* holds is the producer's error and propagates like any other (the `lockName` field is how they are told apart).
 - A command issued while `disconnect()` is running rejects with `REDIS_UNAVAILABLE`, same as a dead connection: shutdown refuses to create new connections it would have to hunt down.
 - A command issued while disconnected rejects with `REDIS_UNAVAILABLE` — it is **not** queued (the tiny race window that slips into the driver's offline queue is resent on reconnection; bound it with `commandTimeout` if needed).
 - `xpending()` answers two different questions in two different shapes: the group summary with no options, the pending entries with `start`, `end` and `count`. A partial range rejects with `INVALID_ARGUMENT` instead of silently answering the other one.
+- Wrappers are as variadic as their commands: `set(k, v, 'EX', 900)`, `expire(k, 60, 'NX')`, `exists(a, b)`, `rpop(q, 5)`, `xgroup('CREATE', …, 'ENTRIESREAD', n)` all reach the server. Earlier versions silently dropped the trailing arguments and answered `'OK'`.
+- `zrange` refuses option combinations Redis would reject (`limit` without `byScore`/`byLex`, `withScores` with `byLex`, both range modes at once) with `INVALID_ARGUMENT` naming the option, instead of the server's generic syntax error.
+- `setJson`/`setexJson`/`publishJson` refuse values JSON cannot encode (`undefined`, functions, symbols) with `INVALID_ARGUMENT`, like `getOrSetJson` always did — writing them stored `""`, a key that existed but read as a miss.
+- Lock `ttl`s (and `extend()`'s) must be positive integers in milliseconds, checked before the wire: `0` reached `PEXPIRE` as "delete the key" and `extend(0)` reported success.
+- `subscribeToKeyEvents` knows the full `notify-keyspace-events` class table (exported as `KEY_EVENT_CLASSES`). An event it does not know is verified for the `E` flag only, and a warning says so — it is never waved through as if it had been checked.
+- Every error names the **public method** you called in `operation`, whichever internal step refused it: a disconnected `getOrSetJson()` says `getOrSetJson`, not `get`; `psubscribe()` says `psubscribe`, not `subscribe`.
+- `disconnect()` during an outage finishes at once and still emits `end`. The driver cannot say goodbye to a socket that is already gone, so the library ends the cycle itself instead of waiting out a deadline for an event that cannot come — and a blocking read parked on that socket is cancelled with `REDIS_UNAVAILABLE` by the library, because nothing in the driver would ever reject it.
 - Blocking reads (`xread`/`xreadgroup` with `block`) run on a dedicated connection so they never stall the shared one, and that connection is **pooled** between reads — a consumer loop does not pay a handshake per iteration. `disconnect()` closes the pool along with everything else.
 - `disconnect()` always finishes. Every `quit()` on the way out has a 2-second deadline, after which the socket is forced closed: the driver parks `QUIT` behind whatever is already in its offline queue, and on a connection that is still retrying that reply may never come.
 
