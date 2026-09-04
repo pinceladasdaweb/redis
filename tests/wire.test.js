@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { RedisClient } from '../src/index.js'
+import { RedisClient, RedisClientError, KEY_EVENT_CLASSES } from '../src/index.js'
 import createManualClock from './helpers/manual-clock.js'
 
 const quietLogger = { error () {}, warn () {}, info () {}, debug () {} }
@@ -80,8 +80,20 @@ const createClient = (options = {}) => {
   const connection = {
     client: fake,
     isConnected: true,
-    assertReady: () => fake,
-    connect: async () => {},
+    closing: false,
+    // Faithful to ConnectionManager: the ONE gate refuses work from the moment
+    // a shutdown begins, under the operation the caller named.
+    assertReady: (operation) => {
+      if (connection.closing) {
+        throw new RedisClientError(`disconnect() is in progress. Cannot execute '${operation}'.`, operation, 'REDIS_UNAVAILABLE')
+      }
+
+      return fake
+    },
+    // The facade closes the gate before any teardown step runs; a connect()
+    // reopens it — a refusal is about the shutdown, not the client's future.
+    connect: async () => { connection.closing = false },
+    beginShutdown () { connection.closing = true },
     disconnect: async () => {}
   }
 
@@ -1165,5 +1177,302 @@ describe('wire contract', () => {
     await redis.deleteByPattern('user:*')
 
     assert.deepEqual(patterns, ['app:user:*', 'app:user:*'])
+  })
+})
+
+// Fourth full-source review (22/08/2026).
+describe('wire contract — review findings', () => {
+  // Probed against ioredis 6: on a connection that is 'reconnecting' the
+  // driver's disconnect() flushes nothing — the parked XREAD sits in a queue
+  // only a SUCCESSFUL reconnect drains — and no public API forces the
+  // rejection. The caller's await hung forever after disconnect() resolved.
+  // The cancellation is the library's own now; the fake here never rejects.
+  test('a blocking read is cancelled even when the driver never rejects it', async () => {
+    const { redis, fake, calls } = createClient()
+
+    fake.disconnect = () => { calls.push(['<disconnect>']) } // no flushWaiting: the driver stays silent
+    fake.xread = () => fake.blockForever()
+
+    const read = redis.xread({ block: 0 }, ['s', '$'])
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await redis.disconnect()
+
+    await assert.rejects(read, { code: 'REDIS_UNAVAILABLE', operation: 'xread' })
+
+    // A cancelled lease is never recycled into the pool: the next blocking
+    // read after a reconnect has to mint a fresh connection, not find the
+    // cancelled one parked and waiting.
+    let duplicates = 0
+    fake.duplicate = () => { duplicates++; return fake }
+    fake.xread = async (...args) => { calls.push(['xread', ...args]); return null }
+
+    await redis.connect()
+    await redis.xread({ block: 0 }, ['s', '$'])
+
+    assert.equal(duplicates, 1, 'the pool was empty — the cancelled connection was closed, not parked')
+  })
+
+  test('a disconnected subscribeToKeyEvents names itself and does not blame CONFIG', async () => {
+    const warnings = []
+    const redis = new RedisClient({ logger: { ...quietLogger, warn: (m) => warnings.push(m) } })
+
+    await assert.rejects(redis.subscribeToKeyEvents('expired', () => {}), {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'subscribeToKeyEvents'
+    })
+    assert.deepEqual(warnings, [], '"not connected" is the gate\'s verdict, not a restricted CONFIG')
+  })
+
+  test('a disconnected cache call names itself, not the command it was issuing', async () => {
+    const redis = new RedisClient({ logger: quietLogger })
+
+    await assert.rejects(redis.getOrSetJson('k', 60, () => ({})), { code: 'REDIS_UNAVAILABLE', operation: 'getOrSetJson' })
+    await assert.rejects(redis.getOrSet('k', 60, () => 'v'), { code: 'REDIS_UNAVAILABLE', operation: 'getOrSet' })
+    await assert.rejects(redis.setJson('k', {}), { code: 'REDIS_UNAVAILABLE', operation: 'setJson' })
+    await assert.rejects(redis.publishJson('c', {}), { code: 'REDIS_UNAVAILABLE', operation: 'publishJson' })
+  })
+
+  // The probe awaits up to its deadline; a disconnect() landing inside that
+  // window used to be followed by a brand-new subscriber nobody released.
+  test('a disconnect() during the CONFIG probe refuses the subscription instead of building it', async () => {
+    const clock = createManualClock()
+    const { redis, calls, fake } = createClient({ clock })
+
+    fake.config = () => new Promise(() => {}) // the probe hangs
+
+    // The expectation is attached before the clock moves: the rejection lands
+    // inside advance(), and must not be an unhandled one meanwhile.
+    const refused = assert.rejects(
+      redis.subscribeToKeyEvents('expired', () => {}),
+      { code: 'REDIS_UNAVAILABLE', operation: 'subscribeToKeyEvents' }
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await redis.disconnect()
+    calls.length = 0
+
+    await clock.advance(2000) // the probe times out into its fallback...
+
+    await refused
+    assert.equal(calls.some((c) => c[0] === 'subscribe'), false, '...and the gate refuses what would have leaked')
+  })
+
+  test('the JSON writers refuse a value JSON cannot encode, without touching the wire', async () => {
+    const { redis, calls } = createClient()
+
+    for (const value of [undefined, () => {}, Symbol('x')]) {
+      await assert.rejects(redis.setJson('k', value), { code: 'INVALID_ARGUMENT', operation: 'setJson' })
+      await assert.rejects(redis.setexJson('k', 60, value), { code: 'INVALID_ARGUMENT', operation: 'setexJson' })
+      await assert.rejects(redis.publishJson('c', value), { code: 'INVALID_ARGUMENT', operation: 'publishJson' })
+    }
+
+    assert.deepEqual(calls, [], 'the poison never reaches the server')
+  })
+
+  test('variadic wrappers forward their trailing options instead of dropping them', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.set('session', 'tok', 'EX', 900, 'NX')
+    await redis.expire('window', 60, 'NX')
+    await redis.exists('a', 'b', 'c')
+    await redis.rpop('queue', 5)
+    await redis.xgroup('CREATE', 'ev', 'g', '0', true, 'ENTRIESREAD', 5)
+    await redis.xgroup('SETID', 'ev', 'g', '0', 'ENTRIESREAD', 7)
+
+    assert.deepEqual(calls, [
+      ['set', 'session', 'tok', 'EX', 900, 'NX'],
+      ['expire', 'window', 60, 'NX'],
+      ['exists', 'a', 'b', 'c'],
+      ['rpop', 'queue', 5],
+      ['xgroup', 'CREATE', 'ev', 'g', '0', 'MKSTREAM', 'ENTRIESREAD', 5],
+      ['xgroup', 'SETID', 'ev', 'g', '0', 'ENTRIESREAD', 7]
+    ])
+  })
+
+  test('xread and xreadgroup refuse a malformed streams argument up front', async () => {
+    const { redis, calls } = createClient()
+
+    for (const streams of [undefined, 'events', [], ['events'], ['a', 'b', 'c']]) {
+      await assert.rejects(redis.xread({}, streams), { code: 'INVALID_ARGUMENT', operation: 'xread' })
+      await assert.rejects(redis.xreadgroup('g', 'c', {}, streams), { code: 'INVALID_ARGUMENT', operation: 'xreadgroup' })
+    }
+
+    assert.deepEqual(calls, [])
+  })
+
+  test('zrange refuses the option combinations Redis would reject, naming the option', async () => {
+    const { redis, calls } = createClient()
+
+    await assert.rejects(redis.zrange('z', 0, 9, { limit: { offset: 0, count: 5 } }), { code: 'INVALID_ARGUMENT', operation: 'zrange', message: /limit together with byScore or byLex/ })
+    await assert.rejects(redis.zrange('z', '[a', '[z', { byLex: true, withScores: true }), { code: 'INVALID_ARGUMENT', operation: 'zrange', message: /withScores for a byLex/ })
+    await assert.rejects(redis.zrange('z', 0, 9, { byScore: true, byLex: true }), { code: 'INVALID_ARGUMENT', operation: 'zrange', message: /not both/ })
+
+    assert.deepEqual(calls, [])
+  })
+
+  test('sort takes many GET patterns and a STORE destination', async () => {
+    const { redis, calls } = createClient()
+
+    await redis.sort('ids', { by: 'weight_*', get: ['name_*', '#'], store: 'sorted' })
+    await redis.sort('ids', { get: 'name_*' })
+
+    assert.deepEqual(calls, [
+      ['sort', 'ids', 'BY', 'weight_*', 'GET', 'name_*', 'GET', '#', 'STORE', 'sorted'],
+      ['sort', 'ids', 'GET', 'name_*']
+    ])
+  })
+
+  test('zadd with INCR parses the returned score like every other sorted-set method', async () => {
+    const { redis, fake } = createClient()
+
+    fake.zadd = async (...args) => (args.includes('INCR') ? (args.includes('inf-member') ? 'inf' : '5') : 2)
+
+    assert.equal(await redis.zadd('z', 'INCR', 5, 'ada'), 5)
+    assert.equal(await redis.zadd('z', 'INCR', 1, 'inf-member'), Infinity)
+    assert.equal(await redis.zadd('z', { ada: 1, bob: 2 }), 2, 'a plain ZADD still reports the count')
+  })
+
+  // The driver applies commandTimeout to blocking commands like any other, so
+  // a consumer loop with commandTimeout: 5000 saw its "block forever" read
+  // rejected after 5s. The pooled connection drops the inherited timeout; a
+  // one-shot dedicated connection keeps whatever the caller configured.
+  test('blocking-read duplicates drop commandTimeout; dedicated ones keep it', async () => {
+    const { redis, fake } = createClient()
+    const duplicateArgs = []
+
+    fake.duplicate = (...args) => { duplicateArgs.push(args); return fake }
+
+    await redis.xread({ block: 0 }, ['s', '$'])
+    await redis.withDedicatedConnection(async () => {})
+
+    assert.deepEqual(duplicateArgs, [[{ commandTimeout: undefined }], []])
+  })
+
+  test('a plain command in the quit window is refused under its own name', async () => {
+    const { redis, calls } = createClient()
+
+    let releaseTeardown
+    redis.connection.disconnect = () => new Promise((resolve) => { releaseTeardown = resolve })
+
+    const closing = redis.disconnect()
+    await new Promise((resolve) => setImmediate(resolve))
+    calls.length = 0
+
+    await assert.rejects(redis.get('k'), { code: 'REDIS_UNAVAILABLE', operation: 'get' })
+    await assert.rejects(redis.multi(), { code: 'REDIS_UNAVAILABLE', operation: 'multi' })
+    assert.deepEqual(calls, [], 'nothing is written behind QUIT to be rejected with a bare driver Error')
+
+    releaseTeardown()
+    await closing
+  })
+
+  // The class table used to name fourteen events; anything else was checked
+  // for 'E' alone and waved through — a subscription that would never speak.
+  test('the keyspace probe knows the whole class table, and flags what it cannot verify', async () => {
+    const warnings = []
+    const { redis, fake, calls } = createClient({ logger: { ...quietLogger, warn: (m) => warnings.push(m) } })
+
+    fake.config = async () => ['notify-keyspace-events', 'Ex']
+    await assert.rejects(redis.subscribeToKeyEvents('hdel', () => {}), {
+      code: 'KEYSPACE_NOTIFICATIONS_DISABLED',
+      message: /missing "h"/
+    })
+    await assert.rejects(redis.subscribeToKeyEvents('xgroup-create', () => {}), { message: /missing "t"/ })
+    await assert.rejects(redis.subscribeToKeyEvents('incrby', () => {}), { message: /missing "\$"/ })
+
+    // The canonical "AKE" excludes 'm' — and the table now knows 'keymiss'.
+    fake.config = async () => ['notify-keyspace-events', 'AKE']
+    await assert.rejects(redis.subscribeToKeyEvents('keymiss', () => {}), { message: /missing "m"/ })
+
+    // An event the table does not know is not silently passed: it is verified
+    // for 'E' and the caller is told the class could not be checked.
+    fake.config = async () => ['notify-keyspace-events', 'E']
+    await redis.subscribeToKeyEvents('json.set', () => {})
+    assert.match(warnings.at(-1), /'json\.set' has no known notify-keyspace-events class/)
+    assert.equal(warnings.length, 1, 'known events are verified silently — only the unknown one is flagged')
+    assert.deepEqual(calls.at(-1), ['subscribe', '__keyevent@0__:json.set'])
+  })
+})
+
+describe('wire contract — keyspace class table', () => {
+  // Every entry of the table is load-bearing: mutate one class letter and the
+  // probe waves the wrong event through. So each one is asserted by name — a
+  // server configured with only 'E' must be told exactly which class it lacks.
+  test('the probe demands the documented class for every known event', async () => {
+    const { redis, fake } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', 'E']
+
+    const events = Object.entries(KEY_EVENT_CLASSES)
+    assert.ok(events.length >= 60, `the table must be the full relation, not a sample (${events.length})`)
+
+    for (const [event, cls] of events) {
+      await assert.rejects(redis.subscribeToKeyEvents(event, () => {}), {
+        code: 'KEYSPACE_NOTIFICATIONS_DISABLED',
+        message: new RegExp(`for '${event.replace(/[-$]/g, '\\$&')}'.*missing "${cls.replace('$', '\\$')}"`)
+      }, `${event} needs class '${cls}'`)
+    }
+  })
+
+  test('the alias covers every class except n and m', async () => {
+    const { redis, fake, calls } = createClient()
+
+    fake.config = async () => ['notify-keyspace-events', 'AE']
+
+    for (const [event, cls] of Object.entries(KEY_EVENT_CLASSES)) {
+      if (cls === 'n' || cls === 'm') {
+        await assert.rejects(redis.subscribeToKeyEvents(event, () => {}), { code: 'KEYSPACE_NOTIFICATIONS_DISABLED' }, `'A' does not cover ${event}`)
+      } else {
+        await redis.subscribeToKeyEvents(event, () => {})
+        assert.deepEqual(calls.at(-1), ['subscribe', `__keyevent@0__:${event}`])
+      }
+    }
+  })
+})
+
+describe('wire contract — cluster-shaped dedicated connections', () => {
+  // Cluster.duplicate(startupNodes, options) takes the override in the second
+  // position, with node options under redisOptions.
+  test('a blocking-read duplicate of a Cluster drops commandTimeout under redisOptions', async () => {
+    const { redis, fake } = createClient()
+    const duplicateArgs = []
+
+    fake.nodes = () => [fake]
+    fake.duplicate = (...args) => { duplicateArgs.push(args); return fake }
+
+    await redis.xread({ block: 0 }, ['s', '$'])
+
+    assert.deepEqual(duplicateArgs, [[[], { redisOptions: { commandTimeout: undefined } }]])
+  })
+
+  test('every JSON reader and writer names itself at the gate', async () => {
+    const redis = new RedisClient({ logger: quietLogger })
+
+    await assert.rejects(redis.getJson('k'), { code: 'REDIS_UNAVAILABLE', operation: 'getJson' })
+    await assert.rejects(redis.setexJson('k', 60, {}), { code: 'REDIS_UNAVAILABLE', operation: 'setexJson' })
+  })
+
+  // The facade's connect() awaits its own shutdown promise ONLY when one is in
+  // flight. An unconditional await would yield a microtask before reaching the
+  // manager — enough for a disconnect() issued in the same tick to close the
+  // gate first, after which the connect proceeds as the last word and builds a
+  // client the caller had just asked to tear down.
+  test('a connect() then disconnect() in the same tick ends with no client', async () => {
+    const { redis } = createClient()
+
+    // What matters is the ORDER in which the manager hears the two intents:
+    // the manager's own last-word rule then does the rest. A facade that
+    // yielded before reaching the manager would deliver them reversed.
+    const heard = []
+    redis.connection.connect = async () => { heard.push('connect') }
+    redis.connection.beginShutdown = () => { heard.push('disconnect'); redis.connection.closing = true }
+
+    const connecting = redis.connect()
+    const closing = redis.disconnect()
+
+    await Promise.all([connecting, closing])
+
+    assert.deepEqual(heard, ['connect', 'disconnect'], 'the manager must hear them in the order the caller issued them')
   })
 })

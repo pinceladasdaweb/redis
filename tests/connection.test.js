@@ -20,29 +20,41 @@ const createDriverClient = ({ connectFails = false, quitFails = false } = {}) =>
     client.status = 'ready'
     client.emit('ready')
   }
-  // Probed against ioredis 6 (16/08/2026): every teardown path emits
-  // 'close' BEFORE 'end', and quit() RESOLVES before either fires. A fake
-  // that only emits the "main" event hides every bug in a 'close' handler —
-  // the exact blind spot that buried the RabbitMQ lib's worst bug.
+  // Probed against ioredis 6 (16/08 and 22/08/2026). Three facts, each one a
+  // lie this fake used to tell:
+  //
+  //   - quit() RESOLVES while the status is still 'ready'; the socket closes
+  //     afterwards. (The fake used to flip 'end' synchronously.)
+  //   - The driver assigns status SYNCHRONOUSLY and emits on nextTick, running
+  //     close→end in ONE stack. So when a 'close' listener runs, status is
+  //     already 'end' — 'close' is never observable. (The fake used to emit
+  //     'close' with status 'close', which is what let a dead deferral and a
+  //     listener-stripping bug pass their tests.)
+  //   - While 'reconnecting' the socket is already destroyed: quit() is
+  //     answered locally with 'OK' and disconnect() produces NO events at all.
+  //     'end' never comes. (The fake used to emit it anyway.)
+  const die = () => {
+    if (client.status === 'reconnecting') return
+
+    setImmediate(() => {
+      client.status = 'end'
+      client.emit('close')
+      client.emit('end')
+    })
+  }
+
   client.quit = async () => {
     client.calls.push('quit')
 
     if (quitFails) throw new Error('quit failed')
 
-    client.status = 'end'
-    setImmediate(() => {
-      client.emit('close')
-      client.emit('end')
-    })
+    die()
+
     return 'OK'
   }
   client.disconnect = () => {
     client.calls.push('disconnect')
-    client.status = 'end'
-    setImmediate(() => {
-      client.emit('close')
-      client.emit('end')
-    })
+    die()
   }
 
   return client
@@ -52,6 +64,9 @@ const createManager = (clientOptions = {}) => {
   const created = []
   const events = []
   const clock = createManualClock()
+  // A test can hook the facade emit — the way a supervisor in the application
+  // would react to 'close' — and it runs INSIDE the emit, as it does for real.
+  const hooks = { onEmit: null }
 
   const manager = new ConnectionManager({
     redisConfig: {
@@ -63,10 +78,13 @@ const createManager = (clientOptions = {}) => {
     },
     logger: quietLogger,
     clock,
-    emit: (...args) => events.push(args)
+    emit: (...args) => {
+      events.push(args)
+      hooks.onEmit?.(...args)
+    }
   })
 
-  return { manager, created, events, clock }
+  return { manager, created, events, clock, hooks }
 }
 
 describe('connection manager', () => {
@@ -128,6 +146,10 @@ describe('connection manager', () => {
     assert.equal(created.length, 1)
     assert.equal(manager.isConnected, false)
     assert.equal(manager.client, created[0], 'the driver keeps retrying on this client')
+    // The settle race armed a once('ready') that never fired; it must be
+    // detached, or it piles up and fires against a later state.
+    assert.equal(created[0].listenerCount('ready'), 1, 'only the manager\'s own ready handler remains')
+    assert.equal(created[0].listenerCount('end'), 1)
   })
 
   // A driver that rejects with the client already dead must not leave the
@@ -486,11 +508,14 @@ describe('connection manager', () => {
     assert.equal(manager.isConnected, false)
   })
 
-  // The deferral is a real suspension point, so a disconnect() can land inside
+  // Cluster-shaped: a standalone client never shows status 'close' to a
+  // listener, but a Cluster's pool-'drain' path does, and the deferral exists
+  // for it. It is a real suspension point, so a disconnect() can land inside
   // it — a supervisor reconnecting from 'close' while the application is
-  // shutting down. Coming back to find the client mid-quit would be the same
-  // "connected with nothing behind it" lie the deferral exists to avoid.
-  test('a disconnect() that lands during the close deferral is waited out', async () => {
+  // shutting down. The caller's LAST word was disconnect, so the reconnect
+  // must wait the teardown out and then stand down, not build a client the
+  // caller no longer wants.
+  test('a disconnect() that lands during the close deferral wins', async () => {
     const { manager, created, clock } = createManager()
 
     await manager.connect()
@@ -517,8 +542,171 @@ describe('connection manager', () => {
     await teardown
     await reconnect
 
-    assert.equal(created.length, 2, 'a fresh cycle starts once the teardown finished')
+    assert.equal(created.length, 1, 'the later disconnect() is the last word: no fresh cycle')
+    assert.equal(manager.client, null)
+    assert.equal(manager.isConnected, false)
+  })
+
+  // Review finding: a disconnect() that JOINED an in-flight teardown never ran
+  // #teardown, so it never abandoned a connect() queued behind that teardown.
+  // The connect resumed once the join resolved and built a live client — the
+  // caller's last word was "disconnect", yet isConnected came back true.
+  test('a connect() queued behind a teardown is abandoned by a later disconnect()', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+    created[0].quit = () => {
+      created[0].calls.push('quit')
+
+      return new Promise(() => {})
+    }
+
+    const first = manager.disconnect()
+    const queued = manager.connect()
+    const second = manager.disconnect()
+
+    await clock.advance(2000)
+    await Promise.all([first, second, queued])
+
+    assert.equal(created[0].calls.filter((c) => c === 'quit').length, 1, 'the second disconnect() joined the teardown, not doubled it')
+    assert.equal(created.length, 1, 'the queued connect() must not build a client nobody wants')
+    assert.equal(manager.client, null)
+    assert.equal(manager.isConnected, false)
+  })
+
+  // ...whereas with connect() as the last word, the queued attempt proceeds:
+  // the two tests together pin "last word wins".
+  test('a connect() queued behind a teardown proceeds when nothing countermands it', async () => {
+    const { manager, created, clock } = createManager()
+
+    await manager.connect()
+    created[0].quit = () => {
+      created[0].calls.push('quit')
+
+      return new Promise(() => {})
+    }
+
+    const teardown = manager.disconnect()
+    const queued = manager.connect()
+
+    await clock.advance(2000)
+    await Promise.all([teardown, queued])
+
+    assert.equal(created.length, 2)
+    assert.equal(manager.client, created[1])
     assert.equal(manager.isConnected, true)
+  })
+
+  // Review finding, probed against ioredis 6: while the client is
+  // 'reconnecting' the socket is already destroyed. quit() is answered
+  // locally — disconnect() + 'OK' — and that disconnect() can produce no
+  // 'close', so 'end' NEVER arrives. Every shutdown during an outage sat out
+  // the whole 2s escape, logged "disconnected successfully", and released in
+  // silence: the facade 'end' event was never emitted for that cycle.
+  test('a teardown while reconnecting ends the cycle at once, with a facade end', async () => {
+    const { manager, created, events, clock } = createManager()
+
+    await manager.connect()
+    const client = created[0]
+
+    // The outage: driver gave up on the socket and is between retries.
+    client.status = 'reconnecting'
+    client.emit('close')
+    client.emit('reconnecting', 2000)
+    client.flushQueue = (err) => { client.calls.push(['flushQueue', err.code, err.operation]) }
+
+    await manager.disconnect()
+
+    assert.equal(client.calls.includes('quit'), false, 'there is nothing to say goodbye to')
+    assert.ok(client.calls.includes('disconnect'), 'the driver retry must be cancelled')
+    assert.deepEqual(client.calls.at(-1), ['flushQueue', 'REDIS_UNAVAILABLE', 'disconnect'], 'parked commands are rejected, best effort, under the shutdown\'s name')
+    assert.deepEqual(clock.delays(), [], 'no escape timer: the outcome is known immediately')
+    assert.equal(events.at(-1)[0], 'end', 'the cycle ended, and the facade must hear it')
+    assert.equal(manager.client, null)
+    assert.equal(client.listenerCount('end'), 0)
+  })
+
+  // Review finding, probed against ioredis 6: Cluster.connect() removes its
+  // own close listener at 'refresh' and, when the first ready-check reports
+  // cluster_state:fail, calls disconnect(true) without ever resolving or
+  // rejecting. The cluster becomes 'ready' on its own moments later while
+  // `await client.connect()` hangs forever — pinning the connect slot for the
+  // life of the process. The cycle must settle on the client's own 'ready'.
+  test('connect() settles on the client becoming ready even if the driver promise never does', async () => {
+    const { manager, created } = createManager()
+    const client = createDriverClient()
+
+    client.connect = () => {
+      client.calls.push('connect')
+
+      // The orphaned promise; the client reaches 'ready' through its internal
+      // reconnect, which this models one turn later.
+      setImmediate(() => {
+        client.status = 'ready'
+        client.emit('ready')
+      })
+
+      return new Promise(() => {})
+    }
+    manager.redisConfig = { createRedisClient: () => { created.push(client); return client } }
+
+    await manager.connect()
+
+    assert.equal(manager.isConnected, true)
+    assert.equal(manager.client, client)
+
+    // ...and the slot is free again: a later connect() is a cheap no-op, not
+    // a join on a promise that never resolves.
+    await manager.connect()
+    assert.equal(created.length, 1)
+  })
+
+  test('connect() gives up when the client ends before it was ready, whatever the driver promise does', async () => {
+    const { manager, created, events } = createManager()
+    const client = createDriverClient()
+
+    client.connect = () => {
+      client.calls.push('connect')
+      setImmediate(() => {
+        client.status = 'end'
+        client.emit('close')
+        client.emit('end')
+      })
+
+      return new Promise(() => {})
+    }
+    manager.redisConfig = { createRedisClient: () => { created.push(client); return client } }
+
+    await manager.connect()
+
+    assert.equal(manager.client, null, 'a client that ended before ready is released')
+    assert.equal(manager.isConnected, false)
+    assert.equal(events.filter(([name]) => name === 'end').length, 1, 'exactly one facade end')
+  })
+
+  // Review finding: the facade's #closing gate and the manager's readiness
+  // gate were two gates with two labels. The manager is the ONE gate now, and
+  // it refuses work from the moment a shutdown begins — before quit() has
+  // touched the driver — under the operation the caller named.
+  test('assertReady refuses work from beginShutdown() on, under the caller\'s operation', async () => {
+    const { manager, created } = createManager()
+
+    await manager.connect()
+    manager.beginShutdown()
+
+    assert.equal(created[0].status, 'ready', 'the driver has not been told yet')
+    assert.equal(manager.closing, true)
+    assert.throws(() => manager.assertReady('xread'), {
+      code: 'REDIS_UNAVAILABLE',
+      operation: 'xread',
+      message: /disconnect\(\) is in progress/
+    })
+
+    await manager.disconnect()
+    await manager.connect()
+
+    assert.equal(manager.closing, false, 'connect() reopens the gate')
+    assert.doesNotThrow(() => manager.assertReady('xread'))
   })
 
   test('disconnect() is joined, never doubled, while a teardown is in flight', async () => {
@@ -541,27 +729,32 @@ describe('connection manager', () => {
     assert.equal(created[0].calls.filter((c) => c === 'quit').length, 1, 'one teardown, however many callers')
   })
 
-  // Probed against ioredis 6: on a give-up the driver emits close→end in the
-  // SAME synchronous stack, and on a flap close→reconnecting likewise. A
-  // supervisor reconnecting from its 'close' handler therefore acts at the
-  // one instant the two are indistinguishable. The manager defers that
-  // decision one turn, by which point the status says which one it was.
-  test('a connect() issued from the close handler of a give-up starts fresh', async () => {
-    const { manager, created, events } = createManager()
+  // Probed against ioredis 6 (22/08/2026): setStatus assigns the status
+  // SYNCHRONOUSLY and emits on nextTick, and a give-up runs close→end in ONE
+  // stack. So a supervisor reconnecting from the facade's 'close' event runs
+  // with status ALREADY 'end' — and the driver's 'end' emit still queued
+  // behind the 'close' being handled. This test used to call the supervisor
+  // before the emit, with status 'close': an ordering the driver never
+  // produces, and the reason a listener-stripping bug passed its own test.
+  // With the real ordering the manager stripped its 'end' handler on the
+  // corpse and the facade never emitted 'end' for that cycle.
+  test('a connect() issued from the close handler of a give-up starts fresh and still ends the old cycle', async () => {
+    const { manager, created, events, hooks } = createManager()
 
     await manager.connect()
     const dying = created[0]
 
-    // The supervisor: reconnect the moment the connection reports closed.
+    // The supervisor: reconnect the moment the facade reports 'close'. It
+    // runs INSIDE the emit, exactly where an application handler would.
     let reconnect = null
-    const supervisor = () => { reconnect = manager.connect() }
+    hooks.onEmit = (name) => {
+      if (name === 'close') reconnect = manager.connect()
+    }
 
-    // The give-up cascade, exactly as the driver produces it: status flips
-    // and events fire in one synchronous stack.
-    dying.status = 'close'
-    supervisor()
-    dying.emit('close')
+    // The give-up cascade as the driver produces it: status is 'end' before
+    // either listener runs; the two emits follow in order.
     dying.status = 'end'
+    dying.emit('close')
     dying.emit('end')
 
     await reconnect
@@ -569,22 +762,30 @@ describe('connection manager', () => {
     assert.equal(created.length, 2, 'the supervisor must get a fresh cycle, not the corpse')
     assert.equal(manager.client, created[1])
     assert.equal(manager.isConnected, true)
-    assert.deepEqual(events.map(([name]) => name), ['ready', 'close', 'end', 'ready'])
+    assert.deepEqual(
+      events.map(([name]) => name),
+      ['ready', 'close', 'end', 'ready'],
+      'the dead cycle must still be reported as ended — exactly once'
+    )
+    assert.equal(dying.listenerCount('end'), 0, 'and the corpse carries nothing')
   })
 
   test('a connect() during a mere flap keeps the flapping client', async () => {
-    const { manager, created } = createManager()
+    const { manager, created, hooks } = createManager()
 
     await manager.connect()
     const flapping = created[0]
 
-    // The flap cascade: close→reconnecting in one stack, the driver keeps
-    // retrying on the SAME client — building a second one would duplicate it.
+    // The flap cascade: close→reconnecting in one stack, so the supervisor
+    // sees 'reconnecting'. The driver keeps retrying on the SAME client —
+    // building a second one would duplicate it.
     let reconnect = null
-    flapping.status = 'close'
-    reconnect = manager.connect()
-    flapping.emit('close')
+    hooks.onEmit = (name) => {
+      if (name === 'close') reconnect = manager.connect()
+    }
+
     flapping.status = 'reconnecting'
+    flapping.emit('close')
     flapping.emit('reconnecting', 50)
 
     await reconnect
@@ -798,19 +999,143 @@ describe('facade wiring', () => {
     assert.equal(redis.health.timeout, 222)
   })
 
-  test('zero is honored for every numeric option', () => {
+  test('zero is honored where it means something', () => {
     const { redis } = createFacade({
       maxRetryAttempts: 0,
       baseRetryDelay: 0,
       maxRetryDelay: 0,
-      healthCheckInterval: 0,
-      healthCheckTimeout: 0
+      healthCheckInterval: 0
     })
 
     assert.equal(redis.redisConfig.maxRetryAttempts, 0)
     assert.equal(redis.redisConfig.baseRetryDelay, 0)
     assert.equal(redis.redisConfig.maxRetryDelay, 0)
     assert.equal(redis.health.interval, 0)
-    assert.equal(redis.health.timeout, 0)
+  })
+
+  // Review finding: 0 used to be accepted for the two TIMEOUTS as well, where
+  // it is not "none" but a 0ms timer that beats every reply — ioredis's
+  // Command.setTimeout has no `ms > 0` guard, and neither did the health
+  // probe. `commandTimeout: 0` (a common idiom for "no timeout") failed every
+  // command; `healthCheckTimeout: 0` made checkHealth() permanently false.
+  test('zero is refused for the timeouts, where it means "instantly"', () => {
+    for (const name of ['commandTimeout', 'healthCheckTimeout']) {
+      assert.throws(() => createFacade({ [name]: 0 }), {
+        code: 'INVALID_OPTION',
+        operation: 'constructor',
+        message: /0 is not "no timeout"/
+      }, `${name}: 0 must not arm a 0ms timer`)
+    }
+
+    // connectTimeout: 0 IS disabled in the driver (a truthiness check), so it
+    // stays legitimate.
+    assert.doesNotThrow(() => createFacade({ connectTimeout: 0 }))
+  })
+})
+
+// Fourth full-source review (22/08/2026): the facade's own shutdown promise.
+describe('facade shutdown ordering', () => {
+  // Faithful to the driver: every cycle is a NEW client object. A fake that
+  // handed the same object back let a previous cycle's queued 'end' land on
+  // the next cycle's fresh connection.
+  const createFacade = (options = {}) => {
+    const redis = new RedisClient({ logger: quietLogger, ...options })
+    const drivers = []
+
+    redis.connection.redisConfig = {
+      createRedisClient: () => {
+        const driver = createDriverClient()
+        driver.ping = async () => 'PONG'
+        drivers.push(driver)
+        return driver
+      }
+    }
+
+    return { redis, drivers }
+  }
+
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+
+  // The facade has steps to run BEFORE the driver is told (subscribers,
+  // dedicated connections). A connect() landing during those found a manager
+  // that knew nothing of the teardown and "reused" the client about to be
+  // quit — connected, with nothing behind it a moment later.
+  test('a connect() during disconnect() waits for the whole shutdown, then starts fresh', async () => {
+    const clock = createManualClock()
+    const { redis, drivers } = createFacade({ clock })
+
+    await redis.connect()
+    const dying = drivers[0]
+    dying.quit = () => { dying.calls.push('quit'); return new Promise(() => {}) } // pin the teardown
+
+    const closing = redis.disconnect()
+    const reconnect = redis.connect()
+
+    let reconnected = false
+    reconnect.then(() => { reconnected = true })
+
+    // Let the shutdown reach the driver (and arm its deadline) before the
+    // clock moves — a timer registered after the clock advanced would be due
+    // in a future no advance() here ever reaches.
+    await flush()
+
+    await clock.advance(1999)
+    assert.equal(reconnected, false, 'connect() must wait out the shutdown it collided with')
+    assert.equal(drivers.length, 1, 'and must not build a client while the old one is being quit')
+
+    await clock.advance(1)
+    await closing
+    await reconnect
+
+    assert.equal(drivers.length, 2, 'a fresh cycle starts once the shutdown finished')
+    assert.equal(redis.client, drivers[1], 'and the caller gets the LIVE client')
+    assert.equal(redis.isConnected, true)
+  })
+
+  test('concurrent disconnect() calls share one shutdown', async () => {
+    const { redis, drivers } = createFacade()
+
+    await redis.connect()
+
+    await Promise.all([redis.disconnect(), redis.disconnect(), redis.disconnect()])
+
+    assert.equal(drivers[0].calls.filter((c) => c === 'quit').length, 1, 'one teardown, however many callers')
+    assert.equal(redis.client, null)
+  })
+})
+
+describe('connection manager — listener hygiene', () => {
+  // #settled arms a once('ready') and a once('end') to resolve connect() on
+  // the client's own lifecycle; whichever does not fire is detached. Left in
+  // place they would pile up on the driver and fire against the next cycle's
+  // state. Exactly one listener per event survives: the manager's own.
+  test('connect() leaves exactly the manager\'s own listeners on the client', async () => {
+    const { manager, created } = createManager()
+
+    await manager.connect()
+
+    assert.equal(created[0].listenerCount('ready'), 1)
+    assert.equal(created[0].listenerCount('end'), 1)
+    assert.equal(created[0].listenerCount('close'), 1)
+  })
+})
+
+describe('connection manager — teardown without a flushQueue', () => {
+  // flushQueue is a driver INTERNAL (TypeScript-private); the teardown uses it
+  // best-effort and must not depend on it being there.
+  test('a reconnecting client with no flushQueue is still released cleanly', async () => {
+    const { manager, created, events } = createManager()
+
+    await manager.connect()
+    const client = created[0]
+    client.status = 'reconnecting'
+    client.emit('close')
+    client.emit('reconnecting', 2000)
+    assert.equal(typeof client.flushQueue, 'undefined', 'the fake models a driver without it')
+
+    await manager.disconnect()
+
+    assert.equal(manager.client, null)
+    assert.equal(events.at(-1)[0], 'end')
   })
 })

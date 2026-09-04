@@ -23,7 +23,7 @@ const createClient = ({ store = new Map(), lockBehavior = 'grant' } = {}) => {
   }
 
   const redis = new RedisClient({ logger: quietLogger })
-  const connection = { client: fake, isConnected: true, assertReady: () => fake }
+  const connection = { client: fake, isConnected: true, assertReady: () => fake, beginShutdown () {} }
 
   redis.connection = connection
   redis.subscriptions.connection = connection
@@ -291,7 +291,10 @@ describe('facade delegation', () => {
     assert.equal(await redis.checkHealth(), true)
     await redis.disconnect()
 
-    assert.deepEqual(seen, ['connect', 'health', 'close-subscriptions', 'disconnect'])
+    // Subscriptions are closed twice on purpose: once up front, and once more
+    // in the finally for a subscription that was mid-flight when the gate
+    // closed and finished creating its connection after the first sweep.
+    assert.deepEqual(seen, ['connect', 'health', 'close-subscriptions', 'disconnect', 'close-subscriptions'])
   })
 
   test('deleteByPattern demands an explicit pattern', async () => {
@@ -333,5 +336,61 @@ describe('facade delegation', () => {
 
     assert.match(messages[0], /operation 'set' failed: gate closed/)
     assert.match(messages[1], /Unexpected error in Redis 'get' operation: boom/)
+  })
+})
+
+// Fourth full-source review (22/08/2026).
+describe('cache-aside — review findings', () => {
+  // The mutation ledger accepted `err?.code` in the lock fallback as
+  // equivalent, with the proof "only Errors are thrown on that path". The
+  // path includes the caller's producer, which can throw anything.
+  test('a producer that throws a non-Error under lock surfaces that very value', async () => {
+    const { redis } = createClient()
+
+    await assert.rejects(
+      redis.getOrSet('k', 60, () => { throw undefined }, { lock: true }), // eslint-disable-line no-throw-literal
+      (err) => err === undefined
+    )
+    await assert.rejects(
+      redis.getOrSetJson('k', 60, () => { throw null }, { lock: true }), // eslint-disable-line no-throw-literal
+      (err) => err === null
+    )
+  })
+})
+
+describe('facade delegation — shutdown is shared', () => {
+  // The facade holds ONE shutdown promise: a second disconnect() while the
+  // first is in flight joins it rather than running the sequence again.
+  test('concurrent disconnect() calls run the shutdown sequence once', async () => {
+    const { redis } = createClient()
+    const seen = []
+
+    redis.connection.disconnect = async () => { seen.push('disconnect') }
+    redis.subscriptions.close = async () => { seen.push('close-subscriptions') }
+
+    await Promise.all([redis.disconnect(), redis.disconnect(), redis.disconnect()])
+
+    assert.deepEqual(seen, ['close-subscriptions', 'disconnect', 'close-subscriptions'], 'one sequence, however many callers')
+  })
+})
+
+describe('facade delegation — shutdown can run again', () => {
+  // The shared shutdown promise is cleared when it settles: a disconnect()
+  // after a reconnect must run the sequence again, not hand back the old
+  // resolved promise and leave everything open.
+  test('a later disconnect() runs the shutdown sequence again', async () => {
+    const { redis } = createClient()
+    const seen = []
+
+    redis.connection.disconnect = async () => { seen.push('disconnect') }
+    redis.subscriptions.close = async () => { seen.push('close-subscriptions') }
+
+    await redis.disconnect()
+    await redis.disconnect()
+
+    assert.deepEqual(seen, [
+      'close-subscriptions', 'disconnect', 'close-subscriptions',
+      'close-subscriptions', 'disconnect', 'close-subscriptions'
+    ], 'two sequential shutdowns, two full sequences')
   })
 })

@@ -10,7 +10,20 @@ export interface Logger {
   debug?: (message: string, ...args: unknown[]) => void
 }
 
-export declare function createLogger (level?: string): Logger
+/**
+ * Level names are case-insensitive; `silent` turns the fallback logger off.
+ * Without an argument the level is read from `LOG_LEVEL` when a line is
+ * written (not at import), so `dotenv` loaded after this module still counts.
+ */
+export declare function createLogger (level?: 'silent' | 'error' | 'warn' | 'info' | 'debug' | string | (() => string | undefined)): Logger
+
+/**
+ * Which `notify-keyspace-events` class each key event belongs to — the full
+ * relation from redis.conf. `subscribeToKeyEvents` verifies an event's class
+ * against the server; an event absent here can only be verified for the 'E'
+ * flag, and a warning says so.
+ */
+export declare const KEY_EVENT_CLASSES: Readonly<Record<string, string>>
 
 /**
  * Everything ioredis accepts — host/port/password, tls, connectTimeout,
@@ -76,12 +89,18 @@ export interface SortedSetRangeOptions {
   limit?: { offset: number, count: number }
 }
 
+/**
+ * `by`, `get` and `store` are KEYS to the driver: ioredis prefixes them with
+ * `keyPrefix` like any other key (`#` excepted). Pass them without the prefix.
+ */
 export interface SortOptions {
   by?: string
   limit?: { offset: number, count: number }
-  get?: string
+  /** One pattern or several — SORT accepts any number of GET clauses. */
+  get?: string | string[]
   direction?: 'ASC' | 'DESC'
   alpha?: boolean
+  store?: string
 }
 
 export interface StreamReadOptions {
@@ -226,17 +245,24 @@ export declare class RedisClient extends EventEmitter {
   executeBlockingCommand (command: string, args: unknown[]): Promise<unknown>
 
   get (key: string): Promise<string | null>
-  set (key: string, value: string | number | Buffer): Promise<'OK'>
+  /**
+   * Variadic like the command: `set(k, v, 'EX', 900)`, `set(k, v, 'NX')`,
+   * `KEEPTTL`, `GET`… travel to the server. `NX`/`XX` resolve `null` when the
+   * condition fails.
+   */
+  set (key: string, value: string | number | Buffer, ...options: Array<string | number>): Promise<'OK' | null>
   setex (key: string, seconds: number, value: string | number | Buffer): Promise<'OK'>
   del (...keys: string[]): Promise<number>
   incr (key: string): Promise<number>
   decr (key: string): Promise<number>
-  exists (key: string): Promise<number>
+  /** Variadic: the count of the given keys that exist. */
+  exists (...keys: string[]): Promise<number>
   type (key: string): Promise<string>
   rename (key: string, newkey: string): Promise<'OK'>
   renamenx (key: string, newkey: string): Promise<number>
   persist (key: string): Promise<number>
-  expire (key: string, seconds: number): Promise<number>
+  /** Variadic: `NX` | `XX` | `GT` | `LT` (Redis 7) travel to the server. */
+  expire (key: string, seconds: number, ...options: string[]): Promise<number>
   ttl (key: string): Promise<number>
 
   setJson (key: string, value: unknown): Promise<'OK'>
@@ -263,7 +289,9 @@ export declare class RedisClient extends EventEmitter {
   hdel (key: string, ...fields: string[]): Promise<number>
 
   lpush (key: string, ...values: Array<string | number>): Promise<number>
+  /** Without a count a single element (or null); with one, an array of up to `count`. */
   rpop (key: string): Promise<string | null>
+  rpop (key: string, count: number): Promise<string[] | null>
   lrange (key: string, start: number, stop: number): Promise<string[]>
   llen (key: string): Promise<number>
   lrem (key: string, count: number, value: string): Promise<number>
@@ -281,7 +309,8 @@ export declare class RedisClient extends EventEmitter {
 
   /** Adds members as { member: score }, or passes ioredis arguments through (score first, plus flags). */
   zadd (key: string, members: Record<string, number | string>): Promise<number>
-  zadd (key: string, ...args: Array<string | number>): Promise<number | string>
+  /** Raw form, flags included. With `INCR` the reply is the new score, parsed to a number like every other score. */
+  zadd (key: string, ...args: Array<string | number>): Promise<number>
   /** The member's score as a number, or null when it is not in the set. */
   zscore (key: string, member: string): Promise<number | null>
   /** The new score after the increment. */

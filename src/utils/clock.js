@@ -14,13 +14,14 @@ const createClock = () => ({
   setInterval: (callback, ms) => setInterval(callback, ms),
   clearInterval: (handle) => clearInterval(handle),
 
-  // A delay between retries is not a reason to keep a process alive: whatever
-  // is retrying holds a live connection, which keeps the loop running anyway.
-  sleep: (ms) => new Promise((resolve) => {
-    const handle = setTimeout(resolve, ms)
-
-    handle.unref?.()
-  })
+  // Ref'd on purpose. This used to unref on the premise that "whatever is
+  // retrying holds a live connection, which keeps the loop running anyway" —
+  // but the connection can END during the backoff (server gone, retries
+  // exhausted, a concurrent disconnect()), and then nothing held the loop:
+  // Node exited 0 mid-await, the caller's rejection, finally blocks and log
+  // flushes never ran, and a job runner reported success. Someone awaiting a
+  // retry delay IS pending work.
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 })
 
 export { createClock }

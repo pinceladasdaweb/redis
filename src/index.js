@@ -1,34 +1,114 @@
 import { EventEmitter } from 'node:events'
 import { createClock } from './utils/clock.js'
 import LockManager from './resilience/lock.js'
+import withDeadline from './utils/deadline.js'
 import RedisConfig from './connection/config.js'
 import RedisClientError from './utils/errors.js'
 import HealthChecker from './connection/health.js'
 import ScriptRegistry from './scripting/scripts.js'
-import withDeadline from './utils/deadline.js'
 import SubscriptionManager from './messaging/pubsub.js'
 import ConnectionManager from './connection/manager.js'
 import Logger, { createLogger } from './utils/logger.js'
+import { isCluster, masters, nodeKey } from './utils/cluster.js'
 import { parseScore, parseScoredMembers } from './utils/scores.js'
-import scanKeyspace, { deletePattern } from './keyspace/scanner.js'
+import scanKeyspace, { deletePattern, omitPrefixWith } from './keyspace/scanner.js'
 
-// Which notify-keyspace-events class each event needs, for the ones worth
-// naming. Anything else is only checked for the 'E' (key-event) flag.
+// Which notify-keyspace-events class each event needs — the full relation
+// from redis.conf, not a sample of it. The probe's whole purpose is turning a
+// silent subscription into an error, and it can only do that for an event
+// whose class it knows; for years it knew fourteen and quietly checked only
+// the 'E' flag for everything else, so `subscribeToKeyEvents('hdel')` against
+// a server configured "Ex" installed a channel that would never speak. An
+// event absent from this table is now reported as unverifiable rather than
+// waved through.
 const KEY_EVENT_CLASSES = {
-  expired: 'x',
-  evicted: 'e',
-  set: '$',
+  // g — generic commands
   del: 'g',
   rename_from: 'g',
   rename_to: 'g',
+  move_from: 'g',
+  move_to: 'g',
+  copy_to: 'g',
+  restore: 'g',
   expire: 'g',
+  persist: 'g',
+  sortstore: 'g',
+  // $ — strings
+  set: '$',
+  setrange: '$',
+  incrby: '$',
+  incrbyfloat: '$',
+  append: '$',
+  // l — lists
   lpush: 'l',
   rpush: 'l',
+  lpop: 'l',
+  rpop: 'l',
+  linsert: 'l',
+  lset: 'l',
+  lrem: 'l',
+  ltrim: 'l',
+  // s — sets
   sadd: 's',
+  srem: 's',
+  spop: 's',
+  sinterstore: 's',
+  sunionstore: 's',
+  sdiffstore: 's',
+  // h — hashes
   hset: 'h',
+  hincrby: 'h',
+  hincrbyfloat: 'h',
+  hdel: 'h',
+  hexpire: 'h',
+  hexpired: 'h',
+  hpersist: 'h',
+  // z — sorted sets
   zadd: 'z',
+  zincr: 'z',
+  zrem: 'z',
+  zrembyscore: 'z',
+  zrembyrank: 'z',
+  zrembylex: 'z',
+  zdiffstore: 'z',
+  zinterstore: 'z',
+  zunionstore: 'z',
+  zpopmin: 'z',
+  zpopmax: 'z',
+  // t — streams
   xadd: 't',
-  new: 'n'
+  xdel: 't',
+  'xgroup-create': 't',
+  'xgroup-createconsumer': 't',
+  'xgroup-delconsumer': 't',
+  'xgroup-destroy': 't',
+  'xgroup-setid': 't',
+  xsetid: 't',
+  xtrim: 't',
+  // x, e, n, m — one event each
+  expired: 'x',
+  evicted: 'e',
+  new: 'n',
+  keymiss: 'm'
+}
+
+// The JSON helpers share one encoder so they agree on what cannot be stored.
+// JSON.stringify returns undefined for undefined/functions/symbols; ioredis
+// serializes that argument as '' — a key that exists, reads as a miss through
+// getJson, and makes every getOrSetJson on it throw a raw SyntaxError until it
+// expires. getOrSetJson refused that at its producer; setJson wrote it.
+const encodeJson = (value, operation) => {
+  const encoded = JSON.stringify(value)
+
+  if (typeof encoded !== 'string') {
+    throw new RedisClientError(
+      `${operation} requires a JSON-serializable value (got undefined, a function or a symbol).`,
+      operation,
+      'INVALID_ARGUMENT'
+    )
+  }
+
+  return encoded
 }
 
 // How many idle connections the blocking-read pool keeps around. A consumer
@@ -49,12 +129,12 @@ class RedisClient extends EventEmitter {
   #dedicated = new Set()
   // Connections a blocking read finished with, ready for the next one.
   #idleBlocking = []
-  // Raised for the whole of disconnect(). The sequence below is async (each
-  // quit carries a deadline), and without this flag work arriving DURING the
-  // teardown would still pass assertReady — quit() does not flip the driver's
-  // status synchronously — and create connections AFTER their reapers ran:
-  // sockets nobody cancels, parked blocking reads that keep the process alive.
-  #closing = false
+  // The disconnect() in flight, if any. connect() waits for it: the facade has
+  // steps to run before the driver is told (subscribers, dedicated
+  // connections), and a connect() landing during those found a manager that
+  // knew nothing of the teardown and "reused" the client about to be quit —
+  // resolving connected, with nothing behind it a moment later.
+  #shutdown = null
 
   constructor (options = {}) {
     super()
@@ -101,7 +181,15 @@ class RedisClient extends EventEmitter {
       connection: this.connection,
       logger: this.logger,
       clock: this.clock,
-      emit: (event, ...args) => this.emit(event, ...args)
+      emit: (event, ...args) => this.emit(event, ...args),
+      // The library's own backoff, for the per-node keyspace subscribers only.
+      // Cluster node connections carry the driver's `retryStrategy: null` and
+      // a duplicate() inherits it; without this a subscriber died on the first
+      // socket blip. It must reach the SUBSCRIBER sockets and nothing else —
+      // giving the pool's nodes a retry policy (via clusterNodeRetryStrategy)
+      // defeats the driver's failover detection, which relies on a dead node
+      // ENDING to notice it is gone.
+      retryStrategy: this.redisConfig.retryStrategy.bind(this.redisConfig)
     })
 
     this.locks = new LockManager({
@@ -131,53 +219,72 @@ class RedisClient extends EventEmitter {
   }
 
   async connect () {
-    this.#closing = false
+    // A shutdown still running owns the client. Waiting here — rather than in
+    // the manager, which has not been told yet — is what lets "connect after
+    // disconnect" mean a fresh cycle instead of a handshake with a corpse.
+    if (this.#shutdown) {
+      await this.#shutdown
+    }
 
     return this.connection.connect()
   }
 
   async disconnect () {
-    this.#closing = true
-
-    try {
-      await this.subscriptions.close()
-      this.#releaseDedicatedConnections()
-      await this.connection.disconnect()
-    } finally {
-      // An in-flight health probe holds a deliberately ref'd timer (it is
-      // awaited); on a wedged server nothing would ever settle it, and the
-      // loop would stay open for up to healthCheckTimeout after this method
-      // resolved. Cancelling is the shutdown's job, not the probe's.
-      this.health.stop()
-      // Anything that slipped past the flag before it was raised has already
-      // been reaped above; this second sweep is the safety net for the one
-      // interleaving the flag cannot see — a lease that read #closing as
-      // false and was still awaiting assertReady when disconnect() started.
-      this.#releaseDedicatedConnections()
+    if (this.#shutdown) {
+      return this.#shutdown
     }
-  }
 
-  // Resource-creating paths check this before building anything: rejecting
-  // with the same code assertReady uses keeps "we are shutting down" and
-  // "the server is gone" indistinguishable to callers, which is exactly how
-  // a consumer loop wants to treat them.
-  #assertNotClosing (operation) {
-    if (this.#closing) {
-      throw new RedisClientError(
-        `disconnect() is in progress. Cannot execute '${operation}'.`,
-        operation,
-        'REDIS_UNAVAILABLE'
-      )
-    }
+    // The gate closes FIRST, before any of the steps below: quit() does not
+    // flip the driver's status synchronously, so without this work arriving
+    // during the teardown would still pass assertReady and create connections
+    // after their reapers ran — sockets nobody cancels, parked blocking reads
+    // that keep the process alive.
+    this.connection.beginShutdown()
+
+    const shutdown = (async () => {
+      try {
+        await this.subscriptions.close()
+        this.#releaseDedicatedConnections()
+        await this.connection.disconnect()
+      } finally {
+        // An in-flight health probe holds a deliberately ref'd timer (it is
+        // awaited); on a wedged server nothing would ever settle it, and the
+        // loop would stay open for up to healthCheckTimeout after this method
+        // resolved. Cancelling is the shutdown's job, not the probe's.
+        this.health.stop()
+        // Second sweeps, for whatever the awaits above let through: a lease
+        // or a subscription that was mid-flight when the gate closed and
+        // finished creating its connection after the first sweep ran.
+        this.#releaseDedicatedConnections()
+        await this.subscriptions.close()
+      }
+    })().finally(() => {
+      this.#shutdown = null
+    })
+
+    this.#shutdown = shutdown
+
+    return shutdown
   }
 
   // A blocking read parked on a dedicated connection would otherwise outlive
   // the client: its promise never settles and its socket keeps the process
   // alive, so a graceful shutdown never finishes. Idle pooled connections go
   // too — nothing may hold the loop open past disconnect().
+  //
+  // The cancellation is OURS, not the driver's. Probed against ioredis 6: on
+  // a connection that is 'reconnecting' (server down, socket already gone),
+  // disconnect() flushes nothing — the parked XREAD sits in a queue only a
+  // SUCCESSFUL reconnect ever drains, and no public driver API forces the
+  // rejection. The caller's await would hang forever after disconnect()
+  // resolved. So every lease carries a promise this sweep rejects directly.
   #releaseDedicatedConnections () {
     for (const held of this.#dedicated) {
-      held.cancelled = true
+      held.cancel(new RedisClientError(
+        `disconnect() closed the connection while '${held.operation}' was still waiting.`,
+        held.operation,
+        'REDIS_UNAVAILABLE'
+      ))
       held.client.disconnect()
     }
 
@@ -199,28 +306,28 @@ class RedisClient extends EventEmitter {
   }
 
   async #withDedicatedConnection (operation, fn, { reuse = false } = {}) {
-    this.#assertNotClosing(operation)
-
     const client = this.connection.assertReady(operation)
-    const held = { client: this.#lease(client, reuse), cancelled: false, reuse }
+    const held = { client: this.#lease(client, reuse), operation, cancelled: false, reuse }
+
+    // Settled only by #releaseDedicatedConnections: shutdown closed this
+    // connection under a command that was still waiting. That is a
+    // cancellation, not a failure of its own, and the caller needs a code it
+    // can branch on to leave its loop — delivered by us, because the driver
+    // cannot be relied on to reject anything once the socket is gone.
+    const cancellation = new Promise((_resolve, reject) => {
+      held.cancel = (err) => {
+        held.cancelled = true
+        reject(err)
+      }
+    })
+    // Cancellation is one of two ways to lose the race; when fn settles first
+    // this rejection has no listener left and must not become "unhandled".
+    cancellation.catch(() => {})
 
     this.#dedicated.add(held)
 
     try {
-      return await fn(held.client)
-    } catch (err) {
-      // Shutdown closed this connection under a command that was still
-      // waiting: that is a cancellation, not a failure of its own, and the
-      // caller needs a code it can branch on to leave its loop.
-      if (held.cancelled) {
-        throw new RedisClientError(
-          `disconnect() closed the connection while '${operation}' was still waiting.`,
-          operation,
-          'REDIS_UNAVAILABLE'
-        )
-      }
-
-      throw err
+      return await Promise.race([fn(held.client), cancellation])
     } finally {
       this.#dedicated.delete(held)
       this.#return(held)
@@ -240,7 +347,17 @@ class RedisClient extends EventEmitter {
       pooled?.disconnect()
     }
 
-    const fresh = client.duplicate()
+    // A blocking read documents `block: 0` as "block forever", and the driver
+    // applies commandTimeout to blocking commands like any other — so a
+    // consumer loop with commandTimeout: 5000 saw its forever-read rejected
+    // "Command timed out" after 5s on an idle stream. The read's own BLOCK is
+    // its bound; the pooled connection drops the inherited timeout. The two
+    // driver classes take the override in different positions.
+    const fresh = reuse
+      ? (isCluster(client)
+          ? client.duplicate([], { redisOptions: { commandTimeout: undefined } })
+          : client.duplicate({ commandTimeout: undefined }))
+      : client.duplicate()
 
     fresh.on('error', (err) => {
       this.logger.debug?.(`Dedicated connection error: ${err.message}`)
@@ -287,7 +404,15 @@ class RedisClient extends EventEmitter {
   }
 
   async executeCommand (command, ...args) {
-    const client = this.connection.assertReady(command)
+    return this.#command(command, command, ...args)
+  }
+
+  // Runs a driver command under the PUBLIC operation the caller invoked. The
+  // gate and the log both report `operation`, so a getOrSetJson() that has to
+  // GET and SETEX on the way says 'getOrSetJson' when either refuses — never
+  // the name of the wire command it happened to be issuing at the time.
+  async #command (operation, command, ...args) {
+    const client = this.connection.assertReady(operation)
 
     try {
       if (command === 'getAllStream') {
@@ -296,7 +421,7 @@ class RedisClient extends EventEmitter {
 
       return await client[command](...args)
     } catch (err) {
-      this.logError(err, command)
+      this.logError(err, operation)
 
       throw err
     }
@@ -310,8 +435,12 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('getAllStream', pattern)
   }
 
-  async set (key, value) {
-    return this.executeCommand('set', key, value)
+  // Variadic, like the command: SET takes NX|XX, GET, EX|PX|EXAT|PXAT|KEEPTTL
+  // after the value. A two-argument wrapper used to swallow those silently —
+  // `set('session', token, 'EX', 900)` answered 'OK' and the key never
+  // expired. Same for expire's NX|XX|GT|LT, exists' extra keys, rpop's count.
+  async set (key, value, ...options) {
+    return this.executeCommand('set', key, value, ...options)
   }
 
   async setex (key, seconds, value) {
@@ -346,8 +475,11 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('lpush', key, ...values)
   }
 
-  async rpop (key) {
-    return this.executeCommand('rpop', key)
+  // Without a count Redis pops a single element; with one it pops up to count
+  // as an array — forward it, or a caller iterating the result walks the
+  // characters of one string.
+  async rpop (key, ...count) {
+    return this.executeCommand('rpop', key, ...count)
   }
 
   async sadd (key, ...members) {
@@ -358,8 +490,8 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('smembers', key)
   }
 
-  async expire (key, seconds) {
-    return this.executeCommand('expire', key, seconds)
+  async expire (key, seconds, ...options) {
+    return this.executeCommand('expire', key, seconds, ...options)
   }
 
   async ttl (key) {
@@ -367,17 +499,17 @@ class RedisClient extends EventEmitter {
   }
 
   async setJson (key, value) {
-    return this.executeCommand('set', key, JSON.stringify(value))
+    return this.#command('setJson', 'set', key, encodeJson(value, 'setJson'))
   }
 
   async getJson (key) {
-    const value = await this.executeCommand('get', key)
+    const value = await this.#command('getJson', 'get', key)
 
     return value ? JSON.parse(value) : null
   }
 
   async setexJson (key, seconds, value) {
-    return this.executeCommand('setex', key, seconds, JSON.stringify(value))
+    return this.#command('setexJson', 'setex', key, seconds, encodeJson(value, 'setexJson'))
   }
 
   // Cache-aside: return the cached value, or produce it, store it (SETEX)
@@ -446,7 +578,16 @@ class RedisClient extends EventEmitter {
       )
     }
 
-    const cached = await this.get(key)
+    // Gated once, up front, under the caller's own name. Reaching the wire
+    // through the public get()/setex() wrappers reported their names instead
+    // — a disconnected getOrSetJson() rejected with operation 'get', and a
+    // failing SETEX with 'setex' — and with `lock`, a gate failure inside
+    // withLock said 'acquireLock'. The lock manager keeps its own operation
+    // for its own errors (LOCK_NOT_ACQUIRED is genuinely the lock's); the
+    // readiness check is this method's.
+    this.connection.assertReady(operation)
+
+    const cached = await this.#command(operation, 'get', key)
 
     if (cached !== null) {
       return decode(cached)
@@ -457,7 +598,7 @@ class RedisClient extends EventEmitter {
     const produceAndStore = async () => {
       const value = await producer()
       const encoded = encode(value)
-      await this.setex(key, ttlSeconds, encoded)
+      await this.#command(operation, 'setex', key, ttlSeconds, encoded)
 
       return decode(encoded)
     }
@@ -479,7 +620,7 @@ class RedisClient extends EventEmitter {
     try {
       return await this.locks.withLock(`cache:${key}`, lockOptions, async () => {
         // Double-check: the winner may have filled the cache while we waited.
-        const refreshed = await this.get(key)
+        const refreshed = await this.#command(operation, 'get', key)
 
         if (refreshed !== null) {
           return decode(refreshed)
@@ -504,7 +645,7 @@ class RedisClient extends EventEmitter {
       // the last resort (availability beats perfect stampede protection).
       this.logger.debug?.(`Cache lock for '${key}' not acquired within the retry budget — falling back.`)
 
-      const fallback = await this.get(key)
+      const fallback = await this.#command(operation, 'get', key)
 
       if (fallback !== null) {
         return decode(fallback)
@@ -623,7 +764,11 @@ class RedisClient extends EventEmitter {
       )
     }
 
-    return this.executeCommand('zadd', key, ...commandArgs)
+    // Parsed unconditionally: a count comes back as an integer, which
+    // parseScore leaves untouched, and with INCR the reply is the new score,
+    // which Redis speaks as a string ('5', 'inf') — every other sorted-set
+    // method parses those, and this one used to hand the raw string back.
+    return parseScore(await this.executeCommand('zadd', key, ...commandArgs))
   }
 
   async zscore (key, member) {
@@ -655,6 +800,20 @@ class RedisClient extends EventEmitter {
   }
 
   async zrange (key, start, stop, options = {}) {
+    // Redis refuses these combinations with a generic "syntax error" that
+    // names no option; the caller gets told which one here, first.
+    if (options.byScore && options.byLex) {
+      throw new RedisClientError('zrange takes byScore or byLex, not both.', 'zrange', 'INVALID_ARGUMENT')
+    }
+
+    if (options.limit && !options.byScore && !options.byLex) {
+      throw new RedisClientError('zrange only supports limit together with byScore or byLex.', 'zrange', 'INVALID_ARGUMENT')
+    }
+
+    if (options.byLex && options.withScores) {
+      throw new RedisClientError('zrange cannot return withScores for a byLex range (lexicographic ranges have no scores to report).', 'zrange', 'INVALID_ARGUMENT')
+    }
+
     const args = [key, start, stop]
 
     if (options.byScore) args.push('BYSCORE')
@@ -716,14 +875,22 @@ class RedisClient extends EventEmitter {
     return count === undefined ? entries[0] ?? null : entries
   }
 
+  // `by` and `get` patterns are KEYS to the driver: @ioredis/commands marks
+  // the BY pattern, every GET pattern except '#', and the STORE destination as
+  // key positions, and ioredis prefixes them with keyPrefix like any other.
+  // Pass them WITHOUT the prefix — the README once said the opposite, and a
+  // caller who followed it got `BY app:app:weight_*`: every weight 0, an
+  // arbitrary order, and no error. SORT accepts many GET patterns; `get` may
+  // be one string or an array of them.
   async sort (key, options = {}) {
     const args = [key]
 
     if (options.by) args.push('BY', options.by)
     if (options.limit) args.push('LIMIT', options.limit.offset, options.limit.count)
-    if (options.get) args.push('GET', options.get)
+    for (const pattern of [options.get].flat().filter((p) => p != null)) args.push('GET', pattern)
     if (options.direction) args.push(options.direction)
     if (options.alpha) args.push('ALPHA')
+    if (options.store) args.push('STORE', options.store)
 
     return this.executeCommand('sort', ...args)
   }
@@ -739,8 +906,8 @@ class RedisClient extends EventEmitter {
     return this.executeCommand('mget', ...keys)
   }
 
-  async exists (key) {
-    return this.executeCommand('exists', key)
+  async exists (...keys) {
+    return this.executeCommand('exists', ...keys)
   }
 
   async type (key) {
@@ -789,23 +956,22 @@ class RedisClient extends EventEmitter {
   }
 
   async publishJson (channel, value) {
-    return this.executeCommand('publish', channel, JSON.stringify(value))
+    return this.#command('publishJson', 'publish', channel, encodeJson(value, 'publishJson'))
   }
 
+  // The readiness gate lives in the connection manager and already knows a
+  // shutdown is in progress; each method passes its own name down so the
+  // refusal — whichever reason — is reported under it.
   async subscribe (channel, handler) {
-    this.#assertNotClosing('subscribe')
-
-    return this.subscriptions.subscribe(channel, handler)
+    return this.subscriptions.subscribe(channel, handler, 'subscribe')
   }
 
   async unsubscribe (channel) {
-    return this.subscriptions.unsubscribe(channel)
+    return this.subscriptions.unsubscribe(channel, 'unsubscribe')
   }
 
   async psubscribe (pattern, handler) {
-    this.#assertNotClosing('psubscribe')
-
-    return this.subscriptions.psubscribe(pattern, handler)
+    return this.subscriptions.psubscribe(pattern, handler, 'psubscribe')
   }
 
   async punsubscribe (pattern) {
@@ -859,17 +1025,16 @@ class RedisClient extends EventEmitter {
   // that class of provider.
   async #keyspaceFlagsByNode (operation) {
     const client = this.connection.assertReady(operation)
-    const isCluster = typeof client.nodes === 'function'
-    const targets = isCluster ? client.nodes('master') : [client]
+    const cluster = isCluster(client)
 
-    return Promise.all(targets.map(async (target) => {
+    return Promise.all(masters(client).map(async (target) => {
       const [, flags] = await withDeadline(
         target.config('GET', 'notify-keyspace-events'),
         { clock: this.clock, ms: CONFIG_PROBE_DEADLINE_MS, operation }
       )
 
       return {
-        node: isCluster ? `${target.options.host}:${target.options.port}` : null,
+        node: cluster ? nodeKey(target) : null,
         flags: flags ?? ''
       }
     }))
@@ -879,15 +1044,16 @@ class RedisClient extends EventEmitter {
   // a subscription to a silent channel looks exactly like one that works.
   // Probing turns that silence into an error that says what to enable.
   async subscribeToKeyEvents (event, handler, options = {}) {
-    this.#assertNotClosing('subscribeToKeyEvents')
-
     await this.#assertKeyspaceNotifications(event)
 
     const db = options.db ?? this.redisConfig.db
 
     // Not subscribe(): in a cluster these events are node-local, so they need
-    // one subscriber per master (see SubscriptionManager).
-    return this.subscriptions.subscribeEverywhere(`__keyevent@${db}__:${event}`, handler)
+    // one subscriber per master (see SubscriptionManager). The probe above
+    // may have waited up to its deadline; subscribeEverywhere gates again
+    // under this operation's name, so a disconnect() that started during the
+    // probe refuses the subscription instead of finding a dying client.
+    return this.subscriptions.subscribeEverywhere(`__keyevent@${db}__:${event}`, handler, 'subscribeToKeyEvents')
   }
 
   async #assertKeyspaceNotifications (event) {
@@ -896,6 +1062,13 @@ class RedisClient extends EventEmitter {
     try {
       readings = await this.#keyspaceFlagsByNode('subscribeToKeyEvents')
     } catch (err) {
+      // "Not connected" is the gate's verdict, not the provider's. Swallowing
+      // it here logged a bogus "CONFIG restricted" warning and let the call
+      // fail one step later under the wrong operation.
+      if (err instanceof RedisClientError && err.code === 'REDIS_UNAVAILABLE') {
+        throw err
+      }
+
       // Managed providers commonly block CONFIG. Refusing to subscribe would
       // be worse than subscribing without the guarantee.
       this.logger.warn(`Could not read notify-keyspace-events (${err.message}). Subscribing without verifying it.`)
@@ -903,7 +1076,13 @@ class RedisClient extends EventEmitter {
       return
     }
 
-    const required = KEY_EVENT_CLASSES[event]
+    const required = Object.hasOwn(KEY_EVENT_CLASSES, event) ? KEY_EVENT_CLASSES[event] : undefined
+
+    // An event this table does not know cannot be verified beyond the 'E'
+    // flag. Say so, rather than passing it in silence as if it had been.
+    if (required === undefined) {
+      this.logger.warn(`Key event '${event}' has no known notify-keyspace-events class: only the 'E' flag can be verified for it.`)
+    }
 
     // One misconfigured master is enough to lose that shard's events silently,
     // so the weakest node decides the verdict — not the first one asked.
@@ -966,20 +1145,30 @@ class RedisClient extends EventEmitter {
   // block: 0 is a legitimate value (block forever) — test against null,
   // never truthiness. Blocking reads run on a dedicated connection.
   async xread (options = {}, streams) {
-    const args = []
-
-    if (options.count != null) args.push('COUNT', options.count)
-    if (options.block != null) args.push('BLOCK', options.block)
-
-    args.push('STREAMS', ...streams)
-
-    return options.block != null
-      ? this.executeBlockingCommand('xread', args)
-      : this.executeCommand('xread', ...args)
+    return this.#xreadCommand('xread', [], options, streams)
   }
 
   async xreadgroup (groupName, consumerName, options = {}, streams) {
-    const args = ['GROUP', groupName, consumerName]
+    return this.#xreadCommand('xreadgroup', ['GROUP', groupName, consumerName], options, streams)
+  }
+
+  // One body for both reads: they differed only in a leading GROUP clause and
+  // NOACK, and the duplicated block-routing ternary had already cost a
+  // mutation review (the report blamed one method's line while the live
+  // mutant sat on the other's). `streams` is the keys followed by the ids,
+  // positionally; a string would be spread into its characters and reach the
+  // server as `STREAMS e v e n t s`, and a missing argument threw a raw
+  // TypeError outside the logging path.
+  async #xreadCommand (command, leading, options, streams) {
+    if (!Array.isArray(streams) || streams.length === 0 || streams.length % 2 !== 0) {
+      throw new RedisClientError(
+        `${command} takes the streams as one array of keys followed by their ids, e.g. ['events', '$'] (got ${JSON.stringify(streams)}).`,
+        command,
+        'INVALID_ARGUMENT'
+      )
+    }
+
+    const args = [...leading]
 
     if (options.count != null) args.push('COUNT', options.count)
     if (options.block != null) args.push('BLOCK', options.block)
@@ -988,8 +1177,8 @@ class RedisClient extends EventEmitter {
     args.push('STREAMS', ...streams)
 
     return options.block != null
-      ? this.executeBlockingCommand('xreadgroup', args)
-      : this.executeCommand('xreadgroup', ...args)
+      ? this.executeBlockingCommand(command, args)
+      : this.executeCommand(command, ...args)
   }
 
   // The key of XGROUP/XINFO sits *after* a subcommand. Through ioredis 5 the
@@ -1008,18 +1197,23 @@ class RedisClient extends EventEmitter {
 
     switch (subcommand) {
       case 'CREATE': {
-        const [id = '$', mkstream] = rest
+        // `mkstream` is the boolean this facade has always taken; anything
+        // after it (ENTRIESREAD n, Redis 7) travels as-is — it used to be
+        // dropped, and XINFO reported the group's lag as null forever.
+        const [id = '$', mkstream, ...extra] = rest
         args.push(id)
 
         if (mkstream) {
           args.push('MKSTREAM')
         }
 
+        args.push(...extra)
+
         break
       }
       case 'SETID': {
-        const [id = '$'] = rest
-        args.push(id)
+        const [id = '$', ...extra] = rest
+        args.push(id, ...extra)
 
         break
       }
@@ -1162,9 +1356,7 @@ class RedisClient extends EventEmitter {
   }
 
   omitPrefix (key) {
-    return this.keyPrefix && key.startsWith(this.keyPrefix)
-      ? key.slice(this.keyPrefix.length)
-      : key
+    return omitPrefixWith(this.keyPrefix)(key)
   }
 
   logError (err, operation) {
@@ -1176,5 +1368,7 @@ class RedisClient extends EventEmitter {
   }
 }
 
-export { RedisClient, RedisClientError, createLogger }
+// The class table is exported so callers (and the tests) can see exactly which
+// events the keyspace probe can verify.
+export { RedisClient, RedisClientError, createLogger, KEY_EVENT_CLASSES }
 export default RedisClient

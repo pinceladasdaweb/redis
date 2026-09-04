@@ -1,4 +1,5 @@
 import withDeadline from '../utils/deadline.js'
+import { isCluster, masters, nodeKey } from '../utils/cluster.js'
 
 // Nothing on the shutdown path may block forever — see utils/deadline.js.
 const SHUTDOWN_DEADLINE_MS = 2000
@@ -27,12 +28,25 @@ class SubscriptionManager {
   #nodeChannels = new Set()
   #nodeWatcher = null
   #nodeResync = null
+  // The listeners THIS manager put on each subscriber, so a release removes
+  // exactly those. removeAllListeners() would also strip the driver's own —
+  // a Cluster reaches 'end' only through a once('close') it registered on
+  // itself, and an 'error' with no listener bypasses the injected logger.
+  #wiring = new WeakMap()
 
-  constructor ({ connection, logger, clock, emit }) {
+  constructor ({ connection, logger, clock, emit, retryStrategy = null }) {
     this.connection = connection
     this.logger = logger
     this.clock = clock
     this.emit = emit
+    // For the per-node subscribers. A cluster node connection carries the
+    // driver's own `retryStrategy: null` (never reconnect — the pool relies on
+    // the node ENDING to notice it is gone), and a duplicate() inherits it. A
+    // subscriber built from one therefore died on the first socket blip and
+    // took that shard's events with it. The override reaches only the
+    // subscriber sockets, which are not pool members, so the pool's failover
+    // detection is untouched.
+    this.retryStrategy = retryStrategy
   }
 
   #dispatch (handler, message, channel, pattern) {
@@ -52,35 +66,51 @@ class SubscriptionManager {
   // Every subscriber connection — the shared one and the per-node ones — routes
   // its traffic through the same handler maps and facade events.
   #wireSubscriber (subscriber, onEnd) {
-    subscriber.on('error', (err) => {
-      this.logger.error(`Redis subscriber error: ${err.message || err}`)
-      this.emit('connectionError', err)
-    })
+    const listeners = {
+      error: (err) => {
+        this.logger.error(`Redis subscriber error: ${err.message || err}`)
+        this.emit('connectionError', err)
+      },
+      message: (channel, message) => {
+        this.emit('message', channel, message)
+        this.#dispatch(this.#channelHandlers.get(channel), message, channel)
+      },
+      pmessage: (pattern, channel, message) => {
+        this.emit('pmessage', pattern, channel, message)
+        this.#dispatch(this.#patternHandlers.get(pattern), message, channel, pattern)
+      },
+      end: () => {
+        onEnd()
+        // The driver is done with it: nothing else will ever fire.
+        subscriber.removeAllListeners()
+      }
+    }
 
-    subscriber.on('message', (channel, message) => {
-      this.emit('message', channel, message)
-      this.#dispatch(this.#channelHandlers.get(channel), message, channel)
-    })
+    for (const [event, listener] of Object.entries(listeners)) {
+      subscriber.on(event, listener)
+    }
 
-    subscriber.on('pmessage', (pattern, channel, message) => {
-      this.emit('pmessage', pattern, channel, message)
-      this.#dispatch(this.#patternHandlers.get(pattern), message, channel, pattern)
-    })
-
-    subscriber.on('end', () => {
-      onEnd()
-      subscriber.removeAllListeners()
+    // Detaching stops dispatch and disarms the give-up handler; the 'error'
+    // listener stays so anything the driver reports while quitting still
+    // reaches the logger instead of stderr.
+    this.#wiring.set(subscriber, () => {
+      for (const event of ['message', 'pmessage', 'end']) {
+        subscriber.removeListener(event, listeners[event])
+      }
     })
 
     return subscriber
   }
 
-  #ensureSubscriber () {
+  // `operation` is the PUBLIC method the caller invoked — the gate reports it,
+  // so psubscribe() refused for being disconnected says 'psubscribe', not the
+  // name of whichever internal step happened to ask first.
+  #ensureSubscriber (operation) {
     if (this.#subscriber) {
       return this.#subscriber
     }
 
-    const subscriber = this.connection.assertReady('subscribe').duplicate()
+    const subscriber = this.connection.assertReady(operation).duplicate()
     this.#subscriber = subscriber
 
     return this.#wireSubscriber(subscriber, () => {
@@ -101,8 +131,8 @@ class SubscriptionManager {
   // One handler per channel/pattern — a re-subscribe replaces it (last one
   // wins); the facade 'message'/'pmessage' events allow fan-out when needed.
   // On a failed subscribe the previous handler is restored.
-  async subscribe (channel, handler) {
-    const subscriber = this.#ensureSubscriber()
+  async subscribe (channel, handler, operation = 'subscribe') {
+    const subscriber = this.#ensureSubscriber(operation)
     const previous = this.#channelHandlers.get(channel)
 
     if (handler) {
@@ -124,17 +154,18 @@ class SubscriptionManager {
   // one shard's events and look exactly like a subscription that works, so
   // these channels get one subscriber per master instead.
   //
-  // The call is atomic to the caller: if any master refuses, every mutation is
-  // rolled back — the previous handler restored, the channel deregistered, the
-  // masters that DID subscribe unsubscribed — and the error rethrown. Without
-  // that, a partial failure left two of three shards delivering events to a
-  // handler the caller believes was never installed, and the third permanently
-  // silent. A failed call can simply be retried whole.
-  async subscribeEverywhere (channel, handler) {
-    const client = this.connection.assertReady('subscribe')
+  // The call is atomic to the caller: if any master refuses, every mutation
+  // THIS call made is rolled back — the previous handler restored, a channel it
+  // registered deregistered, the masters that took it for the first time
+  // unsubscribed, and the fan-out machinery it started torn down — and the
+  // error rethrown. Without that, a partial failure left two of three shards
+  // delivering events to a handler the caller believes was never installed,
+  // and the third permanently silent. A failed call can simply be retried whole.
+  async subscribeEverywhere (channel, handler, operation = 'subscribe') {
+    const client = this.connection.assertReady(operation)
 
-    if (typeof client.nodes !== 'function') {
-      return this.subscribe(channel, handler)
+    if (!isCluster(client)) {
+      return this.subscribe(channel, handler, operation)
     }
 
     const previous = this.#channelHandlers.get(channel)
@@ -147,7 +178,7 @@ class SubscriptionManager {
     this.#nodeChannels.add(channel)
     this.#watchTopology(client)
 
-    const masters = client.nodes('master')
+    const nodes = masters(client)
     // This channel always reaches the wire — a re-subscribe has to fail when a
     // shard cannot take it, which is the atomicity this method promises — and
     // it is followed by whatever else the node is missing. Without the catch-up
@@ -156,7 +187,7 @@ class SubscriptionManager {
     // every event registered before it, with the resync seeing a subscriber in
     // place and never noticing.
     const outcomes = await Promise.allSettled(
-      masters.map((node) => this.#subscribeNode(node, [
+      nodes.map((node) => this.#subscribeNode(node, [
         channel,
         ...this.#missingChannels(node).filter((other) => other !== channel)
       ]))
@@ -167,8 +198,24 @@ class SubscriptionManager {
     if (failed) {
       this.#restore(this.#channelHandlers, channel, previous, handler)
 
-      if (!wasRegistered) {
-        this.#nodeChannels.delete(channel)
+      // An ESTABLISHED channel stays established. Restoring its handler is the
+      // only undo owed; taking it off the wire as well would silence the
+      // previous handler on every shard for up to a resync tick — withdrawing
+      // a subscription that predates this call, which was never its to take.
+      if (wasRegistered) {
+        throw failed.reason
+      }
+
+      this.#nodeChannels.delete(channel)
+
+      // Nothing else is registered: the connections, watcher and resync this
+      // call started have no reason to exist. Left behind a rejected promise
+      // they were one idle socket per master until disconnect(), with the
+      // tick returning early on the empty set forever.
+      if (this.#nodeChannels.size === 0) {
+        await this.#releaseAll(this.#stopNodeFanOut())
+
+        throw failed.reason
       }
 
       // Every master holding this channel gives it back — best effort (a node
@@ -180,8 +227,8 @@ class SubscriptionManager {
       // fulfilled. With the catch-up above a node can subscribe this channel
       // and then fail on an older one — its outcome lands in `rejected` while
       // it is holding precisely what has to come back off.
-      for (const node of masters) {
-        const entry = this.#nodeSubscribers.get(this.#nodeKey(node))
+      for (const node of nodes) {
+        const entry = this.#nodeSubscribers.get(nodeKey(node))
 
         if (!entry?.channels.delete(channel)) continue
 
@@ -196,23 +243,17 @@ class SubscriptionManager {
 
   // What this node still owes, against the channels registered for fan-out.
   #missingChannels (node) {
-    const entry = this.#nodeSubscribers.get(this.#nodeKey(node))
+    const entry = this.#nodeSubscribers.get(nodeKey(node))
 
     return [...this.#nodeChannels].filter((channel) => !entry?.channels.has(channel))
   }
 
-  #nodeKey (node) {
-    const { host, port } = node.options
-
-    return `${host}:${port}`
-  }
-
   async #subscribeNode (node, channels) {
-    const key = this.#nodeKey(node)
+    const key = nodeKey(node)
     let entry = this.#nodeSubscribers.get(key)
 
     if (!entry) {
-      const subscriber = node.duplicate()
+      const subscriber = node.duplicate(this.retryStrategy ? { retryStrategy: this.retryStrategy } : undefined)
       entry = { subscriber, channels: new Set() }
       this.#nodeSubscribers.set(key, entry)
 
@@ -281,7 +322,7 @@ class SubscriptionManager {
           return // between cycles; the next tick will see the new client
         }
 
-        if (typeof current.nodes !== 'function') {
+        if (!isCluster(current)) {
           return
         }
 
@@ -293,19 +334,19 @@ class SubscriptionManager {
     }
   }
 
+  // Reached only while at least one channel is registered: the watcher and the
+  // tick that call this are torn down with the last channel (#stopNodeFanOut),
+  // so there is no empty-set early return to keep — the loops below are
+  // simply no-ops on an empty registry.
   #resyncTopology (client) {
-    if (this.#nodeChannels.size === 0) {
-      return
-    }
-
-    const masters = new Map(client.nodes('master').map((node) => [this.#nodeKey(node), node]))
+    const current = new Map(masters(client).map((node) => [nodeKey(node), node]))
 
     // Every master is reconciled against the channels it has confirmed, not
     // against whether it has a subscriber at all: new shards and replicas
     // promoted without a '+node' have none, and a node that lost a SUBSCRIBE
     // partway through has one that is incomplete. Both are losing events right
     // now, and only the second one looks healthy from the outside.
-    for (const [key, node] of masters) {
+    for (const [key, node] of current) {
       const missing = this.#missingChannels(node)
 
       if (missing.length === 0) continue
@@ -318,7 +359,7 @@ class SubscriptionManager {
     // Subscribers whose node left the master set: departed or demoted nodes
     // whose connection would otherwise retry forever, invisibly.
     for (const [key, entry] of this.#nodeSubscribers) {
-      if (masters.has(key)) continue
+      if (current.has(key)) continue
 
       this.#nodeSubscribers.delete(key)
       this.#release(entry.subscriber).catch(() => {})
@@ -326,31 +367,53 @@ class SubscriptionManager {
     }
   }
 
-  async unsubscribe (channel) {
+  async unsubscribe (channel, operation = 'unsubscribe') {
     this.#channelHandlers.delete(channel)
-    this.#nodeChannels.delete(channel)
 
-    const counts = await Promise.all(
-      [...this.#nodeSubscribers.values()].map((entry) => {
-        entry.channels.delete(channel)
+    let count = 0
 
-        return entry.subscriber.unsubscribe(channel)
-      })
-    )
+    // Only a channel that was fanned out has anything to undo on the nodes; a
+    // regular channel lives on the shared subscriber alone, and asking every
+    // master to UNSUBSCRIBE from it was one wasted round-trip per master.
+    if (this.#nodeChannels.delete(channel)) {
+      // Each node answers on its own, and each answer is deadlined: a node
+      // between retries parks the UNSUBSCRIBE in its offline queue and would
+      // otherwise hold the whole call — and everything below it — hostage
+      // until that one master came back. One refusal is logged, not fatal:
+      // the handler is already gone, so the worst case is an inert delivery.
+      const outcomes = await Promise.allSettled(
+        [...this.#nodeSubscribers.entries()].map(([key, entry]) => {
+          entry.channels.delete(channel)
 
-    // The per-node connections, the '+node' watcher and the resync tick exist
-    // only to serve node-local channels. With the last one gone nothing would
-    // ever release them again — #resyncTopology returns early on an empty set,
-    // so they used to idle, one connection per master, until disconnect().
-    if (this.#nodeChannels.size === 0) {
-      await Promise.all(this.#stopNodeFanOut().map((subscriber) => this.#release(subscriber)))
+          return withDeadline(entry.subscriber.unsubscribe(channel), {
+            clock: this.clock,
+            ms: SHUTDOWN_DEADLINE_MS,
+            operation
+          }).catch((err) => {
+            this.logger.warn(`Cluster node ${key} did not confirm UNSUBSCRIBE '${channel}': ${err.message}`)
+
+            throw err
+          })
+        })
+      )
+
+      const last = outcomes.at(-1)
+      count = last?.status === 'fulfilled' ? last.value : 0
+
+      // The per-node connections, the '+node' watcher and the resync tick exist
+      // only to serve node-local channels. With the last one gone nothing would
+      // ever release them again — #resyncTopology returns early on an empty
+      // set, so they used to idle, one connection per master, until disconnect().
+      if (this.#nodeChannels.size === 0) {
+        await this.#releaseAll(this.#stopNodeFanOut())
+      }
     }
 
     if (this.#subscriber) {
       return this.#subscriber.unsubscribe(channel)
     }
 
-    return counts.at(-1) ?? 0
+    return count
   }
 
   // Tears down the cluster fan-out machinery and hands back the subscribers it
@@ -374,8 +437,12 @@ class SubscriptionManager {
     return dropped
   }
 
-  async psubscribe (pattern, handler) {
-    const subscriber = this.#ensureSubscriber()
+  #releaseAll (subscribers) {
+    return Promise.allSettled(subscribers.map((subscriber) => this.#release(subscriber)))
+  }
+
+  async psubscribe (pattern, handler, operation = 'psubscribe') {
+    const subscriber = this.#ensureSubscriber(operation)
     const previous = this.#patternHandlers.get(pattern)
 
     if (handler) {
@@ -391,8 +458,14 @@ class SubscriptionManager {
     }
   }
 
+  // Undoes a handler installation — but only if that installation is still
+  // what the map holds. Two subscribes to the same key can be in flight at
+  // once (queued behind a reconnect, say); if the second already replaced the
+  // first's handler, the first's failure has nothing left to undo, and
+  // "restoring" would either reinstall a handler nothing is subscribed for or
+  // delete one that is.
   #restore (handlers, key, previous, attempted) {
-    if (!attempted) {
+    if (!attempted || handlers.get(key) !== attempted) {
       return
     }
 
@@ -422,11 +495,11 @@ class SubscriptionManager {
     this.#channelHandlers.clear()
     this.#patternHandlers.clear()
 
-    await Promise.all(closing.map((subscriber) => this.#release(subscriber)))
+    await this.#releaseAll(closing)
   }
 
   async #release (subscriber) {
-    subscriber.removeAllListeners()
+    this.#wiring.get(subscriber)?.()
 
     try {
       if (subscriber.status !== 'end') {
