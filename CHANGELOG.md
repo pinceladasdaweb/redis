@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 4.4.0 (2026-09-04)
+
+* fix: the thirty-two findings of the fourth full-source review by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/f1d6200f39750b90ece862c65a6fc78f25a6ca95)
+
+
 ## 4.3.0 (2026-08-22)
 
 * fix: the ten findings of the third full-source review by Pedro Rogério [View](https://github.com/pinceladasdaweb/redis/commit/a057ad5f5b12bd56e775c1266752aff7cb671611)
